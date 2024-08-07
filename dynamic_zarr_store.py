@@ -563,6 +563,7 @@ def make_test_grib_idx_files(
                     break
                 tidxf.write(line)
 
+
 def parse_grib_idx(
     fs: fsspec.AbstractFileSystem,
     basename: str,
@@ -631,11 +632,11 @@ def parse_grib_idx(
         result.loc[:, "idx_crc32"] = None
         result.loc[:, "idx_updated_at"] = None
 
-
     if validate and not result["attrs"].is_unique:
         raise ValueError(f"Attribute mapping for grib file {basename} is not unique)")
 
     return result.set_index("idx")
+
 
 def build_idx_grib_mapping(
     fs: fsspec.AbstractFileSystem,
@@ -715,8 +716,6 @@ def build_idx_grib_mapping(
             )
 
     return result
-
-
 
 
 def map_from_index(
