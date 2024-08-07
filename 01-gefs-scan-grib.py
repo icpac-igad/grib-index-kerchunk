@@ -12,14 +12,14 @@ def main_processing(date, run):
     results = xcluster_process_kc_individual(date, run)
     results = func_combine_kc(date, run)
 
-    #plotter = acluster_RetryPlotter(date, run)
-    #plotter.run_plotter()
-    #plotter.retry(attempt=1)
-    #plotter.retry(attempt=2)
-    #plotter.shutdown()
+    plotter = acluster_RetryPlotter(date, run)
+    plotter.run_plotter()
+    plotter.retry(attempt=1)
+    plotter.retry(attempt=2)
+    plotter.shutdown()
 
-    #results = func_execute_plotting_and_stitching(date, run)
-    # results = "test"
+    results = func_execute_plotting_and_stitching(date, run)
+    results = "test"
     return results
 
 
