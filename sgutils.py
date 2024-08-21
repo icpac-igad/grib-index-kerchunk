@@ -7,7 +7,7 @@ import json
 import tempfile
 from datetime import datetime, timedelta
 import ntpath
-
+import logging
 # Third-party libraries
 import numpy as np
 import pandas as pd
@@ -17,8 +17,10 @@ import fsspec
 import dask
 import dask.bag as daskbag
 import dask.dataframe as daskdf
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+#import boto3
+#from botocore.exceptions import BotoCoreError, ClientError
+from google.cloud import storage
+from google.api_core.exceptions import GoogleAPIError
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
@@ -32,6 +34,21 @@ from kerchunk.combine import MultiZarrToZarr
 from scipy.ndimage import zoom
 
 # %%01-delayed-get-gefs-kc-daily
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_cloud_config(cloud_provider='aws'):
+    try:
+        with open('cloud_config.json', 'r') as config_file:
+            config = json.load(config_file)
+        return config.get(cloud_provider, {})
+    except FileNotFoundError:
+        logging.error("Cloud configuration file not found")
+        return {}
+    except json.JSONDecodeError:
+        logging.error("Error decoding cloud configuration file")
+        return {}
+
 
 
 def flatten_list(list_of_lists):
@@ -40,8 +57,23 @@ def flatten_list(list_of_lists):
         flattened_list.extend(sublist)
     return flattened_list
 
-
 def get_details(url):
+    try:
+        logging.info(f"Extracting details from URL: {url}")
+        pattern = r"s3://noaa-gefs-pds/gefs\.(\d+)/(\d+)/atmos/pgrb2sp25/gep(\w+)\.t(\d+)z\.pgrb2s\.0p25.f(\d+)"
+        match = re.match(pattern, url)
+        if match:
+            date, run, ens_mem, hour, forecast = match.groups()
+            logging.info(f"Successfully extracted details: date={date}, run={run}, ens_mem={ens_mem}, hour={hour}, forecast={forecast}")
+            return date, run, hour, ens_mem
+        else:
+            logging.warning(f"No match found for URL: {url}")
+            return None
+    except Exception as e:
+        logging.error(f"Error in get_details: {str(e)}")
+        raise
+
+def DEPRICATE_get_details(url):
     pattern = r"s3://noaa-gefs-pds/gefs\.(\d+)/(\d+)/atmos/pgrb2sp25/gep(\w+)\.t(\d+)z\.pgrb2s\.0p25.f(\d+)"
     match = re.match(pattern, url)
     if match:
@@ -72,7 +104,7 @@ def foldercreator(path):
 
 
 @dask.delayed
-def gen_json(s3_url):
+def DEPRICATEDgen_json(s3_url):
     s3_source = {"anon": True, "skip_instance_cache": True}
     var_filter = {"typeOfLevel": "surface", "name": "Total Precipitation"}
     date, run, hour, ens_mem = get_details(s3_url)
@@ -101,7 +133,44 @@ def gen_json(s3_url):
     return output_flname
 
 
-def gefs_s3_utl_maker(date, run):
+@dask.delayed
+def gen_json_gcs(s3_url):
+    try:
+        logging.info(f"Starting gen_json for URL: {s3_url}")
+        s3_source = {"anon": True, "skip_instance_cache": True}
+        var_filter = {"typeOfLevel": "surface", "name": "Total Precipitation"}
+        date, run, hour, ens_mem = get_details(s3_url)
+        year = date[:4]
+        month = date[4:6]
+        fs = fsspec.filesystem("gcs")
+        
+        max_retry = 5
+        while max_retry >= 0:
+            try:
+                out = scan_grib(s3_url, storage_options=s3_source, filter=var_filter)[0]
+                logging.info(f"Successfully scanned grib for URL: {s3_url}")
+                flname = s3_url.split("/")[-1]
+                output_flname = f"gcs://gefs_ens/{year}/{month}/{date}/{run}/individual/{flname}.json"
+                with fs.open(output_flname, "w") as f:
+                    f.write(ujson.dumps(out))
+                logging.info(f"Successfully wrote JSON to: {output_flname}")
+                break
+            except Exception as e:
+                if max_retry == 0:
+                    logging.error(f"Max retries reached for URL: {s3_url}")
+                    raise
+                else:
+                    max_retry -= 1
+                    logging.warning(f"Retrying... Remaining retries: {max_retry+1}")
+        return output_flname
+    except Exception as e:
+        logging.error(f"Error in gen_json: {str(e)}")
+        raise
+
+
+
+
+def DEPTRECATE_gefs_s3_utl_maker(date, run):
     fs_s3 = fsspec.filesystem("s3", anon=True)
     members = [str(i).zfill(2) for i in range(1, 31)]
     s3url_ll = []
@@ -114,6 +183,38 @@ def gefs_s3_utl_maker(date, run):
         s3url_ll.append(fmt_s3og[1:])
     gefs_url = [item for sublist in s3url_ll for item in sublist]
     return gefs_url
+
+
+def gefs_s3_url_maker(date, run):
+    try:
+        logging.info(f"Starting gefs_s3_url_maker for date: {date}, run: {run}")
+        fs_s3 = fsspec.filesystem("s3", anon=True)
+        members = [str(i).zfill(2) for i in range(1, 31)]
+        s3url_ll = []
+        
+        for ensemble_member in members:
+            try:
+                s3url_glob = fs_s3.glob(
+                    f"s3://noaa-gefs-pds/gefs.{date}/{run}/atmos/pgrb2sp25/gep{ensemble_member}.*"
+                )
+                s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "idx"]
+                fmt_s3og = sorted(["s3://" + f for f in s3url_only_grib])
+                s3url_ll.append(fmt_s3og[1:])
+                logging.info(f"Processed ensemble member: {ensemble_member}")
+            except Exception as e:
+                logging.error(f"Error processing ensemble member {ensemble_member}: {str(e)}")
+        
+        gefs_url = [item for sublist in s3url_ll for item in sublist]
+        logging.info(f"Total GEFS URLs generated: {len(gefs_url)}")
+        return gefs_url
+    except BotoCoreError as e:
+        logging.error(f"AWS service error in gefs_s3_url_makerr: {str(e)}")
+        raise
+    except ClientError as e:
+        logging.error(f"AWS client error in gefs_s3_url_maker: {str(e)}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in gefs_s3_url_maker: {str(e)}")
 
 
 def xcluster_process_kc_individual(date, run):
@@ -148,6 +249,76 @@ def xcluster_process_kc_individual(date, run):
 
     return final_results
 
+def load_cloud_config(cloud_provider='gcp'):
+    try:
+        with open('cloud_config.json', 'r') as config_file:
+            config = json.load(config_file)
+        return config.get(cloud_provider, {})
+    except FileNotFoundError:
+        logging.error("Cloud configuration file not found")
+        return {}
+    except json.JSONDecodeError:
+        logging.error("Error decoding cloud configuration file")
+        return {}
+
+def coiled_cluster_config(func):
+    cloud_config = load_cloud_config('gcp')
+    
+    @coiled.cluster(
+        n_workers=cloud_config.get('n_workers', 5),
+        name=f"gks1-{{date}}-{{run}}",
+        software=cloud_config.get('software', "your-gcp-software-image"),
+        scheduler_vm_types=cloud_config.get('scheduler_vm_types', ["n1-standard-2"]),
+        region=cloud_config.get('region', "us-central1"),
+        compute_purchase_option=cloud_config.get('compute_purchase_option', "preemptible"),
+        tags=cloud_config.get('tags', {"workload": "gefs-gcp-test0"}),
+        worker_vm_types=cloud_config.get('worker_vm_types', "n1-standard-2"),
+    )
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+@coiled_cluster_config
+def xcluster_process_kc_individual(date, run):
+    try:
+        logging.info(f"Starting xcluster_process_kc_individual for date: {date}, run: {run}")
+        gefs_url = gefs_gcs_utl_maker(date, run)  # Assuming you have a GCS version of this function
+        logging.info(f"Number of GEFS URLs: {len(gefs_url)}")
+
+        cluster = coiled.Cluster()
+        client = cluster.get_client()
+        
+        try:
+            client.upload_file("utils.py")
+            logging.info("Successfully uploaded utils.py to the cluster")
+
+            results = []
+            for input_value in gefs_url:
+                result = gen_json_gcs(input_value)  # Assuming you have a GCS version of this function
+                results.append(result)
+            
+            final_results = dask.compute(results)
+            logging.info("Successfully computed all results")
+
+        except Exception as e:
+            logging.error(f"Error during computation: {str(e)}")
+            raise
+        finally:
+            client.close()
+            cluster.shutdown()
+            logging.info("Cluster shut down")
+
+        return final_results
+
+    except GoogleAPIError as e:
+        logging.error(f"Google Cloud API error: {str(e)}")
+        raise
+    except storage.exceptions.GoogleCloudError as e:
+        logging.error(f"Google Cloud Storage error: {str(e)}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in xcluster_process_kc_individual: {str(e)}")
+        raise
 
 # %%02-combine-gefs-json-func
 
