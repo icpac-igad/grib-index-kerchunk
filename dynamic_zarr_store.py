@@ -138,7 +138,7 @@ def store_data_var(
     zarray["shape"] = [full_dims[k] for k in full_coords]
     if zarray["fill_value"] is None:
         # Check dtype first?
-        zarray["fill_value"] = np.NaN
+        zarray["fill_value"] = np.nan
 
     zattrs["_ARRAY_DIMENSIONS"] = [
         COORD_DIM_MAPPING[v] if v in COORD_DIM_MAPPING else v for v in full_coords
