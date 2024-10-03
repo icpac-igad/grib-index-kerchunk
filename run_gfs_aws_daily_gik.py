@@ -86,11 +86,13 @@ def process_dataframe(df, varnames_to_process):
     - pd.DataFrame: Processed DataFrame with duplicates removed based on the 'time' column and sorted by 'length'.
     """
     conditions = {
+        'acpcp':'surface',
         'cape': 'surface',
         'cin': 'surface',
         'pres': 'heightAboveGround',
         'r': 'atmosphereSingleLayer',
-        'soill': ['atmosphereSingleLayer', 'depthBelowLandLayer'],  # Handling multiple levels for 'soill'
+        'soill': 'atmosphereSingleLayer',
+        'soilw':'depthBelowLandLayer',  # Handling multiple levels for 'soill'
         'st': 'depthBelowLandLayer',
         't': 'surface',
         'tp': 'surface'
@@ -415,9 +417,6 @@ def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parqu
     except Exception as e:
         logger.error(f"An error occurred during processing: {str(e)}")
         raise
-
-
-
 
 
 

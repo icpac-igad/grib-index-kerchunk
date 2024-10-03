@@ -74,6 +74,7 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     times = valid_times
     return time_dims, time_coords, times, valid_times, steps
 
+
 def process_dataframe(df, varnames_to_process):
     """
     Filter and process the DataFrame by specific variable names and their corresponding type of levels.
@@ -86,11 +87,13 @@ def process_dataframe(df, varnames_to_process):
     - pd.DataFrame: Processed DataFrame with duplicates removed based on the 'time' column and sorted by 'length'.
     """
     conditions = {
+        'acpcp':'surface',
         'cape': 'surface',
         'cin': 'surface',
         'pres': 'heightAboveGround',
         'r': 'atmosphereSingleLayer',
-        'soill': ['atmosphereSingleLayer', 'depthBelowLandLayer'],  # Handling multiple levels for 'soill'
+        'soill': 'atmosphereSingleLayer',
+        'soilw':'depthBelowLandLayer',  # Handling multiple levels for 'soill'
         'st': 'depthBelowLandLayer',
         't': 'surface',
         'tp': 'surface'
@@ -163,6 +166,8 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     final_df = final_df.sort_values(by=['time', 'varname'])
     logger.info(f"Mapped collected multiple variables index info: {gfs_kind1.info()}")
     return final_df
+
+
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
     """
