@@ -5,6 +5,7 @@ import xarray as xr
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import os
+import gc 
 
 def read_and_process_parquet(file_path):
     """
@@ -70,6 +71,9 @@ def plot_data(data, var_name, file_date):
     filename = f"{var_name}-{file_date}.png"
     plt.savefig(filename, dpi=200)
     plt.show()
+    plt.close(fig)  # Explicitly close the figure to free memory
+    del data  # Delete the data to free memory
+    gc.collect()  # Force garbage collection
 
 def extract_date_from_filename(file_path):
     """
@@ -85,15 +89,23 @@ def extract_date_from_filename(file_path):
     date_str = base_name.split('-')[3]  # Assuming the date is always in the same position
     return date_str
 
-if __name__ == "__main__":
-    # Path to the Parquet file
-    parquet_file_path = 'aws-best-avlbl-20210501-allvar.parquet'
+
+
+list_ds=['20210501','20210803','20211108','20220104','20220501','20220815',
+         '20221201','20230108','20240405','20240928','20241001']
+
+for date_str in list_ds:
+    parquet_file_path = f'gfs-z00-{date_str}-allvar.parquet'
     variable_path = "tp/accum/surface"
     var_name = variable_path.split('/')[0]
 
     zstore_dict = read_and_process_parquet(parquet_file_path)
     data = load_data_from_dict(zstore_dict, variable_path)
     
-    file_date = extract_date_from_filename(parquet_file_path)
+    #file_date = extract_date_from_filename(parquet_file_path)
+    file_date=date_str
     plot_data(data, var_name, file_date)
-
+    
+    del zstore_dict, data  # Free memory by deleting large variables
+    gc.collect()  # Run garbage collector after the loop iteration
+    print(f'completed {date_str}')
