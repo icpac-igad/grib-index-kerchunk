@@ -9,6 +9,8 @@ from dynamic_zarr_store import (
     AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
     parse_grib_idx, map_from_index, store_coord_var, store_data_var
 )
+from calendar import monthrange
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +53,24 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     times = valid_times
     return time_dims, time_coords, times, valid_times, steps
 
-def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str) -> pd.DataFrame:
-    """Create mapped index from GFS files."""
-    logger.info("Creating Mapped Index")
+def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, date_str: str) -> pd.DataFrame:
+    """
+    Create a mapped index from the GFS files.
+    
+    Args:
+        axes (List[pd.Index]): Time axes for GFS mapping.
+        mapping_parquet_file_path (str): Path to the parquet file containing mappings.
+    
+    Returns:
+        pd.DataFrame: A DataFrame containing the mapped index.
+    """
+    logger.info(f"Creating Mapped Index for date {date_str}")
     mapped_index_list = []
     dtaxes = axes[0]
 
     for idx, datestr in enumerate(dtaxes):
         try:
-            fname = f"s3://noaa-gfs-bdp-pds/gfs.20230928/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
             
             idxdf = parse_grib_idx(
                 fs=fsspec.filesystem("s3"),
@@ -188,14 +199,64 @@ def create_parquet_file(zstore: dict, output_parquet_file: str):
     zstore_df.to_parquet(output_parquet_file)
     logger.info(f"Parquet file saved to {output_parquet_file}")
 
-def process_gfs_data(gfs_files: List[str], axes: List[pd.Index], mapping_parquet_file_path: str, output_parquet_file: str, log_level: int = logging.INFO):
-    """Main function to process GFS data."""
+
+def generate_axes(date_str: str) -> List[pd.Index]:
+    """
+    Generate axes for a given date.
+    
+    Args:
+    date_str (str): Date string in format 'YYYYMMDD'
+    
+    Returns:
+    List[pd.Index]: List containing valid_time and time indices
+    """
+    start_date = pd.Timestamp(date_str)
+    end_date = start_date + pd.Timedelta(days=5)  # Assuming 5 days forecast
+    
+    valid_time_index = pd.date_range(start_date, end_date, freq="60min", name="valid_time")
+    time_index = pd.Index([start_date], name="time")
+    
+    return [valid_time_index, time_index]
+
+def generate_gfs_dates(year: int, month: int) -> List[str]:
+    """
+    Generate a list of GFS dates for a given month and year in the format 'YYYYMMDD'.
+    
+    Args:
+        year (int): The year.
+        month (int): The month (1-12).
+    
+    Returns:
+        List[str]: A list of dates in 'YYYYMMDD' format.
+    """
+    # Get the last day of the month
+    _, last_day = monthrange(year, month)
+    
+    # Generate date range for the entire month
+    date_range = pd.date_range(start=f'{year}-{month:02d}-01', 
+                               end=f'{year}-{month:02d}-{last_day}', 
+                               freq='D')
+    
+    return date_range.strftime('%Y%m%d').tolist()
+
+
+
+
+def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parquet_file: str, log_level: int = logging.INFO):
+    """Main function to process GFS data for a single date."""
     setup_logging(log_level)
     
     try:
+        logger.info(f"Processing date: {date_str}")
+        axes = generate_axes(date_str)
+        gfs_files = [
+            f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f000",
+            f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f001"
+        ]
         _, deflated_gfs_grib_tree_store = build_grib_tree(gfs_files)
         time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
-        gfs_kind = create_mapped_index(axes, mapping_parquet_file_path)
+        gfs_kind = create_mapped_index(axes, mapping_parquet_file_path, date_str)
+        
         zstore, chunk_index = prepare_zarr_store(deflated_gfs_grib_tree_store, gfs_kind)
         updated_zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords, times, valid_times, steps)
         create_parquet_file(updated_zstore, output_parquet_file)
@@ -203,17 +264,19 @@ def process_gfs_data(gfs_files: List[str], axes: List[pd.Index], mapping_parquet
         logger.error(f"An error occurred during processing: {str(e)}")
         raise
 
-if __name__ == "__main__":
-    # Example usage
-    gfs_files = [
-        "s3://noaa-gfs-bdp-pds/gfs.20230928/00/atmos/gfs.t00z.pgrb2.0p25.f000",
-        "s3://noaa-gfs-bdp-pds/gfs.20230928/00/atmos/gfs.t00z.pgrb2.0p25.f001"
-    ]
-    axes = [
-        pd.Index(pd.date_range("2023-09-01T00:00", "2023-09-03T12:00", freq="60min", name="valid_time")),
-        pd.Index([pd.Timestamp("2023-09-01T00:00")], name="time")
-    ]
-    mapping_parquet_file_path = 'gfs_mapping3_120hr/'
-    output_parquet_file = 'aws-best-avlbl-61hrs-t2m.parquet'
 
-    process_gfs_data(gfs_files, axes, mapping_parquet_file_path, output_parquet_file)
+list_ds=['20210101','20210125','20210501','20210803','20211108','20220104','20220501','20220815',
+         '20221201','20230108','20240405','20240928','20241001']
+
+for date_str in list_ds:
+    output_parquet_file = f'aws-best-avlbl-{date_str}-t2m.parquet'
+    try:
+        process_gfs_data(date_str, mapping_parquet_file_path, output_parquet_file)
+    except Exception as e:  # Catch generic exceptions or specify the type of exception
+        print(f"Failed to process data for {date_str}: {e}")
+    else:
+        print(f"Successfully processed data for {date_str}")
+    finally:
+        print(f"Completed processing attempt for {date_str}")
+
+

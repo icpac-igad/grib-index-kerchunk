@@ -16,11 +16,24 @@ from dynamic_zarr_store import (
 logger = logging.getLogger(__name__)
 
 def setup_logging(log_level: int = logging.INFO):
-    """Set up logging configuration."""
+    """
+    Set up logging configuration.
+    
+    Args:
+        log_level (int): Logging level, default is logging.INFO.
+    """
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
-    """Build and deflate the Grib tree."""
+    """
+    Build and deflate the Grib tree structure from the provided GFS files.
+    
+    Args:
+        gfs_files (List[str]): List of GFS file paths in AWS S3 object storage to scan and build the Grib tree.
+    
+    Returns:
+        Tuple[dict, dict]: Original and deflated (stripped) Grib tree stores.
+    """ 
     logger.info("Building Grib Tree")
     gfs_grib_tree_store = grib_tree([group for f in gfs_files for group in scan_grib(f)])
     deflated_gfs_grib_tree_store = copy.deepcopy(gfs_grib_tree_store)
@@ -30,7 +43,16 @@ def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
     return gfs_grib_tree_store, deflated_gfs_grib_tree_store
 
 def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]:
-    """Calculate time dimensions and coordinates."""
+    """
+    Calculate time dimensions and coordinates based on the provided axes.
+    
+    Args:
+        axes (List[pd.Index]): List of time axes used for calculations.
+    
+    Returns:
+        Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]: Time dimensions, coordinates, 
+                                                               and arrays for times, valid_times, steps.
+    """
     logger.info("Calculating Time Dimensions and Coordinates")
     axes_by_name: Dict[str, pd.Index] = {pdi.name: pdi for pdi in axes}
     aggregation_type = AggregationType.BEST_AVAILABLE
@@ -55,7 +77,16 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     return time_dims, time_coords, times, valid_times, steps
 
 def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, date_str: str) -> pd.DataFrame:
-    """Create mapped index from GFS files for a specific date."""
+    """
+    Create a mapped index from the GFS files.
+    
+    Args:
+        axes (List[pd.Index]): Time axes for GFS mapping.
+        mapping_parquet_file_path (str): Path to the parquet file containing mappings.
+    
+    Returns:
+        pd.DataFrame: A DataFrame containing the mapped index.
+    """
     logger.info(f"Creating Mapped Index for date {date_str}")
     mapped_index_list = []
     dtaxes = axes[0]
@@ -124,7 +155,16 @@ def RMV_create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str
     return gfs_kind1
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
-    """Prepare Zarr store and chunk index."""
+    """
+    Prepare Zarr store and chunk index for further processing.
+    
+    Args:
+        deflated_gfs_grib_tree_store (dict): Deflated Grib tree store.
+        gfs_kind (pd.DataFrame): Mapped index DataFrame.
+    
+    Returns:
+        Tuple[dict, pd.DataFrame]: Prepared Zarr store and chunk index.
+    """
     logger.info("Preparing Zarr Store")
     zarr_ref_store = deflated_gfs_grib_tree_store
     #chunk_index = gfs_kind.loc[gfs_kind.varname.isin(["t2m"])]
@@ -134,7 +174,21 @@ def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFram
 
 def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Dict, time_coords: Dict,
                           times: np.ndarray, valid_times: np.ndarray, steps: np.ndarray) -> dict:
-    """Process unique groups and update Zarr store."""
+    """
+    Process unique groups and update the Zarr store.
+    
+    Args:
+        zstore (dict): Zarr store to be updated.
+        chunk_index (pd.DataFrame): DataFrame containing chunk indices.
+        time_dims (Dict): Time dimensions calculated from axes.
+        time_coords (Dict): Time coordinates for Zarr store.
+        times (np.ndarray): Array of times.
+        valid_times (np.ndarray): Array of valid times.
+        steps (np.ndarray): Array of step sizes.
+    
+    Returns:
+        dict: Updated Zarr store after processing.
+    """
     logger.info("Processing Unique Groups and Updating Zarr Store")
     unique_groups = chunk_index.set_index(
         ["varname", "stepType", "typeOfLevel"]
@@ -208,7 +262,13 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
     return zstore
 
 def create_parquet_file(zstore: dict, output_parquet_file: str):
-    """Create and save Parquet file."""
+    """
+    Create and save a Parquet file from the Zarr store.
+    
+    Args:
+        zstore (dict): Zarr store containing the processed data.
+        output_parquet_file (str): Path to save the Parquet file.
+    """
     logger.info("Creating and Saving Parquet File")
     gfs_store = dict(refs=zstore, version=1)
 
