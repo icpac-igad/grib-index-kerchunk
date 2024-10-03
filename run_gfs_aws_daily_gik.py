@@ -53,6 +53,71 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     times = valid_times
     return time_dims, time_coords, times, valid_times, steps
 
+
+def process_duplicated_vars(df, varnames_to_process):
+    # Dictionary to define typeOfLevel conditions for each varname
+    conditions = {
+        'cape': 'surface',
+        'cin': 'surface',
+        'pres': 'heightAboveGround',
+        'r': 'atmosphereSingleLayer',
+        'soill': 'atmosphereSingleLayer',  # soill has two conditions
+        'soilw': 'depthBelowLandLayer',  # not mentioned in your description, assuming no specific level required
+        'st': 'depthBelowLandLayer',
+        't': 'surface',
+        'tp': 'surface'
+    }
+    
+    # Initialize an empty DataFrame to store the results
+    processed_df = pd.DataFrame()
+
+    # Iterate through each specified varname and apply the corresponding conditions
+    for varname in varnames_to_process:
+        if varname in conditions:
+            level = conditions[varname]
+            if isinstance(level, list):  # Handling multiple levels for 'soill'
+                for l in level:
+                    filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == l)]
+                    # Handle duplicates in the 'time' column by selecting the entry with the highest 'length'
+                    filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
+                    processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
+            else:
+                filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == level)]
+                # Handle duplicates in the 'time' column by selecting the entry with the highest 'length'
+                filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
+                processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
+
+    return processed_df
+
+def process_dataframe(df, varnames_to_process):
+    conditions = {
+        'cape': 'surface',
+        'cin': 'surface',
+        'pres': 'heightAboveGround',
+        'r': 'atmosphereSingleLayer',
+        'soill': ['atmosphereSingleLayer', 'depthBelowLandLayer'],  # Handling multiple levels for 'soill'
+        'st': 'depthBelowLandLayer',
+        't': 'surface',
+        'tp': 'surface'
+    }
+    processed_df = pd.DataFrame()
+
+    for varname in varnames_to_process:
+        if varname in conditions:
+            level = conditions[varname]
+            if isinstance(level, list):
+                for l in level:
+                    filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == l)]
+                    filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
+                    processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
+            else:
+                filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == level)]
+                filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
+                processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
+
+    return processed_df
+
+
 def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, date_str: str) -> pd.DataFrame:
     """
     Create a mapped index from the GFS files.
@@ -93,8 +158,15 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
     gfs_kind1=gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
     #gfs_kind1 = gfs_kind.drop_duplicates('uri')
+    # Process the data that needs to be filtered and modified
+    to_process_df = gfs_kind[~gfs_kind['varname'].isin(var1_list)]
+    processed_df = process_dataframe(to_process_df, var_to_remove)
+    # Concatenate the unprocessed and processed parts back together
+    final_df = pd.concat([gfs_kind1, processed_df], ignore_index=True)
+    # Optionally, you might want to sort or reorganize the DataFrame
+    final_df = final_df.sort_values(by=['time', 'varname'])
     logger.info(f"Mapped collected multiple variables index info: {gfs_kind1.info()}")
-    return gfs_kind1
+    return final_df
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
     """Prepare Zarr store and chunk index."""
