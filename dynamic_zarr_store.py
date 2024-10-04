@@ -841,3 +841,161 @@ def _extract_single_group(grib_group: dict, idx: int):
     ), f"expected a single variable grib group but produced: {k_ind}"
     k_ind.loc[:, "idx"] = idx
     return k_ind
+
+
+def s3_ecwmf_build_idx_grib_mapping(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    suffix: str = "index",
+    mapper: Optional[Callable] = None,
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = True,
+) -> pd.DataFrame:
+    """
+    Mapping method combines the idx and grib metadata to make a mapping from one to the other for a particular
+    model horizon file. This should be generally applicable to all forecasts for the given horizon.
+    :param fs: the file system to read metatdata from
+    :param basename: the full path for the grib2 file
+    :param suffix: the suffix for the index file
+    :param mapper: the mapper if any to apply (used for hrrr subhf)
+    :param tstamp: the timestamp to use for when the data was indexed
+    :param validate: assert mapping is correct or fail before returning
+    :return: the merged dataframe with the results of the two operations joined on the grib message group number
+    """
+    #grib_file_index = _map_grib_file_by_group(fname=basename, mapper=mapper)
+    grib_file_index = pd.read_parquet('ecmwf_map_scangrib_group.parquet')
+    idx_file_index = s3_parse_ecmwf_grib_idx(
+        fs=fs, basename=basename, suffix=suffix, tstamp=tstamp
+    )
+    result = idx_file_index.merge(
+        # Left merge because the idx file should be authoritative - one record per grib message
+        grib_file_index,
+        on="idx",
+        how="left",
+        suffixes=("_idx", "_grib"),
+    )
+
+    if validate:
+        # If any of these conditions fail - run the method in colab for the same file and inspect the result manually.
+        all_match_offset = (
+            (result.loc[:, "offset_idx"] == result.loc[:, "offset_grib"])
+            | pd.isna(result.loc[:, "offset_grib"])
+            | ~pd.isna(result.loc[:, "inline_value"])
+        )
+        all_match_length = (
+            (result.loc[:, "length_idx"] == result.loc[:, "length_grib"])
+            | pd.isna(result.loc[:, "length_grib"])
+            | ~pd.isna(result.loc[:, "inline_value"])
+        )
+
+        if not all_match_offset.all():
+            vcs = all_match_offset.value_counts()
+            raise ValueError(
+                f"Failed to match message offset mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+            )
+
+        if not all_match_length.all():
+            vcs = all_match_length.value_counts()
+            raise ValueError(
+                f"Failed to match message length mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+            )
+
+        if not result["attrs"].is_unique:
+            dups = result.loc[result["attrs"].duplicated(keep=False), :]
+            logger.warning(
+                "The idx attribute mapping for %s is not unique for %d variables: %s",
+                basename,
+                len(dups),
+                dups.varname.tolist(),
+            )
+
+        r_index = result.set_index(
+            ["varname", "typeOfLevel", "stepType", "level", "valid_time"]
+        )
+        if not r_index.index.is_unique:
+            dups = r_index.loc[r_index.index.duplicated(keep=False), :]
+            logger.warning(
+                "The grib hierarchy in %s is not unique for %d variables: %s",
+                basename,
+                len(dups),
+                dups.index.get_level_values("varname").tolist(),
+            )
+
+    return result
+
+
+
+
+
+def s3_parse_ecmwf_grib_idx(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    suffix: str = "index",
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False,
+) -> pd.DataFrame:
+    """
+    Standalone method used to extract metadata from a grib2 index file
+
+    :param fs: the file system to read from
+    :param basename: the base name is the full path to the grib file
+    :param suffix: the suffix is the ending for the index file
+    :param tstamp: the timestamp to record for this index process
+    :return: the data frame containing the results
+    """
+    fname = f"{basename.rsplit('.', 1)[0]}.{suffix}"
+
+    fs.invalidate_cache(fname)
+    fs.invalidate_cache(basename)
+
+    baseinfo = fs.info(basename)
+
+    with fs.open(fname, "r") as f:
+        splits = []
+        for idx, line in enumerate(f):
+            try:
+                # Removing the trailing characters if there's any at the end of the line
+                clean_line = line.strip().rstrip(',')
+                # Convert the JSON-like string to a dictionary
+                data = json.loads(clean_line)
+                # Extracting required fields using .get() method to handle missing keys
+                lidx = idx
+                offset = data.get("_offset", 0)  # Default to 0 if missing
+                length = data.get("_length", 0)
+                date = data.get("date", "Unknown Date")  # Default to 'Unknown Date' if missing
+                ens_number = data.get("number", -1)  # Default to -1 if missing
+                # Append to the list as integers or the original data type
+                splits.append([int(lidx), int(offset),int(length), date, data, int(ens_number)])
+            except json.JSONDecodeError as e:
+                # Handle cases where JSON conversion fails
+                raise ValueError(f"Could not parse JSON from line: {line}") from e
+
+    result = pd.DataFrame(splits, columns=["idx", "offset", "length", "date", "attr", "ens_number"])
+
+    # Subtract the next offset to get the length using the filesize for the last value 
+
+    result.loc[:, "idx_uri"] = fname
+    result.loc[:, "grib_uri"] = basename
+
+    if tstamp is None:
+        tstamp = pd.Timestamp.now()
+    #result.loc[:, "indexed_at"] = tstamp
+    result['indexed_at'] = result.apply(lambda x: tstamp, axis=1)
+
+    if isinstance(fs, s3fs.S3FileSystem):
+        result.loc[:, "grib_crc32"] = None  # S3 doesn't provide CRC32
+        result.loc[:, "grib_updated_at"] = pd.to_datetime(baseinfo["LastModified"])
+        idxinfo = fs.info(fname)
+        result.loc[:, "idx_crc32"] = None  # S3 doesn't provide CRC32
+        result.loc[:, "idx_updated_at"] = pd.to_datetime(idxinfo["LastModified"])
+    else:
+        # TODO: Fix metadata for other filesystems
+        result.loc[:, "grib_crc32"] = None
+        result.loc[:, "grib_updated_at"] = None
+        result.loc[:, "idx_crc32"] = None
+        result.loc[:, "idx_updated_at"] = None
+
+    if validate and not result["attrs"].is_unique:
+        raise ValueError(f"Attribute mapping for grib file {basename} is not unique)")
+
+    return result.set_index("idx")
