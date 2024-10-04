@@ -1,28 +1,60 @@
 import os
 import logging
+import json
 import pandas as pd
 import numpy as np
 import fsspec
 import copy
-from typing import List, Dict, Tuple, final
+from typing import List, Dict, Tuple, Any
 from dynamic_zarr_store import (
     AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
     parse_grib_idx, map_from_index, store_coord_var, store_data_var
 )
 from calendar import monthrange
 
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+        return json.dumps(log_data)
 
-logger = logging.getLogger(__name__)
-
-def setup_logging(log_level: int = logging.INFO):
+def setup_logging(log_level: int = logging.INFO, log_file: str = "gfs_processing.log"):
     """
     Configure the logging level and format for the application.
 
     Parameters:
     - log_level (int): Logging level to use.
+    - log_file (str): File to save logs to.
     """
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
 
+    # File handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(JSONFormatter())
+    logger.addHandler(file_handler)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(console_handler)
+
+def log_function_call(func):
+    def wrapper(*args, **kwargs):
+        logger = logging.getLogger()
+        func_name = func.__name__
+        logger.info(json.dumps({"event": "function_start", "function": func_name}))
+        result = func(*args, **kwargs)
+        logger.info(json.dumps({"event": "function_end", "function": func_name}))
+        return result
+    return wrapper
+
+@log_function_call
 def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
     """
     Scan GFS files, build a hierarchical tree structure for the data, and strip unnecessary data.
@@ -33,14 +65,18 @@ def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
     Returns:
     - Tuple[dict, dict]: Original and deflated GRIB tree stores.
     """
-    logger.info("Building Grib Tree")
+    logger = logging.getLogger()
     gfs_grib_tree_store = grib_tree([group for f in gfs_files for group in scan_grib(f)])
     deflated_gfs_grib_tree_store = copy.deepcopy(gfs_grib_tree_store)
     strip_datavar_chunks(deflated_gfs_grib_tree_store)
-    logger.info(f"Original references: {len(gfs_grib_tree_store['refs'])}")
-    logger.info(f"Stripped references: {len(deflated_gfs_grib_tree_store['refs'])}")
+    logger.info(json.dumps({
+        "event": "grib_tree_built",
+        "original_refs": len(gfs_grib_tree_store['refs']),
+        "stripped_refs": len(deflated_gfs_grib_tree_store['refs'])
+    }))
     return gfs_grib_tree_store, deflated_gfs_grib_tree_store
 
+@log_function_call
 def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate time-related dimensions and coordinates based on input axes.
@@ -51,7 +87,7 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     Returns:
     - Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]: Time dimensions, coordinates, times, valid times, and steps.
     """
-    logger.info("Calculating Time Dimensions and Coordinates")
+    logger = logging.getLogger()
     axes_by_name: Dict[str, pd.Index] = {pdi.name: pdi for pdi in axes}
     aggregation_type = AggregationType.BEST_AVAILABLE
     time_dims: Dict[str, int] = {}
@@ -72,10 +108,15 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
         steps = valid_times - times
 
     times = valid_times
+    logger.info(json.dumps({
+        "event": "time_dimensions_calculated",
+        "time_dims": time_dims,
+        "time_coords": time_coords
+    }))
     return time_dims, time_coords, times, valid_times, steps
 
-
-def process_dataframe(df, varnames_to_process):
+@log_function_call
+def process_dataframe(df: pd.DataFrame, varnames_to_process: List[str]) -> pd.DataFrame:
     """
     Filter and process the DataFrame by specific variable names and their corresponding type of levels.
 
@@ -86,6 +127,7 @@ def process_dataframe(df, varnames_to_process):
     Returns:
     - pd.DataFrame: Processed DataFrame with duplicates removed based on the 'time' column and sorted by 'length'.
     """
+    logger = logging.getLogger()
     conditions = {
         'acpcp':'surface',
         'cape': 'surface',
@@ -93,7 +135,7 @@ def process_dataframe(df, varnames_to_process):
         'pres': 'heightAboveGround',
         'r': 'atmosphereSingleLayer',
         'soill': 'atmosphereSingleLayer',
-        'soilw':'depthBelowLandLayer',  # Handling multiple levels for 'soill'
+        'soilw':'depthBelowLandLayer',
         'st': 'depthBelowLandLayer',
         't': 'surface',
         'tp': 'surface'
@@ -113,9 +155,14 @@ def process_dataframe(df, varnames_to_process):
                 filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
                 processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
 
+    logger.info(json.dumps({
+        "event": "dataframe_processed",
+        "processed_rows": len(processed_df),
+        "processed_variables": list(processed_df['varname'].unique())
+    }))
     return processed_df
 
-
+@log_function_call
 def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, date_str: str) -> pd.DataFrame:
     """
     Create a mapped index from GFS files for a specific date, using the mapping from a parquet file.
@@ -128,7 +175,7 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     Returns:
     - pd.DataFrame: DataFrame containing the mapped index for the specified date.
     """
-    logger.info(f"Creating Mapped Index for date {date_str}")
+    logger = logging.getLogger()
     mapped_index_list = []
     dtaxes = axes[0]
 
@@ -148,30 +195,33 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
             )
             mapped_index_list.append(mapped_index)
         except Exception as e:
-            logger.error(f"Error processing file {fname}: {str(e)}")
+            logger.error(json.dumps({
+                "event": "error_processing_file",
+                "file": fname,
+                "error": str(e)
+            }))
 
     gfs_kind = pd.concat(mapped_index_list)
-    gfs_kind_var=gfs_kind.drop_duplicates('varname')
-    var_list=gfs_kind_var['varname'].tolist() 
-    var_to_remove=['acpcp','cape','cin','pres','r','soill','soilw','st','t','tp']
+    gfs_kind_var = gfs_kind.drop_duplicates('varname')
+    var_list = gfs_kind_var['varname'].tolist() 
+    var_to_remove = ['acpcp','cape','cin','pres','r','soill','soilw','st','t','tp']
     var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
-    gfs_kind1=gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
-    #gfs_kind1 = gfs_kind.drop_duplicates('uri')
-    # Process the data that needs to be filtered and modified
+    gfs_kind1 = gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
     to_process_df = gfs_kind[gfs_kind['varname'].isin(var_to_remove)]
     processed_df = process_dataframe(to_process_df, var_to_remove)
-    # Concatenate the unprocessed and processed parts back together
     final_df = pd.concat([gfs_kind1, processed_df], ignore_index=True)
-    # Optionally, you might want to sort or reorganize the DataFrame
     final_df = final_df.sort_values(by=['time', 'varname'])
-    final_df_var=final_df.drop_duplicates('varname')
-    final_var_list=final_df_var['varname'].tolist() 
+    final_df_var = final_df.drop_duplicates('varname')
+    final_var_list = final_df_var['varname'].tolist() 
 
-    logger.info(f"Mapped collected multiple variables index info: {len(final_var_list)} and {final_var_list}")
+    logger.info(json.dumps({
+        "event": "mapped_index_created",
+        "variables_count": len(final_var_list),
+        "variables": final_var_list
+    }))
     return final_df
 
-
-
+@log_function_call
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
     """
     Prepare Zarr store and related data for chunk processing based on GFS kind DataFrame.
@@ -183,19 +233,23 @@ def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFram
     Returns:
     - Tuple[dict, pd.DataFrame]: Zarr reference store and the DataFrame for chunk index.
     """
-    logger.info("Preparing Zarr Store")
+    logger = logging.getLogger()
     zarr_ref_store = deflated_gfs_grib_tree_store
-    #chunk_index = gfs_kind.loc[gfs_kind.varname.isin(["t2m"])]
     chunk_index = gfs_kind
     zstore = copy.deepcopy(zarr_ref_store["refs"])
+    logger.info(json.dumps({
+        "event": "zarr_store_prepared",
+        "chunk_index_rows": len(chunk_index)
+    }))
     return zstore, chunk_index
 
 
+
+@log_function_call
 def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Dict, time_coords: Dict,
                           times: np.ndarray, valid_times: np.ndarray, steps: np.ndarray) -> dict:
     """
-    Process and update Zarr store by configuring data for unique variable groups. This involves setting time dimensions,
-    coordinates, and updating Zarr store paths with processed data arrays.
+    Process and update Zarr store by configuring data for unique variable groups.
 
     Parameters:
     - zstore (dict): The initial Zarr store with references to original data.
@@ -208,12 +262,8 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
 
     Returns:
     - dict: Updated Zarr store with added datasets and metadata.
-    
-    This function processes each unique combination of 'varname', 'stepType', and 'typeOfLevel' found in the chunk_index.
-    For each group, it determines appropriate dimensions and coordinates based on the unique levels present and updates
-    the Zarr store with the processed data. It removes any data references that do not match the existing unique groups.
     """
-    logger.info("Processing Unique Groups and Updating Zarr Store")
+    logger = logging.getLogger()
     unique_groups = chunk_index.set_index(["varname", "stepType", "typeOfLevel"]).index.unique()
 
     for key in list(zstore.keys()):
@@ -238,55 +288,47 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
             else:
                 raise ValueError("Invalid level values encountered")
 
-            # Store coordinates and data variables in the Zarr store
             store_coord_var(key=f"{base_path}/time", zstore=zstore, coords=time_coords["time"], data=times.astype("datetime64[s]"))
             store_coord_var(key=f"{base_path}/valid_time", zstore=zstore, coords=time_coords["valid_time"], data=valid_times.astype("datetime64[s]"))
             store_coord_var(key=f"{base_path}/step", zstore=zstore, coords=time_coords["step"], data=steps.astype("timedelta64[s]").astype("float64") / 3600.0)
             store_coord_var(key=f"{base_path}/{key[2]}", zstore=zstore, coords=(key[2],) if lvals.shape else (), data=lvals)
 
             store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims, coords=coords, data=group, steps=steps, times=times, lvals=lvals if lvals.shape else None)
+            
+            logger.info(json.dumps({
+                "event": "group_processed",
+                "varname": key[0],
+                "stepType": key[1],
+                "typeOfLevel": key[2]
+            }))
         except Exception as e:
-            logger.error(f"Error processing group {key}: {str(e)}")
+            logger.error(json.dumps({
+                "event": "error_processing_group",
+                "group": key,
+                "error": str(e)
+            }))
 
+    logger.info(json.dumps({
+        "event": "unique_groups_processed",
+        "total_groups": len(unique_groups)
+    }))
     return zstore
 
-
+@log_function_call
 def create_parquet_file(zstore: dict, output_parquet_file: str):
     """
     Converts a dictionary containing Zarr store data to a DataFrame and saves it as a Parquet file.
 
-    This function encapsulates the Zarr store data within a dictionary, converts this dictionary to a pandas DataFrame,
-    and then writes the DataFrame to a Parquet file. This is useful for persisting Zarr metadata and references
-    in a compressed and efficient format that can be easily reloaded.
-
     Parameters:
     - zstore (dict): The Zarr store dictionary containing all references and data needed for Zarr operations.
     - output_parquet_file (str): The path where the Parquet file will be saved.
-
-    This function first creates an internal dictionary that includes versioning information, then iterates over
-    the items in the Zarr store. For each item, it checks if the value is a dictionary, list, or a numeric type,
-    and encodes it as a UTF-8 string if necessary. This encoded data is then used to create a DataFrame, which
-    is subsequently written to a Parquet file. The function logs both the beginning of the operation and its
-    successful completion, noting the location of the saved Parquet file.
     """
-    logger.info("Creating and Saving Parquet File")
+    logger = logging.getLogger()
     gfs_store = dict(refs=zstore, version=1)  # Include versioning for the store structure
 
     def dict_to_df(zstore: dict):
-        """
-        Helper function to convert dictionary to pandas DataFrame with columns 'key' and 'value'.
-
-        Parameters:
-        - zstore (dict): The dictionary representing the Zarr store.
-
-        Returns:
-        - pd.DataFrame: DataFrame with two columns: 'key' representing the dictionary keys, and 'value'
-                        representing the dictionary values, which are encoded in UTF-8 if they are of type
-                        dictionary, list, or numeric.
-        """
         data = []
         for key, value in zstore.items():
-            # Convert dictionaries, lists, or numeric types to UTF-8 encoded strings
             if isinstance(value, (dict, list, int, float, np.integer, np.floating)):
                 value = str(value).encode('utf-8')
             data.append((key, value))
@@ -294,140 +336,143 @@ def create_parquet_file(zstore: dict, output_parquet_file: str):
 
     zstore_df = dict_to_df(gfs_store)
     zstore_df.to_parquet(output_parquet_file)
-    logger.info(f"Parquet file saved to {output_parquet_file}")
+    logger.info(json.dumps({
+        "event": "parquet_file_created",
+        "file_path": output_parquet_file,
+        "rows_count": len(zstore_df)
+    }))
 
-
-
+@log_function_call
 def generate_axes(date_str: str) -> List[pd.Index]:
     """
     Generate temporal axes indices for a given forecast start date over a predefined forecast period.
     
-    This function creates two pandas Index objects: one for 'valid_time' and another for 'time'. 
-    The 'valid_time' index represents a sequence of datetime stamps for each hour over a 5-day forecast period, 
-    starting from the given start date. The 'time' index captures the single forecast initiation date.
-
     Parameters:
     - date_str (str): The start date of the forecast, formatted as 'YYYYMMDD'.
 
     Returns:
-    - List[pd.Index]: A list containing two pandas Index objects:
-      1. 'valid_time' index with datetime stamps spaced one hour apart, covering a 5-day range from the start date.
-      2. 'time' index representing the single start date of the forecast as a datetime object.
-
-    Example:
-    For a given start date '20230101', this function will return two indices:
-    - The first index will span from '2023-01-01 00:00' to '2023-01-06 00:00' with hourly increments.
-    - The second index will contain just the single datetime '2023-01-01 00:00'.
-
-    These indices are typically used to set up time coordinates in weather or climate models and datasets,
-    facilitating data alignment and retrieval based on forecast times.
+    - List[pd.Index]: A list containing two pandas Index objects for 'valid_time' and 'time'.
     """
+    logger = logging.getLogger()
     start_date = pd.Timestamp(date_str)
     end_date = start_date + pd.Timedelta(days=5)  # Forecast period of 5 days
 
     valid_time_index = pd.date_range(start_date, end_date, freq="60min", name="valid_time")
     time_index = pd.Index([start_date], name="time")
 
+    logger.info(json.dumps({
+        "event": "axes_generated",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "valid_time_count": len(valid_time_index)
+    }))
+
     return [valid_time_index, time_index]
 
-
-
-
+@log_function_call
 def generate_gfs_dates(year: int, month: int) -> List[str]:
     """
-    Generate a list of dates for a specific month and year, formatted as 'YYYYMMDD', to cover the full range of days in the specified month.
-
-    This function computes the total number of days in the given month of the specified year and generates a complete list of dates.
-    This is particularly useful for scheduling tasks or simulations that require a complete temporal scope of a month for processes like
-    weather forecasting or data collection where daily granularity is needed.
+    Generate a list of dates for a specific month and year, formatted as 'YYYYMMDD'.
 
     Parameters:
     - year (int): The year for which the dates are to be generated.
-    - month (int): The month for which the dates are to be generated, where 1 represents January and 12 represents December.
+    - month (int): The month for which the dates are to be generated.
 
     Returns:
     - List[str]: A list of dates in the format 'YYYYMMDD' for every day in the specified month and year.
-
-    Example:
-    For inputs year=2023 and month=1, the output will be:
-    ['20230101', '20230102', '20230103', ..., '20230130', '20230131']
-    
-    This example demonstrates generating dates for January 2023, resulting in a list that includes every day from January 1st to 31st.
     """
-    # Get the last day of the month using the monthrange function from the calendar module
+    logger = logging.getLogger()
     _, last_day = monthrange(year, month)
     
-    # Generate a date range for the entire month from the first to the last day
     date_range = pd.date_range(start=f'{year}-{month:02d}-01', 
                                end=f'{year}-{month:02d}-{last_day}', 
                                freq='D')
     
-    # Convert the date range to a list of strings formatted as 'YYYYMMDD'
-    return date_range.strftime('%Y%m%d').tolist()
+    date_list = date_range.strftime('%Y%m%d').tolist()
+
+    logger.info(json.dumps({
+        "event": "gfs_dates_generated",
+        "year": year,
+        "month": month,
+        "dates_count": len(date_list)
+    }))
+
+    return date_list
 
 
-
-
-
+@log_function_call
 def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parquet_file: str, log_level: int = logging.INFO):
     """
-    Orchestrates the end-to-end processing of Global Forecast System (GFS) data for a specific date. This function
-    integrates several steps including reading GFS files, calculating time dimensions, mapping data, preparing Zarr
-    stores, processing unique data groups, and finally saving the processed data to a Parquet file.
-
-    This function is designed to automate the workflow for daily GFS data processing, ensuring that each step is
-    logged and any issues are reported for troubleshooting.
+    Orchestrates the end-to-end processing of Global Forecast System (GFS) data for a specific date.
 
     Parameters:
     - date_str (str): A date string in the format 'YYYYMMDD' representing the date for which GFS data is to be processed.
     - mapping_parquet_file_path (str): Path to the parquet file that contains mapping information for the GFS data.
     - output_parquet_file (str): Path where the output Parquet file will be saved after processing the data.
-    - log_level (int): Logging level to use for reporting within this function. Default is logging.INFO.
-
-    Workflow:
-    1. Set up logging based on the specified log level.
-    2. Generate time axes for the date specified by `date_str`.
-    3. List GFS file paths for the initial and subsequent model outputs.
-    4. Build a GFS grib tree for storing and managing data hierarchically.
-    5. Calculate the time dimensions and coordinates necessary for data processing.
-    6. Create a mapped index based on the generated axes and specified parquet mapping file.
-    7. Prepare the Zarr store for efficient data manipulation and storage.
-    8. Process unique data groups, organizing and formatting the data as required.
-    9. Save the processed data to a Parquet file for durable storage.
-
-    Exceptions:
-    - Raises an exception if an error occurs during the processing steps, with the error logged for diagnostic purposes.
-
-    Example:
-    To process GFS data for January 1st, 2021, call the function as follows:
-    process_gfs_data('20210101', '/path/to/mapping.parquet/', '/output/path/20210101_processed.parquet')
-    
-    This will execute the entire data processing pipeline for the specified date and save the results in the designated output file.
+    - log_level (int): Logging level to use.
     """
-    setup_logging(log_level)
+    setup_logging(log_level, f"gfs_processing_{date_str}.log")
+    logger = logging.getLogger()
     
     try:
-        logger.info(f"Processing date: {date_str}")
+        logger.info(json.dumps({
+            "event": "processing_started",
+            "date": date_str
+        }))
+
+        # Step 1: Generate axes
+        logger.info(json.dumps({"event": "step_started", "step": "generate_axes"}))
         axes = generate_axes(date_str)
+        logger.info(json.dumps({"event": "step_completed", "step": "generate_axes"}))
+
+        # Step 2: Define GFS files
+        logger.info(json.dumps({"event": "step_started", "step": "define_gfs_files"}))
         gfs_files = [
             f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f000",
             f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f001"
         ]
+        logger.info(json.dumps({"event": "step_completed", "step": "define_gfs_files", "files": gfs_files}))
+
+        # Step 3: Build GRIB tree
+        logger.info(json.dumps({"event": "step_started", "step": "build_grib_tree"}))
         _, deflated_gfs_grib_tree_store = build_grib_tree(gfs_files)
+        logger.info(json.dumps({"event": "step_completed", "step": "build_grib_tree"}))
+
+        # Step 4: Calculate time dimensions
+        logger.info(json.dumps({"event": "step_started", "step": "calculate_time_dimensions"}))
         time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
+        logger.info(json.dumps({"event": "step_completed", "step": "calculate_time_dimensions"}))
+
+        # Step 5: Create mapped index
+        logger.info(json.dumps({"event": "step_started", "step": "create_mapped_index"}))
         gfs_kind = create_mapped_index(axes, mapping_parquet_file_path, date_str)
-        
+        logger.info(json.dumps({"event": "step_completed", "step": "create_mapped_index"}))
+
+        # Step 6: Prepare Zarr store
+        logger.info(json.dumps({"event": "step_started", "step": "prepare_zarr_store"}))
         zstore, chunk_index = prepare_zarr_store(deflated_gfs_grib_tree_store, gfs_kind)
+        logger.info(json.dumps({"event": "step_completed", "step": "prepare_zarr_store"}))
+
+        # Step 7: Process unique groups
+        logger.info(json.dumps({"event": "step_started", "step": "process_unique_groups"}))
         updated_zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords, times, valid_times, steps)
+        logger.info(json.dumps({"event": "step_completed", "step": "process_unique_groups"}))
+
+        # Step 8: Create Parquet file
+        logger.info(json.dumps({"event": "step_started", "step": "create_parquet_file"}))
         create_parquet_file(updated_zstore, output_parquet_file)
+        logger.info(json.dumps({"event": "step_completed", "step": "create_parquet_file"}))
+
+        logger.info(json.dumps({
+            "event": "processing_completed",
+            "date": date_str,
+            "output_file": output_parquet_file
+        }))
     except Exception as e:
-        logger.error(f"An error occurred during processing: {str(e)}")
+        logger.error(json.dumps({
+            "event": "processing_error",
+            "date": date_str,
+            "step": logger.info['event'],  # This will capture the last step that was logged
+            "error": str(e)
+        }))
         raise
-
-
-
-
-
-
-
-
