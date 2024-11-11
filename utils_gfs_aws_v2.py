@@ -12,6 +12,8 @@ from dynamic_zarr_store import (
 )
 from calendar import monthrange
 
+from google.cloud import storage
+
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_data = {
@@ -66,6 +68,11 @@ def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
     - Tuple[dict, dict]: Original and deflated GRIB tree stores.
     """
     logger = logging.getLogger()
+    logger.info(json.dumps({
+        "event": "started building of grib_tree_built",
+        "original_refs": len(gfs_grib_tree_store['refs']),
+        "stripped_refs": len(deflated_gfs_grib_tree_store['refs'])
+    }))
     gfs_grib_tree_store = grib_tree([group for f in gfs_files for group in scan_grib(f)])
     deflated_gfs_grib_tree_store = copy.deepcopy(gfs_grib_tree_store)
     strip_datavar_chunks(deflated_gfs_grib_tree_store)
@@ -398,6 +405,42 @@ def generate_gfs_dates(year: int, month: int) -> List[str]:
     }))
 
     return date_list
+
+
+
+@log_function_call
+def upload_file_to_gcs(bucket_name: str, source_file_name: str, destination_blob_name: str):
+    """
+    Upload a file to a GCS bucket.
+
+    Parameters:
+    - bucket_name (str): Name of the GCS bucket.
+    - source_file_name (str): Local path to the file to be uploaded.
+    - destination_blob_name (str): The destination path within the bucket.
+    """
+    logger = logging.getLogger()
+    try:
+        # Initializes a client using the credentials and project details from environment
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+
+        blob.upload_from_filename(source_file_name)
+
+        logger.info(json.dumps({
+            "event": "file_uploaded",
+            "file_name": source_file_name,
+            "bucket": bucket_name,
+            "destination": destination_blob_name
+        }))
+    except Exception as e:
+        logger.error(json.dumps({
+            "event": "upload_failed",
+            "file_name": source_file_name,
+            "bucket": bucket_name,
+            "error": str(e)
+        }))
+        raise
 
 
 @log_function_call

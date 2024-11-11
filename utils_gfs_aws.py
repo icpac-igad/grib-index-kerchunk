@@ -1,15 +1,26 @@
 import os
 import logging
+import traceback 
+import copy
+import tempfile
+from typing import List, Dict, Tuple, final
+from calendar import monthrange
+import re
+import pathlib
+
 import pandas as pd
 import numpy as np
 import fsspec
-import copy
-from typing import List, Dict, Tuple, final
+import dask 
+import json
+from distributed import get_worker
+
+from google.cloud import storage 
 from dynamic_zarr_store import (
     AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
-    parse_grib_idx, map_from_index, store_coord_var, store_data_var
+    parse_grib_idx, map_from_index, store_coord_var, store_data_var,
+    build_idx_grib_mapping
 )
-from calendar import monthrange
 
 
 logger = logging.getLogger(__name__)
@@ -170,7 +181,108 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     logger.info(f"Mapped collected multiple variables index info: {len(final_var_list)} and {final_var_list}")
     return final_df
 
+def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str: str) -> pd.DataFrame:
+    """
+    Create a mapped index from GFS files for a specific date, using the mapping from a parquet file stored in GCS.
+    
+    Parameters:
+    - axes (List[pd.Index]): List of time axes to map.
+    - gcs_bucket_name (str): Name of the GCS bucket containing mapping files.
+    - date_str (str): Date string for the data being processed (format: YYYYMMDD).
+    
+    Returns:
+    - pd.DataFrame: DataFrame containing the mapped index for the specified date.
+    """
+    logger = logging.getLogger()
+    mapped_index_list = []
+    dtaxes = axes[0]
 
+    # Convert date_str to first day of the month
+    first_day_of_month = pd.to_datetime(date_str).replace(day=1).strftime('%Y%m%d')
+    
+    # Initialize GCS filesystem
+    gcs_fs = fsspec.filesystem('gcs')
+    
+    for idx, datestr in enumerate(dtaxes):
+        try:
+            # S3 path for the GFS data
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            
+            # Parse the idx file from S3
+            idxdf = parse_grib_idx(
+                fs=fsspec.filesystem("s3"),
+                basename=fname
+            )
+            
+            # Construct GCS path for mapping file
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/20231201/agfs-time-20231201-rt{idx:03}.parquet"
+            
+            # Read parquet directly from GCS using fsspec
+            deduped_mapping = pd.read_parquet(
+                gcs_mapping_path,
+                filesystem=gcs_fs
+            )
+            
+            mapped_index = map_from_index(
+                datestr,
+                deduped_mapping,
+                idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+            )
+            mapped_index_list.append(mapped_index)
+            
+            logger.info(json.dumps({
+                "event": "file_processed",
+                "date": date_str,
+                "file_index": idx,
+                "mapping_file": gcs_mapping_path
+            }))
+            
+        except Exception as e:
+            logger.error(json.dumps({
+                "event": "error_processing_file",
+                "date": date_str,
+                "file_index": idx,
+                "error": str(e)
+            }))
+            continue
+
+    if not mapped_index_list:
+        raise ValueError(f"No valid mapped indices created for date {date_str}")
+
+    # Combine all mapped indices
+    gfs_kind = pd.concat(mapped_index_list)
+    
+    # Get unique variables
+    gfs_kind_var = gfs_kind.drop_duplicates('varname')
+    var_list = gfs_kind_var['varname'].tolist()
+    
+    # Define variables to process separately
+    var_to_remove = ['acpcp', 'cape', 'cin', 'pres', 'r', 'soill', 'soilw', 'st', 't', 'tp']
+    
+    # Filter variables
+    var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
+    gfs_kind1 = gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
+    
+    # Process special variables
+    to_process_df = gfs_kind[gfs_kind['varname'].isin(var_to_remove)]
+    processed_df = process_dataframe(to_process_df, var_to_remove)
+    
+    # Combine processed and unprocessed data
+    final_df = pd.concat([gfs_kind1, processed_df], ignore_index=True)
+    final_df = final_df.sort_values(by=['time', 'varname'])
+    
+    # Get final variable list for logging
+    final_df_var = final_df.drop_duplicates('varname')
+    final_var_list = final_df_var['varname'].tolist()
+    
+    logger.info(json.dumps({
+        "event": "mapping_completed",
+        "date": date_str,
+        "variables_count": len(final_var_list),
+        "variables": final_var_list
+    }))
+    
+    return final_df
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
     """
@@ -424,10 +536,194 @@ def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parqu
         logger.error(f"An error occurred during processing: {str(e)}")
         raise
 
+# Set up basic logging configuration
+def setup_logger():
+    """Configure logging for both main process and workers"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()  # Log to console
+        ]
+    )
+    return logging.getLogger(__name__)
+
+# Create logger instance
+logger = setup_logger()
+
+def get_details(url):
+    """Extract date and time details from GFS URL."""
+    pattern = r"s3://noaa-gfs-bdp-pds/gfs\.(\d{8})/(\d{2})/atmos/gfs\.t(\d{2})z\.pgrb2\.0p25\.f(\d{3})"
+    match = re.match(pattern, url)
+    if match:
+        date = match.group(1)  # Captures '20241010'
+        run = match.group(2)   # Captures '00'
+        hour = match.group(4)  # Captures '003'
+        return date, run, hour
+    else:
+        logger.warning(f"No match found for URL pattern: {url}")
+        return None, None, None
+
+def gfs_s3_url_maker(date_str):
+    """Create S3 URLs for GFS data."""
+    fs_s3 = fsspec.filesystem("s3", anon=True)
+    s3url_glob = fs_s3.glob(
+        f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f*"
+    )
+    s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "idx"]
+    fmt_s3og = sorted(["s3://" + f for f in s3url_only_grib])
+    logger.debug(f"Generated {len(fmt_s3og)} URLs for date {date_str}")
+    return fmt_s3og
 
 
+def get_filename_from_path(file_path):
+    """Extract filename from full path"""
+    return os.path.basename(file_path)
+
+def old_upload_to_gcs(bucket_name, source_file_name, destination_blob_name, dask_worker_credentials_path):
+    """Uploads a file to the GCS bucket using provided service account credentials."""
+    try:
+        # Get just the filename from the credentials path
+        #creds_filename = get_filename_from_path(credentials_path)
+        # Construct the worker-local path
+        #worker_creds_path = os.path.join(os.getcwd(), creds_filename)
+        #credentials_path = "/app/coiled-data-key.json"
+        #credentials_path = os.path.join(os.getcwd(), creds_filename)
+        #credentials_path = os.path.join(tempfile.gettempdir(), creds_filename)
+        logger.info(f"Using credentials file at: {dask_worker_credentials_path}")
+        
+        if not os.path.exists(dask_worker_credentials_path):
+            raise FileNotFoundError(f"Credentials file not found at {dask_worker_credentials_path}")
+            
+        storage_client = storage.Client.from_service_account_json(dask_worker_credentials_path)
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        blob.upload_from_filename(source_file_name)
+        logger.info(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
+    except Exception as e:
+        logger.error(f"Failed to upload file to GCS: {str(e)}")
+        raise
+
+def get_worker_creds_path(dask_worker):
+    return str(pathlib.Path(dask_worker.local_directory) / 'coiled-data-key.json')
 
 
+def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
+    """Uploads a file to the GCS bucket using provided service account credentials."""
+    try:
+        # Get the worker's local directory path for credentials
+                    
+        # Get current worker's credentials path
+        worker = get_worker()
+        worker_creds_path = get_worker_creds_path(worker)
+        
+        logger.info(f"Using credentials file at: {worker_creds_path}")
+        
+        storage_client = storage.Client.from_service_account_json(worker_creds_path)
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        blob.upload_from_filename(source_file_name)
+        logger.info(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
+    except Exception as e:
+        logger.error(f"Failed to upload file to GCS: {str(e)}")
+        raise
 
 
+@dask.delayed
+def process_gfs_time_idx_data(s3url, bucket_name):
+    """Process GFS data and upload to GCS."""
+    # Ensure logger is set up in the worker process
+    worker_logger = setup_logger()
+    
+    try:
+        worker_logger.info(f"Processing: {s3url}")
+        date_str, runz, runtime = get_details(s3url)
+        #worker_creds_path = os.path.join(dask_worker.local_directory, credentials_path)
+        #worker_logger.info(f"Using credentials from: {worker_creds_path}")
+        
+        if not all([date_str, runz, runtime]):
+            worker_logger.error(f"Invalid URL format: {s3url}")
+            return False
+
+        # Build mapping for the specified runtime
+        mapping = build_idx_grib_mapping(
+            fs=fsspec.filesystem("s3"),
+            basename=s3url 
+        )
+        deduped_mapping = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
+        deduped_mapping.set_index('attrs', inplace=True)
+        
+        # Save deduped mapping as Parquet
+        output_dir = f"gfs_mapping_{date_str}"
+        os.makedirs(output_dir, exist_ok=True)
+        parquet_path = os.path.join(output_dir, f"gfs-time-{date_str}-rt{int(runtime):03}.parquet")
+        deduped_mapping.to_parquet(parquet_path, index=True)
+        
+        # Upload to GCS
+        destination_blob_name = f"time_idx/2023/{date_str}/{os.path.basename(parquet_path)}"
+        upload_to_gcs(bucket_name, parquet_path, destination_blob_name)
+        
+        # Cleanup
+        os.remove(parquet_path)
+        worker_logger.info(f"Data for {date_str} runtime {runtime} has been processed and uploaded successfully.")
+        return True
+    except Exception as e:
+        worker_logger.error(f"Failed to process data for URL {s3url}: {str(e)}")
+        worker_logger.error(traceback.format_exc())
+        raise
+
+
+#@dask.delayed
+def logged_process_gfs_time_idx_data(s3url, bucket_name):
+    """Process GFS data and upload to GCS, logging results to individual GCS logs."""
+    
+    # Parse date_str and other details from the URL
+    date_str, runz, runtime = get_details(s3url)
+    year=date_str[0:3]
+    
+    # Create a temporary log file for this specific URL with date_str in the name
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=f"_{date_str}_{runtime}.log", delete=False) as log_file:
+        log_filename = log_file.name
+        worker_logger = setup_logger(log_file.name)  # Log messages will go to this file
+
+        try:
+            worker_logger.info(f"Processing: {s3url}")
+
+            if not all([date_str, runz, runtime]):
+                worker_logger.error(f"Invalid URL format: {s3url}")
+                return False
+
+            # Build mapping for the specified runtime
+            mapping = build_idx_grib_mapping(
+                fs=fsspec.filesystem("s3"),
+                basename=s3url 
+            )
+            deduped_mapping = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
+            deduped_mapping.set_index('attrs', inplace=True)
+
+            # Save deduped mapping as Parquet
+            output_dir = f"gfs_mapping_{date_str}"
+            os.makedirs(output_dir, exist_ok=True)
+            parquet_path = os.path.join(output_dir, f"gfs-time-{date_str}-rt{int(runtime):03}.parquet")
+            deduped_mapping.to_parquet(parquet_path, index=True)
+
+            # Upload to GCS
+            destination_blob_name = f"time_idx/year/{date_str}/{os.path.basename(parquet_path)}"
+            upload_to_gcs(bucket_name, parquet_path, destination_blob_name)
+
+            # Cleanup
+            os.remove(parquet_path)
+            worker_logger.info(f"Data for {date_str} runtime {runtime} has been processed and uploaded successfully.")
+            process_success = True
+        except Exception as e:
+            worker_logger.error(f"Failed to process data for URL {s3url}: {str(e)}")
+            worker_logger.error(traceback.format_exc())
+            process_success = False
+        finally:
+            # Upload log file to GCS for later inspection
+            gcs_log_path = f"time_idx/2023/logs/{date_str}/{os.path.basename(log_filename)}"
+            upload_to_gcs(bucket_name, log_filename, gcs_log_path)
+            os.remove(log_filename)  # Remove the temporary log file after uploading
+
+        return process_success
 

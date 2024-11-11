@@ -5,8 +5,11 @@ import numpy as np
 import fsspec
 import copy
 from typing import List, Dict, Tuple
+
+from kerchunk.grib2 import scan_grib, grib_tree
+
 from dynamic_zarr_store import (
-    AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
+    AggregationType, strip_datavar_chunks,
     parse_grib_idx, map_from_index, store_coord_var, store_data_var
 )
 from calendar import monthrange
