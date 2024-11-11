@@ -1162,3 +1162,304 @@ class KerchunkZarrDictStorageManager:
         
         return True
 
+
+import os
+import sys
+import dask
+import coiled
+import logging
+#from dotenv import load_dotenv
+
+import dask
+import coiled
+import pathlib
+from datetime import datetime, timedelta
+
+#load_dotenv()
+
+# Add the GFS_PROCESSOR_PATH to sys.path
+#gfs_processor_path = os.getenv("sgutils_path")
+#gcs_sa_path = os.getenv("gcs_sa_path")
+#if gfs_processor_path and os.path.isdir(gfs_processor_path):
+#    sys.path.append(gfs_processor_path)
+#else:
+#    raise ValueError("GFS_PROCESSOR_PATH is not defined or is not a valid directory.")
+
+
+from utils_gfs_aws import gfs_s3_url_maker, process_gfs_time_idx_data, setup_logger, get_filename_from_path, cs_create_mapped_index
+
+from utils_gfs_aws import generate_axes, build_grib_tree,calculate_time_dimensions, process_dataframe
+
+from dynamic_zarr_store import (
+    AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
+    parse_grib_idx, map_from_index, store_coord_var, store_data_var
+)
+
+import asyncio
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Tuple
+import pandas as pd
+import fsspec
+import math
+from functools import partial
+import json 
+
+from google.auth import credentials
+import gcsfs
+
+logger = logging.getLogger(__name__)
+
+
+async def old_process_single_file(
+    date_str: str,
+    first_day_of_month: str,
+    gcs_bucket_name: str,
+    idx: int,
+    datestr: pd.Timestamp,
+    sem: asyncio.Semaphore,
+    executor: ThreadPoolExecutor,
+    chunk_size: Optional[int] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Process a single file asynchronously with memory management.
+    
+    Parameters:
+    - date_str: The date string for the GFS data
+    - first_day_of_month: First day of the month for mapping files
+    - gcs_bucket_name: GCS bucket name
+    - idx: File index
+    - datestr: Timestamp for the data
+    - sem: Semaphore for controlling concurrent operations
+    - executor: ThreadPoolExecutor for CPU-bound operations
+    - chunk_size: Optional size for chunked reading
+    """
+    async with sem:  # Control concurrent operations
+        try:
+            # S3 path for GFS data
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            #gcs_mapping_path = f"gs://{gcs_bucket_name}/gfs_mapping/{first_day_of_month}/gfs-mapping-{idx:03}.parquet"
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/20231201/agfs-time-20231201-rt{idx:03}.parquet"
+
+            
+            # Use ThreadPoolExecutor for I/O operations
+            loop = asyncio.get_event_loop()
+            
+            # Read idx file
+            idxdf = await loop.run_in_executor(
+                executor,
+                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
+            )
+            
+            # Initialize GCS filesystem
+            gcs_fs = fsspec.filesystem('gcs')
+            
+            # Read parquet in chunks if chunk_size is specified
+            if chunk_size:
+                deduped_mapping_chunks = []
+                for chunk in pd.read_parquet(gcs_mapping_path, filesystem=gcs_fs, chunksize=chunk_size):
+                    deduped_mapping_chunks.append(chunk)
+                deduped_mapping = pd.concat(deduped_mapping_chunks, ignore_index=True)
+            else:
+                deduped_mapping = await loop.run_in_executor(
+                    executor,
+                    partial(pd.read_parquet, gcs_mapping_path, filesystem=gcs_fs)
+                )
+            
+            # Process the mapping
+            idxdf_filtered = idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+            mapped_index = await loop.run_in_executor(
+                executor,
+                partial(map_from_index, datestr, deduped_mapping, idxdf_filtered)
+            )
+            
+            return mapped_index
+            
+        except Exception as e:
+            logger.error(json.dumps({
+                "event": "error_processing_file",
+                "date": date_str,
+                "file_index": idx,
+                "error": str(e)
+            }))
+            return None
+
+async def process_single_file(
+    date_str: str,
+    first_day_of_month: str,
+    gcs_bucket_name: str,
+    idx: int,
+    datestr: pd.Timestamp,
+    sem: asyncio.Semaphore,
+    executor: ThreadPoolExecutor,
+    gcp_service_account_json: str,
+    chunk_size: Optional[int] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Process a single file asynchronously with memory management.
+    
+    Additional Parameter:
+    - gcp_service_account_json: Path to the GCP service account JSON file.
+    """
+    async with sem:  # Control concurrent operations
+        try:
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/20231201/agfs-time-20231201-rt{idx:03}.parquet"
+            
+            # Initialize GCS filesystem with credentials
+            gcs_fs = gcsfs.GCSFileSystem(token=gcp_service_account_json)
+            
+            loop = asyncio.get_event_loop()
+            
+            # Read idx file
+            idxdf = await loop.run_in_executor(
+                executor,
+                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
+            )
+            
+            # Read parquet in chunks if chunk_size is specified
+            if chunk_size:
+                deduped_mapping_chunks = []
+                for chunk in pd.read_parquet(gcs_mapping_path, filesystem=gcs_fs, chunksize=chunk_size):
+                    deduped_mapping_chunks.append(chunk)
+                deduped_mapping = pd.concat(deduped_mapping_chunks, ignore_index=True)
+            else:
+                deduped_mapping = await loop.run_in_executor(
+                    executor,
+                    partial(pd.read_parquet, gcs_mapping_path, filesystem=gcs_fs)
+                )
+            
+            # Process the mapping
+            idxdf_filtered = idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+            mapped_index = await loop.run_in_executor(
+                executor,
+                partial(map_from_index, datestr, deduped_mapping, idxdf_filtered)
+            )
+            
+            return mapped_index
+            
+        except Exception as e:
+            logger.error(json.dumps({
+                "event": "error_processing_file",
+                "date": date_str,
+                "file_index": idx,
+                "error": str(e)
+            }))
+            return None
+
+
+
+async def process_files_in_batches(
+    axes: List[pd.Index],
+    gcs_bucket_name: str,
+    date_str: str,
+    max_concurrent: int = 3,
+    batch_size: int = 5,
+    chunk_size: Optional[int] = None,
+    gcp_service_account_json: Optional[str] = None  # Add the parameter here
+) -> pd.DataFrame:
+    """
+    Process files in batches with controlled concurrency and memory usage.
+    
+    Additional Parameter:
+    - gcp_service_account_json: Path to the GCP service account JSON file.
+    """
+    dtaxes = axes[0]
+    first_day_of_month = pd.to_datetime(date_str).replace(day=1).strftime('%Y%m%d')
+    
+    # Create semaphore for controlling concurrent operations
+    sem = asyncio.Semaphore(max_concurrent)
+    
+    # Initialize thread pool executor
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        all_results = []
+        
+        # Process in batches
+        for batch_start in range(0, len(dtaxes), batch_size):
+            batch_end = min(batch_start + batch_size, len(dtaxes))
+            batch_indices = range(batch_start, batch_end)
+            
+            # Create tasks for current batch
+            tasks = [
+                process_single_file(
+                    date_str,
+                    first_day_of_month,
+                    gcs_bucket_name,
+                    idx,
+                    dtaxes[idx],
+                    sem,
+                    executor,
+                    gcp_service_account_json,  # Pass the parameter here
+                    chunk_size
+                )
+                for idx in batch_indices
+            ]
+            
+            # Wait for batch completion
+            batch_results = await asyncio.gather(*tasks)
+            
+            # Filter out None results and extend all_results
+            valid_results = [r for r in batch_results if r is not None]
+            all_results.extend(valid_results)
+            
+            # Optional: Clear memory after each batch
+            batch_results = None
+            
+            logger.info(json.dumps({
+                "event": "batch_processed",
+                "batch_start": batch_start,
+                "batch_end": batch_end,
+                "valid_results": len(valid_results)
+            }))
+    
+    # Combine results and process
+    if not all_results:
+        raise ValueError(f"No valid mapped indices created for date {date_str}")
+    
+    gfs_kind = pd.concat(all_results, ignore_index=True)
+    
+    # Process variables as before
+    gfs_kind_var = gfs_kind.drop_duplicates('varname')
+    var_list = gfs_kind_var['varname'].tolist()
+    var_to_remove = ['acpcp', 'cape', 'cin', 'pres', 'r', 'soill', 'soilw', 'st', 't', 'tp']
+    var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
+    
+    # Split processing into smaller chunks if needed
+    gfs_kind1 = gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
+    to_process_df = gfs_kind[gfs_kind['varname'].isin(var_to_remove)]
+    processed_df = process_dataframe(to_process_df, var_to_remove)
+    
+    final_df = pd.concat([gfs_kind1, processed_df], ignore_index=True)
+    final_df = final_df.sort_values(by=['time', 'varname'])
+    
+    return final_df
+
+def cs_create_mapped_index(
+    axes: List[pd.Index],
+    gcs_bucket_name: str,
+    date_str: str,
+    max_concurrent: int = 10,
+    batch_size: int = 20,
+    chunk_size: Optional[int] = None,
+    gcp_service_account_json: Optional[str] = None  # Add the parameter here
+) -> pd.DataFrame:
+    """
+    Async wrapper for creating mapped index with memory management.
+    
+    Additional Parameter:
+    - gcp_service_account_json: Path to the GCP service account JSON file.
+    """
+    return asyncio.run(
+        process_files_in_batches(
+            axes,
+            gcs_bucket_name,
+            date_str,
+            max_concurrent,
+            batch_size,
+            chunk_size,
+            gcp_service_account_json  # Pass the parameter here
+        )
+    )
+
+
+
