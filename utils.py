@@ -20,6 +20,17 @@ import dask
 import json
 from distributed import get_worker
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+from google.cloud import storage
+import fsspec
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List
+import json
+import base64
+
+
 from google.cloud import storage 
 
 from kerchunk.grib2 import scan_grib, grib_tree, _split_file
@@ -944,4 +955,210 @@ def s3_parse_ecmwf_grib_idx(
     return result.set_index("idx")
 
 
+class KerchunkZarrDictStorageManager:
+    """Manages storage and retrieval of Kerchunk Zarr dictionaries in Google Cloud Storage."""
+    
+    def __init__(
+        self, 
+        bucket_name: str,
+        service_account_file: Optional[str] = None,
+        service_account_info: Optional[Dict] = None
+    ):
+        """
+        Initialize the storage manager with GCP credentials.
+        
+        Args:
+            bucket_name (str): Name of the GCS bucket
+            service_account_file (str, optional): Path to service account JSON file
+            service_account_info (dict, optional): Service account info as dictionary
+            
+        Note:
+            Provide either service_account_file OR service_account_info, not both.
+            If neither is provided, defaults to application default credentials.
+        """
+        self.bucket_name = bucket_name
+        
+        # Handle credentials
+        if service_account_file and service_account_info:
+            raise ValueError("Provide either service_account_file OR service_account_info, not both")
+        
+        if service_account_file:
+            # Load credentials from file
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_file,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            # Load the JSON content for fsspec
+            with open(service_account_file, 'r') as f:
+                self.service_account_info = json.load(f)
+        elif service_account_info:
+            # Use provided service account info
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info,
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            self.service_account_info = service_account_info
+        else:
+            credentials = None
+            self.service_account_info = None
+        
+        # Initialize storage client
+        self.storage_client = storage.Client(credentials=credentials)
+        
+        # Initialize fsspec filesystem with the same credentials
+        if self.service_account_info:
+            self.gcs_fs = fsspec.filesystem(
+                'gcs', 
+                token=self.service_account_info
+            )
+        else:
+            self.gcs_fs = fsspec.filesystem('gcs')    
+
+    def _process_zarr_value(self, value: Any) -> Any:
+        """Process Zarr store values for storage."""
+        if isinstance(value, (bytes, bytearray)):
+            return base64.b64encode(value).decode('utf-8')
+        elif isinstance(value, (list, dict)):
+            return json.dumps(value)
+        return str(value)
+
+    def _restore_zarr_value(self, value: str, key: str) -> Any:
+        """Restore original Zarr store value from stored format."""
+        try:
+            # Try to parse as JSON first (for lists and dicts)
+            return json.loads(value)
+        except json.JSONDecodeError:
+            # Check if it's base64 encoded
+            try:
+                return base64.b64decode(value.encode('utf-8'))
+            except:
+                # Return as is if not base64
+                return value
+
+    def save_zarr_store(self, zarr_store: Dict[str, Any], filepath: str, 
+                       chunk_size: int = 10000) -> None:
+        """
+        Save Kerchunk Zarr store dictionary to GCS.
+        
+        Args:
+            zarr_store: Zarr store dictionary from grib_tree
+            filepath: GCS path (e.g., 'gs://bucket/path/zarr_store.parquet')
+            chunk_size: Number of keys per chunk for large stores
+        """
+        # Convert zarr store to rows
+        rows = []
+        for key, value in zarr_store.items():
+            processed_value = self._process_zarr_value(value)
+            rows.append({
+                'key': key,
+                'value': processed_value,
+                'value_type': type(value).__name__
+            })
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(rows)
+        
+        # Save in chunks if necessary
+        if len(df) > chunk_size:
+            num_chunks = (len(df) + chunk_size - 1) // chunk_size
+            for i in range(num_chunks):
+                chunk_df = df.iloc[i*chunk_size:(i+1)*chunk_size]
+                chunk_table = pa.Table.from_pandas(chunk_df)
+                chunk_path = f"{filepath}.chunk{i}"
+                
+                pq.write_table(
+                    chunk_table,
+                    chunk_path,
+                    filesystem=self.gcs_fs,
+                    compression='ZSTD',
+                    use_dictionary=True
+                )
+            
+            # Save metadata
+            metadata = {
+                'num_chunks': num_chunks,
+                'total_keys': len(df),
+                'schema_version': '1.0'
+            }
+            self.gcs_fs.write_text(
+                f"{filepath}.metadata",
+                json.dumps(metadata)
+            )
+        else:
+            # Save as single file
+            table = pa.Table.from_pandas(df)
+            pq.write_table(
+                table,
+                filepath,
+                filesystem=self.gcs_fs,
+                compression='ZSTD',
+                use_dictionary=True
+            )
+
+    def load_zarr_store(self, filepath: str) -> Dict[str, Any]:
+        """
+        Load Kerchunk Zarr store dictionary from GCS.
+        
+        Args:
+            filepath: GCS path
+        
+        Returns:
+            Dict representing the Zarr store
+        """
+        # Check if it's a chunked store
+        try:
+            metadata = json.loads(self.gcs_fs.read_text(f"{filepath}.metadata"))
+            is_chunked = True
+        except:
+            is_chunked = False
+        
+        if is_chunked:
+            # Load all chunks
+            dfs = []
+            for i in range(metadata['num_chunks']):
+                chunk_path = f"{filepath}.chunk{i}"
+                chunk_table = pq.read_table(chunk_path, filesystem=self.gcs_fs)
+                dfs.append(chunk_table.to_pandas())
+            df = pd.concat(dfs, ignore_index=True)
+        else:
+            # Load single file
+            table = pq.read_table(filepath, filesystem=self.gcs_fs)
+            df = table.to_pandas()
+        
+        # Reconstruct zarr store
+        zarr_store = {}
+        for _, row in df.iterrows():
+            zarr_store[row['key']] = self._restore_zarr_value(row['value'], row['key'])
+        
+        return zarr_store
+
+    def verify_zarr_store(self, zarr_store: Dict[str, Any], filepath: str) -> bool:
+        """
+        Verify the integrity of a saved Zarr store.
+        
+        Args:
+            zarr_store: Original Zarr store dictionary
+            filepath: GCS path where it was saved
+            
+        Returns:
+            bool: True if verification passes
+        """
+        loaded_store = self.load_zarr_store(filepath)
+        
+        # Compare keys
+        if set(zarr_store.keys()) != set(loaded_store.keys()):
+            return False
+        
+        # Compare values
+        for key in zarr_store:
+            if isinstance(zarr_store[key], (list, dict)):
+                if json.dumps(zarr_store[key]) != json.dumps(loaded_store[key]):
+                    return False
+            elif isinstance(zarr_store[key], (bytes, bytearray)):
+                if zarr_store[key] != loaded_store[key]:
+                    return False
+            elif str(zarr_store[key]) != str(loaded_store[key]):
+                return False
+        
+        return True
 
