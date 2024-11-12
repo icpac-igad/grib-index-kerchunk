@@ -105,12 +105,12 @@ def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
     Returns:
     - Tuple[dict, dict]: Original and deflated GRIB tree stores.
     """
-    logger.info("Building Grib Tree")
+    print("Building Grib Tree")
     gfs_grib_tree_store = grib_tree([group for f in gfs_files for group in scan_grib(f)])
     deflated_gfs_grib_tree_store = copy.deepcopy(gfs_grib_tree_store)
     strip_datavar_chunks(deflated_gfs_grib_tree_store)
-    logger.info(f"Original references: {len(gfs_grib_tree_store['refs'])}")
-    logger.info(f"Stripped references: {len(deflated_gfs_grib_tree_store['refs'])}")
+    print(f"Original references: {len(gfs_grib_tree_store['refs'])}")
+    print(f"Stripped references: {len(deflated_gfs_grib_tree_store['refs'])}")
     return gfs_grib_tree_store, deflated_gfs_grib_tree_store
 
 def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]:
@@ -123,7 +123,7 @@ def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndar
     Returns:
     - Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]: Time dimensions, coordinates, times, valid times, and steps.
     """
-    logger.info("Calculating Time Dimensions and Coordinates")
+    print("Calculating Time Dimensions and Coordinates")
     axes_by_name: Dict[str, pd.Index] = {pdi.name: pdi for pdi in axes}
     aggregation_type = AggregationType.BEST_AVAILABLE
     time_dims: Dict[str, int] = {}
@@ -200,7 +200,7 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     Returns:
     - pd.DataFrame: DataFrame containing the mapped index for the specified date.
     """
-    logger.info(f"Creating Mapped Index for date {date_str}")
+    print(f"Creating Mapped Index for date {date_str}")
     mapped_index_list = []
     dtaxes = axes[0]
 
@@ -239,7 +239,7 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     final_df_var=final_df.drop_duplicates('varname')
     final_var_list=final_df_var['varname'].tolist() 
 
-    logger.info(f"Mapped collected multiple variables index info: {len(final_var_list)} and {final_var_list}")
+    print(f"Mapped collected multiple variables index info: {len(final_var_list)} and {final_var_list}")
     return final_df
 
 def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str: str) -> pd.DataFrame:
@@ -254,7 +254,7 @@ def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str:
     Returns:
     - pd.DataFrame: DataFrame containing the mapped index for the specified date.
     """
-    logger = logging.getLogger()
+    #logger = logging.getLogger()
     mapped_index_list = []
     dtaxes = axes[0]
 
@@ -335,14 +335,7 @@ def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str:
     # Get final variable list for logging
     final_df_var = final_df.drop_duplicates('varname')
     final_var_list = final_df_var['varname'].tolist()
-    
-    logger.info(json.dumps({
-        "event": "mapping_completed",
-        "date": date_str,
-        "variables_count": len(final_var_list),
-        "variables": final_var_list
-    }))
-    
+        
     return final_df
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
@@ -356,7 +349,7 @@ def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFram
     Returns:
     - Tuple[dict, pd.DataFrame]: Zarr reference store and the DataFrame for chunk index.
     """
-    logger.info("Preparing Zarr Store")
+    print("Preparing Zarr Store")
     zarr_ref_store = deflated_gfs_grib_tree_store
     #chunk_index = gfs_kind.loc[gfs_kind.varname.isin(["t2m"])]
     chunk_index = gfs_kind
@@ -386,7 +379,7 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
     For each group, it determines appropriate dimensions and coordinates based on the unique levels present and updates
     the Zarr store with the processed data. It removes any data references that do not match the existing unique groups.
     """
-    logger.info("Processing Unique Groups and Updating Zarr Store")
+    print("Processing Unique Groups and Updating Zarr Store")
     unique_groups = chunk_index.set_index(["varname", "stepType", "typeOfLevel"]).index.unique()
 
     for key in list(zstore.keys()):
@@ -419,7 +412,7 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
 
             store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims, coords=coords, data=group, steps=steps, times=times, lvals=lvals if lvals.shape else None)
         except Exception as e:
-            logger.error(f"Error processing group {key}: {str(e)}")
+            print(f"Error processing group {key}: {str(e)}")
 
     return zstore
 
@@ -442,7 +435,6 @@ def create_parquet_file(zstore: dict, output_parquet_file: str):
     is subsequently written to a Parquet file. The function logs both the beginning of the operation and its
     successful completion, noting the location of the saved Parquet file.
     """
-    logger.info("Creating and Saving Parquet File")
     gfs_store = dict(refs=zstore, version=1)  # Include versioning for the store structure
 
     def dict_to_df(zstore: dict):
@@ -467,7 +459,7 @@ def create_parquet_file(zstore: dict, output_parquet_file: str):
 
     zstore_df = dict_to_df(gfs_store)
     zstore_df.to_parquet(output_parquet_file)
-    logger.info(f"Parquet file saved to {output_parquet_file}")
+    print(f"Parquet file saved to {output_parquet_file}")
 
 
 
@@ -577,10 +569,9 @@ def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parqu
     
     This will execute the entire data processing pipeline for the specified date and save the results in the designated output file.
     """
-    setup_logging(log_level)
-    
+        
     try:
-        logger.info(f"Processing date: {date_str}")
+        print(f"Processing date: {date_str}")
         axes = generate_axes(date_str)
         gfs_files = [
             f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f000",
@@ -594,7 +585,7 @@ def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parqu
         updated_zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords, times, valid_times, steps)
         create_parquet_file(updated_zstore, output_parquet_file)
     except Exception as e:
-        logger.error(f"An error occurred during processing: {str(e)}")
+        print(f"An error occurred during processing: {str(e)}")
         raise
 
 def get_details(url):
@@ -618,7 +609,7 @@ def gfs_s3_url_maker(date_str):
     )
     s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "idx"]
     fmt_s3og = sorted(["s3://" + f for f in s3url_only_grib])
-    logger.debug(f"Generated {len(fmt_s3og)} URLs for date {date_str}")
+    print(f"Generated {len(fmt_s3og)} URLs for date {date_str}")
     return fmt_s3og
 
 
@@ -636,7 +627,7 @@ def old_upload_to_gcs(bucket_name, source_file_name, destination_blob_name, dask
         #credentials_path = "/app/coiled-data-key.json"
         #credentials_path = os.path.join(os.getcwd(), creds_filename)
         #credentials_path = os.path.join(tempfile.gettempdir(), creds_filename)
-        logger.info(f"Using credentials file at: {dask_worker_credentials_path}")
+        print(f"Using credentials file at: {dask_worker_credentials_path}")
         
         if not os.path.exists(dask_worker_credentials_path):
             raise FileNotFoundError(f"Credentials file not found at {dask_worker_credentials_path}")
@@ -645,9 +636,9 @@ def old_upload_to_gcs(bucket_name, source_file_name, destination_blob_name, dask
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(destination_blob_name)
         blob.upload_from_filename(source_file_name)
-        logger.info(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
+        print(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
     except Exception as e:
-        logger.error(f"Failed to upload file to GCS: {str(e)}")
+        print(f"Failed to upload file to GCS: {str(e)}")
         raise
 
 def get_worker_creds_path(dask_worker):
@@ -663,15 +654,15 @@ def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
         worker = get_worker()
         worker_creds_path = get_worker_creds_path(worker)
         
-        logger.info(f"Using credentials file at: {worker_creds_path}")
+        print(f"Using credentials file at: {worker_creds_path}")
         
         storage_client = storage.Client.from_service_account_json(worker_creds_path)
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(destination_blob_name)
         blob.upload_from_filename(source_file_name)
-        logger.info(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
+        print(f"File {source_file_name} uploaded to {destination_blob_name} in bucket {bucket_name}.")
     except Exception as e:
-        logger.error(f"Failed to upload file to GCS: {str(e)}")
+        print(f"Failed to upload file to GCS: {str(e)}")
         raise
 
 
@@ -1396,5 +1387,90 @@ def cs_create_mapped_index(
         )
     )
 
+
+def aws_parse_grib_idx(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    suffix: str = "idx",
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False,
+) -> pd.DataFrame:
+    """
+    Standalone method used to extract metadata from a grib2 idx file from NODD
+    :param fs: the file system to read from
+    :param basename: the base name is the full path to the grib file
+    :param suffix: the suffix is the ending for the idx file
+    :param tstamp: the timestamp to record for this index process
+    :return: the data frame containing the results
+    """
+
+    fname = f"{basename}.{suffix}"
+    fs.invalidate_cache(fname)
+    fs.invalidate_cache(basename)
+
+    baseinfo = fs.info(basename)
+
+    with fs.open(fname, "r") as f:
+        splits = []
+        for line in f.readlines():
+            try:
+                idx, offset, date, attrs = line.split(":", maxsplit=3)
+                splits.append([int(idx), int(offset), date, attrs])
+            except ValueError:
+                # Wrap the ValueError in a new one that includes the bad line
+                # If building the mapping, pick a different forecast run where the idx file is not broken
+                # If indexing a forecast using the mapping, fall back to reading the grib file
+                raise ValueError(f"Could not parse line: {line}")
+
+    result = pd.DataFrame(
+        data=splits,
+        columns=["idx", "offset", "date", "attrs"],
+    )
+
+    # Subtract the next offset to get the length using the filesize for the last value
+    result.loc[:, "length"] = (
+        result.offset.shift(periods=-1, fill_value=baseinfo["size"]) - result.offset
+    )
+
+    result.loc[:, "idx_uri"] = fname
+    result.loc[:, "grib_uri"] = basename
+    if tstamp is None:
+        tstamp = pd.Timestamp.now()
+    result.loc[:, "indexed_at"] = tstamp
+
+    if "s3" in fs.protocol:
+        # Use ETag as the S3 equivalent to crc32c
+        result.loc[:, "grib_etag"] = baseinfo.get("ETag")
+        result.loc[:, "grib_updated_at"] = pd.to_datetime(
+            baseinfo.get("LastModified")
+        ).tz_localize(None)
+
+        idxinfo = fs.info(fname)
+        result.loc[:, "idx_etag"] = idxinfo.get("ETag")
+        result.loc[:, "idx_updated_at"] = pd.to_datetime(
+            idxinfo.get("LastModified")
+        ).tz_localize(None)
+    if "gcs" in fs.protocol:
+        result.loc[:, "grib_crc32"] = baseinfo["crc32c"]
+        result.loc[:, "grib_updated_at"] = pd.to_datetime(
+            baseinfo["updated"]
+        ).tz_localize(None)
+
+        idxinfo = fs.info(fname)
+        result.loc[:, "idx_crc32"] = idxinfo["crc32c"]
+        result.loc[:, "idx_updated_at"] = pd.to_datetime(
+            idxinfo["updated"]
+        ).tz_localize(None)
+    else:
+        # TODO: Fix metadata for other filesystems
+        result.loc[:, "grib_crc32"] = None
+        result.loc[:, "grib_updated_at"] = None
+        result.loc[:, "idx_crc32"] = None
+        result.loc[:, "idx_updated_at"] = None
+
+    if validate and not result["attrs"].is_unique:
+        raise ValueError(f"Attribute mapping for grib file {basename} is not unique)")
+
+    return result.set_index("idx")
 
 
