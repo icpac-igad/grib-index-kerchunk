@@ -1,44 +1,41 @@
-import os
-import logging
-import traceback 
+import asyncio
+import concurrent.futures
 import copy
-import tempfile
-from typing import List, Dict, Tuple, final
-from calendar import monthrange
-import re
-import pathlib
-
+import datetime
 import io
-import contextlib
+import json
+import logging
+import math
+import os
+import pathlib
+import re
 import sys
+import tempfile
 import time
+from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
-import numpy as np
+import dask
 import fsspec
-import dask 
-import json
+import gcsfs
+import numpy as np
+import pandas as pd
 from distributed import get_worker
-
-import pyarrow as pa
-import pyarrow.parquet as pq
+from google.auth import credentials
 from google.cloud import storage
-import fsspec
-import pandas as pd
-import numpy as np
-from typing import Dict, Any, List
-import json
-import base64
-
-
-from google.cloud import storage 
-
-from kerchunk.grib2 import scan_grib, grib_tree, _split_file
+from kerchunk.grib2 import grib_tree, scan_grib
 from dynamic_zarr_store import (
-    AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
-    parse_grib_idx, map_from_index, store_coord_var, store_data_var,
-    build_idx_grib_mapping
+    AggregationType,
+    build_idx_grib_mapping,
+    map_from_index,
+    parse_grib_idx,
+    store_coord_var,
+    store_data_var,
+    strip_datavar_chunks,
 )
+
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -600,21 +597,6 @@ def process_gfs_data(date_str: str, mapping_parquet_file_path: str, output_parqu
         logger.error(f"An error occurred during processing: {str(e)}")
         raise
 
-# Set up basic logging configuration
-def setup_logger():
-    """Configure logging for both main process and workers"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()  # Log to console
-        ]
-    )
-    return logging.getLogger(__name__)
-
-# Create logger instance
-logger = setup_logger()
-
 def get_details(url):
     """Extract date and time details from GFS URL."""
     pattern = r"s3://noaa-gfs-bdp-pds/gfs\.(\d{8})/(\d{2})/atmos/gfs\.t(\d{2})z\.pgrb2\.0p25\.f(\d{3})"
@@ -1162,53 +1144,6 @@ class KerchunkZarrDictStorageManager:
         
         return True
 
-
-import os
-import sys
-import dask
-import coiled
-import logging
-#from dotenv import load_dotenv
-
-import dask
-import coiled
-import pathlib
-from datetime import datetime, timedelta
-
-#load_dotenv()
-
-# Add the GFS_PROCESSOR_PATH to sys.path
-#gfs_processor_path = os.getenv("sgutils_path")
-#gcs_sa_path = os.getenv("gcs_sa_path")
-#if gfs_processor_path and os.path.isdir(gfs_processor_path):
-#    sys.path.append(gfs_processor_path)
-#else:
-#    raise ValueError("GFS_PROCESSOR_PATH is not defined or is not a valid directory.")
-
-
-from utils_gfs_aws import gfs_s3_url_maker, process_gfs_time_idx_data, setup_logger, get_filename_from_path, cs_create_mapped_index
-
-from utils_gfs_aws import generate_axes, build_grib_tree,calculate_time_dimensions, process_dataframe
-
-from dynamic_zarr_store import (
-    AggregationType, grib_tree, scan_grib, strip_datavar_chunks,
-    parse_grib_idx, map_from_index, store_coord_var, store_data_var
-)
-
-import asyncio
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple
-import pandas as pd
-import fsspec
-import math
-from functools import partial
-import json 
-
-from google.auth import credentials
-import gcsfs
-
-logger = logging.getLogger(__name__)
 
 
 async def old_process_single_file(
