@@ -5,6 +5,7 @@ import datetime
 import io
 import json
 import logging
+import contextlib
 import math
 import os
 import pathlib
@@ -15,7 +16,10 @@ import time
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
+import shutil
+import os
+import warnings
 
 import dask
 import fsspec
@@ -34,6 +38,7 @@ from dynamic_zarr_store import (
     store_coord_var,
     store_data_var,
     strip_datavar_chunks,
+    _extract_single_group,
 )
 
 
@@ -765,7 +770,7 @@ def logged_process_gfs_time_idx_data(s3url, bucket_name):
         return process_success
 
 
-def s3_ecwmf_build_idx_grib_mapping(
+def s3_ecmwf_build_idx_grib_mapping(
     fs: fsspec.AbstractFileSystem,
     basename: str,
     date_str: str,
@@ -924,7 +929,7 @@ def s3_parse_ecmwf_grib_idx(
 
     if validate and not result["attrs"].is_unique:
         raise ValueError(f"Attribute mapping for grib file {basename} is not unique)")
-    print('RUNNN')
+    print(f'Completed index files and found {len(result.index)} entries in it')
     return result.set_index("idx")
 
 
@@ -1473,4 +1478,175 @@ def aws_parse_grib_idx(
 
     return result.set_index("idx")
 
+def subset_list_by_indices(lst, id_val):
+    """
+    Subset a list by a list of index values.
+    
+    Parameters:
+    lst (list): The original list to be subsetted.
+    id_val (list): The list of index values to use for subsetting.
+    
+    Returns:
+    list: The subsetted list containing only the elements at the specified indices.
+    """
+    return [lst[i] for i in id_val]
 
+def map_forecast_to_indices(forecast_dict: dict, df: pd.DataFrame) -> Tuple[dict, list]:
+    """
+    Map each forecast variable in forecast_dict to the index in df where its corresponding value in 'attrs' is found.
+    
+    Parameters:
+    - forecast_dict (dict): Dictionary with forecast variables as keys and search strings as values.
+    - df (pd.DataFrame): DataFrame containing a column 'attrs' where search is performed.
+    
+    Returns:
+    - Tuple[dict, list]: 
+        - Dictionary mapping each forecast variable to the found index in df, adjusted by -1, or default_index if not found.
+        - List of all indices found that are not equal to 9999.
+    """
+    output_dict = {}
+    
+    # Iterate over each key-value pair in forecast_dict
+    for key, value in forecast_dict.items():
+        # Check if `value` is present in any row of the 'attrs' column
+        matching_rows = df[df['attrs'].str.contains(value, na=False)]
+        
+        # If there are matching rows, get the row index (adjusted by -1)
+        if not matching_rows.empty:
+            output_dict[key] = int(matching_rows.index[0] - 1)
+        else:
+            output_dict[key] = 9999
+    
+    # Generate the list of non-default indices
+    values_list = [value for value in output_dict.values() if value != 9999]
+
+    return output_dict, values_list
+
+@log_function_call
+def _map_grib_file_by_group(
+    fname: str,
+    total_groups:int,
+    mapper: Optional[Callable] = None,
+):
+    """
+    Helper method used to read the cfgrib metadata associated with each message (group) in the grib file
+    This method does not add metadata
+    :param fname: the file name to read with scan_grib
+    :param mapper: the mapper if any to apply (used for hrrr subhf)
+    :return: the pandas dataframe
+    """
+    mapper = (lambda x: x) if mapper is None else mapper
+    #total_groups = 4233  # Your specified value
+    
+    start_time = time.time()
+    print(f" Starting to process {total_groups} groups from file: {fname}")
+    
+    processed_groups = 0
+    successful_groups = 0
+    failed_groups = 0
+    last_update_time = start_time
+
+    def process_groups():
+        nonlocal processed_groups, successful_groups, failed_groups, last_update_time
+        
+        for i, group in enumerate(scan_grib(fname), start=1):
+            try:
+                result = _extract_single_group(mapper(group), i)
+                processed_groups += 1
+                
+                if result is not None:
+                    successful_groups += 1
+                else:
+                    failed_groups += 1
+                
+                # Log progress every 10% or when processing single digits
+                if total_groups <= 10 or processed_groups % max(1, total_groups // 10) == 0:
+                    current_time = time.time()
+                    elapsed_time = current_time - start_time
+                    time_since_last_update = current_time - last_update_time
+                    last_update_time = current_time
+                    
+                    progress_percentage = (processed_groups / total_groups) * 100
+                    groups_per_second = processed_groups / elapsed_time if elapsed_time > 0 else 0
+                    
+                    # Estimate remaining time
+                    remaining_groups = total_groups - processed_groups
+                    estimated_remaining_time = remaining_groups / groups_per_second if groups_per_second > 0 else 0
+                    
+                    print(
+                        f"Progress: {processed_groups}/{total_groups} groups processed "
+                        f"({progress_percentage:.1f}%) - "
+                        f"Successful: {successful_groups}, Failed: {failed_groups}, "
+                        f"Remaining: {total_groups - processed_groups} | "
+                        f"Rate: {groups_per_second:.1f} groups/sec | "
+                        f"Elapsed: {elapsed_time:.1f}s | "
+                        f"Est. Remaining: {estimated_remaining_time:.1f}s",
+                        end=""
+                    )
+                
+                yield result
+                
+            except Exception as e:
+                failed_groups += 1
+                processed_groups += 1
+                print(f"Error processing group {i}: {str(e)}")
+                continue
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result_df = pd.concat(
+            list(
+                filter(
+                    lambda item: item is not None,
+                    process_groups()
+                )
+            )
+        ).set_index("idx")
+
+    # Calculate final statistics
+    end_time = time.time()
+    total_time = end_time - start_time
+    average_rate = processed_groups / total_time if total_time > 0 else 0
+
+    # Print final summary with timestamp
+    print(f"Completed processing {fname}:")
+    print(f"Total groups: {total_groups}")
+    print(f"Processed groups: {processed_groups}")
+    print(f"Successful groups: {successful_groups}")
+    print(f"Failed groups: {failed_groups}")
+    print(f"Total processing time: {total_time:.2f} seconds")
+    print(f"Average processing rate: {average_rate:.1f} groups/second")
+    print(f"Success rate: {(successful_groups/processed_groups*100):.1f}%")
+
+    return result_df
+
+def zip_folder(folder_path, output_zip_path):
+    """
+    Compresses the contents of a folder into a zip file.
+
+    Parameters:
+    - folder_path (str): The path to the folder you want to compress.
+    - output_zip_path (str): The path for the output zip file (without .zip extension).
+    """
+    # Ensure the output path does not include the .zip extension (it will be added automatically)
+    output_zip_path = os.path.splitext(output_zip_path)[0]
+    
+    # Create the zip file
+    shutil.make_archive(output_zip_path, 'zip', folder_path)
+    print(f"Folder '{folder_path}' has been compressed to '{output_zip_path}.zip'")
+
+def recreate_folder(folder_path):
+    """
+    Creates a new folder. If the folder already exists, it is removed and recreated.
+    
+    Parameters:
+    - folder_path (str): The path to the folder to create.
+    """
+    # Check if the folder exists
+    if os.path.exists(folder_path):
+        # Remove the existing folder and its contents
+        shutil.rmtree(folder_path)
+    
+    # Create the new folder
+    os.makedirs(folder_path)
+    print(f"Folder '{folder_path}' has been recreated.")
