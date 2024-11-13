@@ -29,6 +29,7 @@ import pandas as pd
 from distributed import get_worker
 from google.auth import credentials
 from google.cloud import storage
+from google.oauth2 import service_account
 from kerchunk.grib2 import grib_tree, scan_grib
 from dynamic_zarr_store import (
     AggregationType,
@@ -98,6 +99,9 @@ def log_function_call(func):
         logger.info(json.dumps({"event": "function_end", "function": func_name}))
         return result
     return wrapper
+
+
+
 
 
 def build_grib_tree(gfs_files: List[str]) -> Tuple[dict, dict]:
@@ -1336,12 +1340,7 @@ async def process_files_in_batches(
             # Optional: Clear memory after each batch
             batch_results = None
             
-            logger.info(json.dumps({
-                "event": "batch_processed",
-                "batch_start": batch_start,
-                "batch_end": batch_end,
-                "valid_results": len(valid_results)
-            }))
+            print("event batch_processed")
     
     # Combine results and process
     if not all_results:
@@ -1650,3 +1649,34 @@ def recreate_folder(folder_path):
     # Create the new folder
     os.makedirs(folder_path)
     print(f"Folder '{folder_path}' has been recreated.")
+
+
+def filter_gfs_scan_grib(gurl,tofilter_cgan_var_dict):
+    fs=fsspec.filesystem("s3")
+    suffix= "idx"
+    gsc = scan_grib(gurl)
+    idx_gfs = aws_parse_grib_idx(fs=fs, basename=gurl, suffix=suffix)
+    output_dict0, vl_gfs = map_forecast_to_indices(tofilter_cgan_var_dict, idx_gfs)
+    return [gsc[i] for i in vl_gfs]
+
+
+def filter_build_grib_tree(gfs_files: List[str],tofilter_cgan_var_dict: dict) -> Tuple[dict, dict]:
+    """
+    Scan GFS files, build a hierarchical tree structure for the data, and strip unnecessary data.
+
+    Parameters:
+    - gfs_files (List[str]): List of file paths to GFS files.
+
+    Returns:
+    - Tuple[dict, dict]: Original and deflated GRIB tree stores.
+    """
+    print("Building Grib Tree")
+    sg_groups = [group for gurl in gfs_files for group in filter_gfs_scan_grib(gurl,tofilter_cgan_var_dict)]
+    gfs_grib_tree_store = grib_tree(sg_groups)
+    deflated_gfs_grib_tree_store = copy.deepcopy(gfs_grib_tree_store)
+    strip_datavar_chunks(deflated_gfs_grib_tree_store)
+    print(f"Original references: {len(gfs_grib_tree_store['refs'])}")
+    print(f"Stripped references: {len(deflated_gfs_grib_tree_store['refs'])}")
+    return gfs_grib_tree_store, deflated_gfs_grib_tree_store
+
+
