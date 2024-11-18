@@ -1774,7 +1774,7 @@ def get_worker_paths(dask_worker, date_str: str, run_str: str):
     local_dir = pathlib.Path(dask_worker.local_directory)
     return {
         'credentials': str(local_dir / 'coiled-data-key.json'),
-        'parquet': str(local_dir / f'gfs_{date_str}.par')
+        'parquet': str(local_dir / f'gfs_{date_str}_{run_str}.par')
     }
 
 def load_datatree_on_worker(parquet_path: str):

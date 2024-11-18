@@ -55,7 +55,7 @@ def main(date_str: str, run_str: str):
             client=client,
             credentials_path=gcp_service_account_json,
             date_str=date_str,
-            run_str,
+            run_str=run_str,
             project_id=project_id,
         )
 
