@@ -1767,8 +1767,9 @@ def worker_upload_required_files(client, parquet_path: str, credentials_path: st
     """Upload required files to all workers."""
     client.upload_file(credentials_path)
     client.upload_file(parquet_path)
+    client.upload_file('./utils.py')
     
-def get_worker_paths(dask_worker, date_str: str):
+def get_worker_paths(dask_worker, date_str: str, run_str: str):
     """Get paths for required files on worker."""
     local_dir = pathlib.Path(dask_worker.local_directory)
     return {
@@ -1789,12 +1790,12 @@ def load_datatree_on_worker(parquet_path: str):
         consolidated=False
     )
 
-def process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str):
+def process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str, run_str: str):
     """Process a single path and save to GCS, appending if zarr store exists."""
     try:
         # Get worker-specific paths
         worker = get_worker()
-        paths = get_worker_paths(worker, date_str)
+        paths = get_worker_paths(worker, date_str, run_str)
         
         # Initialize GCS filesystem with proper credentials
         gcs = gcsfs.GCSFileSystem(
@@ -1869,6 +1870,7 @@ def process_and_upload_datatree(
     client: Client,
     credentials_path: str,
     date_str: str,
+    run_str: str, 
     project_id: str  # Add project_id parameter
 ) -> List[str]:
     """Process datatree and upload to GCS as Zarr stores."""
@@ -1891,6 +1893,7 @@ def process_and_upload_datatree(
             gcs_bucket, 
             gcs_path,
             date_str,
+            run_str,
             pure=False
         )
         futures.append(future)

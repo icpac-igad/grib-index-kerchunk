@@ -1,3 +1,4 @@
+from asyncio import run
 import os
 import argparse
 from dotenv import load_dotenv
@@ -44,7 +45,7 @@ def main(date_str: str, run_str: str):
         service_account_json=gcp_service_account_json)
 
         #parquet_path = f"gfs_{date_str}.par"
-        gcs_path = f"cgan_gfs_var/{date_str}"
+        gcs_path = f"cgan_gfs_var/{date_str}{run_str}"
 
         # Process and upload
         results = process_and_upload_datatree(
@@ -54,6 +55,7 @@ def main(date_str: str, run_str: str):
             client=client,
             credentials_path=gcp_service_account_json,
             date_str=date_str,
+            run_str,
             project_id=project_id,
         )
 
