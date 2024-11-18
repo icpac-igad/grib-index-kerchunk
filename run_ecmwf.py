@@ -8,9 +8,10 @@ from utils import _map_grib_file_by_group
 from utils import s3_parse_ecmwf_grib_idx
 from utils import zip_folder
 from utils import recreate_folder
+from utils import s3_ecmwf_build_idx_grib_mapping
 
 date_str='20240529'
-recreate_folder(f'date_str')
+recreate_folder(f'{date_str}')
 log_level=logging.INFO
 log_file = f"{date_str}/ecmwf_buildidx_table_{date_str}.log"
 setup_logging(log_level, log_file)
@@ -30,7 +31,7 @@ try:
     total_groups=len(idx_file_index.index)
     dd=_map_grib_file_by_group(basename,total_groups)
     dd.to_parquet(f'{date_str}/ecmwf_scangrib_metadata_table_{date_str}.parquet', engine='pyarrow')
-    mapping = s3_ecwmf_build_idx_grib_mapping(
+    mapping = s3_ecmwf_build_idx_grib_mapping(
         fs=fsspec.filesystem("s3"),
         basename=f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-3h-enfo-ef.grib2",
         date_str=date_str
@@ -49,4 +50,6 @@ finally:
     # Close the log file
     logging.shutdown()
     print("Log file closed gracefully.")
+
+
 

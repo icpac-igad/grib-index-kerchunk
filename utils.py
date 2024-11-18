@@ -426,6 +426,27 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
     return zstore
 
 
+def zstore_dict_to_df(zstore: dict):
+    """
+    Helper function to convert dictionary to pandas DataFrame with columns 'key' and 'value'.
+
+    Parameters:
+    - zstore (dict): The dictionary representing the Zarr store.
+
+    Returns:
+    - pd.DataFrame: DataFrame with two columns: 'key' representing the dictionary keys, and 'value'
+                    representing the dictionary values, which are encoded in UTF-8 if they are of type
+                    dictionary, list, or numeric.
+    """
+    data = []
+    for key, value in zstore.items():
+        # Convert dictionaries, lists, or numeric types to UTF-8 encoded strings
+        if isinstance(value, (dict, list, int, float, np.integer, np.floating)):
+            value = str(value).encode('utf-8')
+        data.append((key, value))
+    return pd.DataFrame(data, columns=['key', 'value'])
+
+
 def create_parquet_file(zstore: dict, output_parquet_file: str):
     """
     Converts a dictionary containing Zarr store data to a DataFrame and saves it as a Parquet file.
@@ -444,31 +465,41 @@ def create_parquet_file(zstore: dict, output_parquet_file: str):
     is subsequently written to a Parquet file. The function logs both the beginning of the operation and its
     successful completion, noting the location of the saved Parquet file.
     """
-    gfs_store = dict(refs=zstore, version=1)  # Include versioning for the store structure
-
-    def dict_to_df(zstore: dict):
-        """
-        Helper function to convert dictionary to pandas DataFrame with columns 'key' and 'value'.
-
-        Parameters:
-        - zstore (dict): The dictionary representing the Zarr store.
-
-        Returns:
-        - pd.DataFrame: DataFrame with two columns: 'key' representing the dictionary keys, and 'value'
-                        representing the dictionary values, which are encoded in UTF-8 if they are of type
-                        dictionary, list, or numeric.
-        """
-        data = []
-        for key, value in zstore.items():
-            # Convert dictionaries, lists, or numeric types to UTF-8 encoded strings
-            if isinstance(value, (dict, list, int, float, np.integer, np.floating)):
-                value = str(value).encode('utf-8')
-            data.append((key, value))
-        return pd.DataFrame(data, columns=['key', 'value'])
-
-    zstore_df = dict_to_df(gfs_store)
+    gfs_store = dict(refs=zstore, version=1)  # Include versioning for the store structure  
+    zstore_df = zstore_dict_to_df(gfs_store)
     zstore_df.to_parquet(output_parquet_file)
     print(f"Parquet file saved to {output_parquet_file}")
+
+
+def create_parquet_df(zstore: dict, date_str: str, run_str: str, source: str = "aws_s3") -> pd.DataFrame:
+    """
+    Converts a dictionary containing Zarr store data to a DataFrame with additional columns.
+
+    This function encapsulates the Zarr store data within a dictionary,
+    converts this dictionary to a pandas DataFrame, and returns the DataFrame.
+    Additional columns are added for metadata such as date, run, and source.
+
+    Parameters:
+    - zstore (dict): The Zarr store dictionary containing all references
+      and data needed for Zarr operations.
+    - date_str (str): A string representing the date to be added to the DataFrame.
+    - run_str (str): A string representing the run to be added to the DataFrame.
+    - source (str): A string representing the data source to be added to the DataFrame.
+      Defaults to "aws_s3".
+
+    Returns:
+    - pd.DataFrame: The resulting DataFrame representing the Zarr store data
+      with additional metadata columns.
+    """
+    gfs_store = dict(refs=zstore, version=1)  # Include versioning for the store structure
+    zstore_df = zstore_dict_to_df(gfs_store)
+
+    # Add additional metadata columns
+    zstore_df["date"] = date_str
+    zstore_df["run"] = run_str
+    zstore_df["source"] = source
+
+    return zstore_df
 
 
 
@@ -626,7 +657,7 @@ def get_filename_from_path(file_path):
     """Extract filename from full path"""
     return os.path.basename(file_path)
 
-def old_upload_to_gcs(bucket_name, source_file_name, destination_blob_name, dask_worker_credentials_path):
+def nonclusterworker_upload_to_gcs(bucket_name, source_file_name, destination_blob_name, dask_worker_credentials_path):
     """Uploads a file to the GCS bucket using provided service account credentials."""
     try:
         # Get just the filename from the credentials path
@@ -778,6 +809,7 @@ def s3_ecmwf_build_idx_grib_mapping(
     fs: fsspec.AbstractFileSystem,
     basename: str,
     date_str: str,
+    idx:int,
     suffix: str = "index",
     mapper: Optional[Callable] = None,
     tstamp: Optional[pd.Timestamp] = None,
@@ -795,7 +827,7 @@ def s3_ecmwf_build_idx_grib_mapping(
     :return: the merged dataframe with the results of the two operations joined on the grib message group number
     """
     #grib_file_index = _map_grib_file_by_group(fname=basename, mapper=mapper)
-    grib_file_index = pd.read_parquet(f'ecmwf_scangrib_metadata_table_{date_str}.parquet')
+    grib_file_index = pd.read_parquet(f'{date_str}/ecmwf_scangrib_metadata_table_{date_str}_{idx}.parquet')
     idx_file_index = s3_parse_ecmwf_grib_idx(
         fs=fs, basename=basename, suffix=suffix, tstamp=tstamp
     )
@@ -1211,12 +1243,7 @@ async def old_process_single_file(
             return mapped_index
             
         except Exception as e:
-            logger.error(json.dumps({
-                "event": "error_processing_file",
-                "date": date_str,
-                "file_index": idx,
-                "error": str(e)
-            }))
+            print(f'Error in {str(e)}')
             return None
 
 async def process_single_file(
@@ -1274,12 +1301,7 @@ async def process_single_file(
             return mapped_index
             
         except Exception as e:
-            logger.error(json.dumps({
-                "event": "error_processing_file",
-                "date": date_str,
-                "file_index": idx,
-                "error": str(e)
-            }))
+            print(f'Error in {str(e)}')
             return None
 
 
