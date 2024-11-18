@@ -31,6 +31,16 @@ from google.auth import credentials
 from google.cloud import storage
 from google.oauth2 import service_account
 from kerchunk.grib2 import grib_tree, scan_grib
+
+import dask.dataframe as dd
+from dask.distributed import Client, get_worker
+import xarray as xr
+import zarr
+import gcsfs
+import pathlib
+import pandas as pd
+import datatree
+
 from dynamic_zarr_store import (
     AggregationType,
     build_idx_grib_mapping,
@@ -1702,3 +1712,186 @@ def filter_build_grib_tree(gfs_files: List[str],tofilter_cgan_var_dict: dict) ->
     return gfs_grib_tree_store, deflated_gfs_grib_tree_store
 
 
+
+
+def download_parquet_from_gcs(
+    gcs_bucket_name: str,
+    year: str,
+    date_str: str,
+    run_str: str,
+    service_account_json: str,
+    local_save_path: str = "./"):
+    """
+    Downloads a Parquet file from GCS and saves it locally.
+
+    Parameters:
+    - gcs_bucket_name (str): The name of the GCS bucket.
+    - year (str): The year of the data (e.g., "2024").
+    - date_str (str): The date string in YYYYMMDD format.
+    - run_str (str): The run string (e.g., "00", "06", "12", "18").
+    - service_account_json (str): Path to the GCP service account JSON key file.
+    - local_save_path (str): The local directory where the file should be saved. Defaults to "./".
+
+    Returns:
+    - str: The local path to the saved Parquet file.
+    """
+    # Create credentials object
+    credentials = service_account.Credentials.from_service_account_file(
+        service_account_json,
+        scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
+    )
+
+    # Construct the GCS file URL
+    gcs_file_url = f"gs://{gcs_bucket_name}/gik_day_parqs/{year}/gfs_{date_str}_{run_str}.par"
+
+    # Read Parquet file from GCS
+    ddf = dd.read_parquet(
+        gcs_file_url,
+        storage_options={"token": credentials},
+        engine="pyarrow",
+    )
+
+    # Define the local file path
+    local_file_path = os.path.join(local_save_path, f"gfs_{date_str}_{run_str}.par")
+
+    # Save to local Parquet file
+    ddf.to_parquet(local_file_path, engine="pyarrow", write_metadata_file=False)
+
+    print(f"Parquet file saved locally at: {local_file_path}")
+    return local_file_path
+
+
+
+def worker_upload_required_files(client, parquet_path: str, credentials_path: str):
+    """Upload required files to all workers."""
+    client.upload_file(credentials_path)
+    client.upload_file(parquet_path)
+    
+def get_worker_paths(dask_worker, date_str: str):
+    """Get paths for required files on worker."""
+    local_dir = pathlib.Path(dask_worker.local_directory)
+    return {
+        'credentials': str(local_dir / 'coiled-data-key.json'),
+        'parquet': str(local_dir / f'gfs_{date_str}.par')
+    }
+
+def load_datatree_on_worker(parquet_path: str):
+    """Load datatree from parquet file on worker."""
+    zstore_df = pd.read_parquet(parquet_path)
+    zstore_df['value'] = zstore_df['value'].apply(
+        lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
+    )
+    zstore = {row['key']: eval(row['value']) for _, row in zstore_df.iterrows()}
+    return datatree.open_datatree(
+        fsspec.filesystem("reference", fo=zstore).get_mapper(""),
+        engine="zarr",
+        consolidated=False
+    )
+
+def process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str):
+    """Process a single path and save to GCS, appending if zarr store exists."""
+    try:
+        # Get worker-specific paths
+        worker = get_worker()
+        paths = get_worker_paths(worker, date_str)
+        
+        # Initialize GCS filesystem with proper credentials
+        gcs = gcsfs.GCSFileSystem(
+            token=paths['credentials'],
+            project='your-project-id'  # Add your GCP project ID here
+        )
+        
+        # Load datatree on worker
+        gfs_dt = load_datatree_on_worker(paths['parquet'])
+        
+        # Process dataset
+        ds = gfs_dt[path].to_dataset()
+        if 'step' in ds.coords:
+            ds = ds.drop_vars(['step'])
+        if 'isobaricInhPa' in ds.coords:
+            ds = ds.sel(isobaricInhPa=200)
+            
+        # Construct store path
+        var_name = path.strip('/').replace('/', '_')
+        store_path = f"{gcs_bucket}/{gcs_path}/{var_name}.zarr"
+        
+        # Check if zarr store already exists
+        store_exists = gcs.exists(store_path)
+        
+        if store_exists:
+            # If store exists, try to append
+            try:
+                existing_ds = xr.open_zarr(gcs.get_mapper(store_path))
+                
+                # Check if we have new times to append
+                new_times = ds.valid_times.values
+                existing_times = existing_ds.valid_times.values
+                times_to_append = new_times[~np.isin(new_times, existing_times)]
+                
+                if len(times_to_append) > 0:
+                    # Filter dataset to only new times
+                    ds_to_append = ds.sel(valid_times=times_to_append)
+                    
+                    # Append to existing store
+                    ds_to_append.to_zarr(
+                        store=gcs.get_mapper(store_path),
+                        mode='a',  # Append mode
+                        append_dim='valid_times',  # Dimension to append along
+                        consolidated=True
+                    )
+                    return f"Appended {len(times_to_append)} new times to gs://{store_path}"
+                else:
+                    return f"No new times to append for gs://{store_path}"
+                    
+            except Exception as e:
+                # If append fails, log error and create new store
+                print(f"Error appending to store: {e}")
+                print("Creating new store instead")
+                store_exists = False
+        
+        if not store_exists:
+            # Create new store if doesn't exist or append failed
+            ds.to_zarr(
+                store=gcs.get_mapper(store_path),
+                mode='w',  # Write mode (creates new store)
+                consolidated=True
+            )
+            return f"Created new store at gs://{store_path}"
+            
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
+
+def process_and_upload_datatree(
+    parquet_path: str,
+    gcs_bucket: str, 
+    gcs_path: str,
+    client: Client,
+    credentials_path: str,
+    date_str: str,
+    project_id: str  # Add project_id parameter
+) -> List[str]:
+    """Process datatree and upload to GCS as Zarr stores."""
+    # Upload required files to workers
+    worker_upload_required_files(client, parquet_path, credentials_path)
+    
+    # Set GCS credentials for client
+    client.run(lambda: gcsfs.GCSFileSystem(token='coiled-data-key.json', project=project_id))
+    
+    # Load datatree locally just to get paths
+    temp_dt = load_datatree_on_worker(parquet_path)
+    paths = [node.path for node in temp_dt.subtree if node.has_data]
+    
+    # Submit jobs in batches
+    futures = []
+    for path in paths:
+        future = client.submit(
+            process_and_save,
+            path, 
+            gcs_bucket, 
+            gcs_path,
+            date_str,
+            pure=False
+        )
+        futures.append(future)
+    
+    return client.gather(futures)
