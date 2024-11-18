@@ -1750,12 +1750,13 @@ def download_parquet_from_gcs(
         storage_options={"token": credentials},
         engine="pyarrow",
     )
+    pdf = ddf.compute()
 
     # Define the local file path
     local_file_path = os.path.join(local_save_path, f"gfs_{date_str}_{run_str}.par")
 
     # Save to local Parquet file
-    ddf.to_parquet(local_file_path, engine="pyarrow", write_metadata_file=False)
+    pdf.to_parquet(local_file_path)
 
     print(f"Parquet file saved locally at: {local_file_path}")
     return local_file_path

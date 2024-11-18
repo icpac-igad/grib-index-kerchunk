@@ -14,7 +14,7 @@ def main(date_str: str, run_str: str):
     year=date_str[0:4]
     gcs_bucket_name = os.getenv("GCS_BUCKET_NAME")
     gcp_service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-    project_id = os.getenv("GCP_PROJECT_ID")
+    project_id = os.getenv("PROJECT_ID")
 
     if not gcs_bucket_name or not gcp_service_account_json or not project_id:
         raise ValueError("GCS_BUCKET_NAME, GCP_SERVICE_ACCOUNT_JSON, or GCP_PROJECT_ID not set in the environment.")
@@ -22,7 +22,7 @@ def main(date_str: str, run_str: str):
     # Setup cluster
     cluster = coiled.Cluster(
         n_workers=2,
-        name=f"gfs-par-zarr-make-{date_str}",
+        name=f"gfs-par-zarr-stream-{date_str}",
         software="gik-coiled-v6",
         scheduler_vm_types=["n2-standard-4"],
         worker_vm_types="n2-standard-4",
