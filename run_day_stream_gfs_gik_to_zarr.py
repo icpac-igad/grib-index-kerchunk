@@ -5,17 +5,26 @@ from dotenv import load_dotenv
 import coiled
 from dask.distributed import Client
 
+from utils import StorageType
 from utils import download_parquet_from_gcs
 from utils import process_and_upload_datatree
 
 
-def main(date_str: str, run_str: str):
+def main(date_str: str, run_str: str, storage_type: str = "local"):
     # Load environment variables from the specified file
     load_dotenv(dotenv_path='./env_gik')
     year=date_str[0:4]
     gcs_bucket_name = os.getenv("GCS_BUCKET_NAME")
     gcp_service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
     project_id = os.getenv("PROJECT_ID")
+    
+    storage_choice = StorageType.GCS if storage_type.lower() == "gcs" else StorageType.LOCAL
+    latlon_bounds = {
+        "lat_min": 1.0,
+        "lat_max": 5.0,
+        "lon_min": 25.0,
+        "lon_max": 30.0
+    }
 
     if not gcs_bucket_name or not gcp_service_account_json or not project_id:
         raise ValueError("GCS_BUCKET_NAME, GCP_SERVICE_ACCOUNT_JSON, or GCP_PROJECT_ID not set in the environment.")
@@ -57,8 +66,10 @@ def main(date_str: str, run_str: str):
             date_str=date_str,
             run_str=run_str,
             project_id=project_id,
+            storage_type=storage_choice,
+            local_save_path=f"./zarr_stores/{date_str}_{run_str}",
+            latlon_bounds=latlon_bounds
         )
-
         # Print results
         for result in results:
             print(result)

@@ -41,6 +41,7 @@ import pathlib
 import pandas as pd
 import datatree
 
+from enum import Enum, auto
 from dynamic_zarr_store import (
     AggregationType,
     build_idx_grib_mapping,
@@ -1790,7 +1791,86 @@ def load_datatree_on_worker(parquet_path: str):
         consolidated=False
     )
 
-def process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str, run_str: str):
+
+def process_and_save_locally(
+    path: str,
+    local_save_path: str,
+    gcs_bucket: str,
+    date_str: str,
+    run_str: str,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> str:
+    """
+    Process a single dataset path and save to a local Zarr store with specified lat/lon bounds.
+
+    Parameters:
+    - path (str): The dataset path to process.
+    - local_save_path (str): The local directory where the Zarr store should be saved.
+    - gcs_bucket (str): The GCS bucket name.
+    - date_str (str): The date string in YYYYMMDD format.
+    - run_str (str): The run string (e.g., "00", "06", "12", "18").
+    - latlon_bounds (Dict[str, float]): Dictionary containing lat/lon bounds with keys:
+        - lat_min: Minimum latitude (-90 to 90)
+        - lat_max: Maximum latitude (-90 to 90)
+        - lon_min: Minimum longitude (-180 to 180)
+        - lon_max: Maximum longitude (-180 to 180)
+
+    Returns:
+    - str: A message indicating the result of the processing and saving operation.
+
+    Raises:
+    - ValueError: If lat/lon bounds are invalid or missing required keys
+    - FileNotFoundError: If local_save_path cannot be created
+    - Exception: For other processing errors
+    """
+    # Validate latlon_bounds
+    required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+    if not all(key in latlon_bounds for key in required_keys):
+        raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+
+    try:
+        # Create local save directory if it doesn't exist
+        os.makedirs(local_save_path, exist_ok=True)
+
+        # Load the dataset
+        gfs_dt = load_datatree_on_worker(path)
+        ds = gfs_dt[path].to_dataset()
+
+        # Drop unnecessary variables
+        if "step" in ds.coords:
+            ds = ds.drop_vars(["step"])
+        if "isobaricInhPa" in ds.coords:
+            ds = ds.sel(isobaricInhPa=200)
+
+        # Apply lat/lon bounds
+        ds1 = ds.sel(
+            lat=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
+            lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
+        )
+
+        # Construct the store path
+        var_name = path.strip("/").replace("/", "_")
+        store_path = os.path.join(local_save_path, f"{var_name}.zarr")
+
+        # Save dataset to local Zarr store
+        ds1.to_zarr(store_path, mode="w", consolidated=True)
+
+        return f"Created new store at {store_path}"
+
+    except FileNotFoundError as e:
+        return f"Error creating directory {local_save_path}: {str(e)}"
+    except ValueError as e:
+        return f"Error with lat/lon bounds: {str(e)}"
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
+
+
+def old_process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str, run_str: str):
     """Process a single path and save to GCS, appending if zarr store exists."""
     try:
         # Get worker-specific paths
@@ -1863,7 +1943,138 @@ def process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str, r
     except Exception as e:
         return f"Error processing {path}: {str(e)}"
 
-def process_and_upload_datatree(
+def process_and_save(
+    path: str,
+    gcs_bucket: str,
+    gcs_path: str,
+    date_str: str,
+    run_str: str,
+    project_id: str,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }) -> str:
+    """
+    Process a single path and save to GCS, appending if zarr store exists.
+    
+    Parameters:
+    ----------
+    path : str
+        Dataset path to process
+    gcs_bucket : str
+        GCS bucket name
+    gcs_path : str
+        Path within the GCS bucket
+    date_str : str
+        Date string in YYYYMMDD format
+    run_str : str
+        Run string (e.g., '00', '06', '12', '18')
+    project_id : str
+        GCP project ID
+    latlon_bounds : Dict[str, float]
+        Dictionary containing lat/lon bounds with keys:
+        - lat_min: Minimum latitude (-90 to 90)
+        - lat_max: Maximum latitude (-90 to 90)
+        - lon_min: Minimum longitude (-180 to 180)
+        - lon_max: Maximum longitude (-180 to 180)
+    
+    Returns:
+    -------
+    str
+        Message indicating the result of the operation
+    """
+    try:
+        # Validate latlon_bounds
+        required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+        if not all(key in latlon_bounds for key in required_keys):
+            raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+
+        # Get worker-specific paths
+        worker = get_worker()
+        paths = get_worker_paths(worker, date_str, run_str)
+        
+        # Initialize GCS filesystem with proper credentials
+        gcs = gcsfs.GCSFileSystem(
+            token=paths['credentials'],
+            project=project_id
+        )
+        
+        # Load datatree on worker
+        gfs_dt = load_datatree_on_worker(paths['parquet'])
+        
+        # Process dataset
+        ds = gfs_dt[path].to_dataset()
+        if 'step' in ds.coords:
+            ds = ds.drop_vars(['step'])
+        if 'isobaricInhPa' in ds.coords:
+            ds = ds.sel(isobaricInhPa=200)
+            
+        # Apply lat/lon bounds
+        ds = ds.sel(
+            lat=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
+            lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
+        )
+            
+        # Construct store path
+        var_name = path.strip('/').replace('/', '_')
+        store_path = f"{gcs_bucket}/{gcs_path}/{var_name}.zarr"
+        
+        # Check if zarr store already exists
+        store_exists = gcs.exists(store_path)
+        
+        if store_exists:
+            # If store exists, try to append
+            try:
+                existing_ds = xr.open_zarr(gcs.get_mapper(store_path))
+                
+                # Check if we have new times to append
+                new_times = ds.valid_times.values
+                existing_times = existing_ds.valid_times.values
+                times_to_append = new_times[~np.isin(new_times, existing_times)]
+                
+                if len(times_to_append) > 0:
+                    # Filter dataset to only new times
+                    ds_to_append = ds.sel(valid_times=times_to_append)
+                    
+                    # Verify lat/lon bounds match existing dataset
+                    if not (
+                        np.array_equal(existing_ds.lat.values, ds_to_append.lat.values) and
+                        np.array_equal(existing_ds.lon.values, ds_to_append.lon.values)
+                    ):
+                        raise ValueError("Lat/lon bounds don't match existing dataset")
+                    
+                    # Append to existing store
+                    ds_to_append.to_zarr(
+                        store=gcs.get_mapper(store_path),
+                        mode='a',  # Append mode
+                        append_dim='valid_times',  # Dimension to append along
+                        consolidated=True
+                    )
+                    return f"Appended {len(times_to_append)} new times to gs://{store_path}"
+                else:
+                    return f"No new times to append for gs://{store_path}"
+                    
+            except Exception as e:
+                print(f"Error appending to store: {e}")
+                print("Creating new store instead")
+                store_exists = False
+        
+        if not store_exists:
+            # Create new store if doesn't exist or append failed
+            ds.to_zarr(
+                store=gcs.get_mapper(store_path),
+                mode='w',  # Write mode (creates new store)
+                consolidated=True
+            )
+            return f"Created new store at gs://{store_path}"
+            
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
+
+
+def old_process_and_upload_datatree(
     parquet_path: str,
     gcs_bucket: str, 
     gcs_path: str,
@@ -1888,7 +2099,7 @@ def process_and_upload_datatree(
     futures = []
     for path in paths:
         future = client.submit(
-            process_and_save,
+            process_and_save_locally,
             path, 
             gcs_bucket, 
             gcs_path,
@@ -1899,3 +2110,110 @@ def process_and_upload_datatree(
         futures.append(future)
     
     return client.gather(futures)
+
+
+
+class StorageType(Enum):
+    """Enum for storage type options"""
+    LOCAL = auto()
+    GCS = auto()
+
+def process_and_upload_datatree(
+    parquet_path: str,
+    gcs_bucket: str, 
+    gcs_path: str,
+    client: Client,
+    credentials_path: str,
+    date_str: str,
+    run_str: str, 
+    project_id: str,
+    storage_type: StorageType = StorageType.GCS,
+    local_save_path: Optional[str] = "./zarr_stores",
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> List[str]:
+    """
+    Process datatree and upload to either local storage or GCS as Zarr stores.
+
+    Parameters:
+    ----------
+    parquet_path : str
+        Path to the input parquet file
+    gcs_bucket : str
+        GCS bucket name
+    gcs_path : str
+        Path within GCS bucket
+    client : Client
+        Dask client instance
+    credentials_path : str
+        Path to GCP credentials file
+    date_str : str
+        Date string in YYYYMMDD format
+    run_str : str
+        Run string (e.g., '00', '06', '12', '18')
+    project_id : str
+        GCP project ID
+    storage_type : StorageType
+        Whether to store locally or in GCS (default: StorageType.GCS)
+    local_save_path : str, optional
+        Local path for saving Zarr stores if storage_type is LOCAL
+    latlon_bounds : Dict[str, float]
+        Dictionary containing lat/lon bounds
+
+    Returns:
+    -------
+    List[str]
+        List of messages indicating processing results
+    """
+    # Upload required files to workers
+    worker_upload_required_files(client, parquet_path, credentials_path)
+    
+    # Set GCS credentials for client if using GCS storage
+    if storage_type == StorageType.GCS:
+        client.run(lambda: gcsfs.GCSFileSystem(token='coiled-data-key.json', project=project_id))
+    
+    # Load datatree locally just to get paths
+    temp_dt = load_datatree_on_worker(parquet_path)
+    paths = [node.path for node in temp_dt.subtree if node.has_data]
+    
+    # Submit jobs in batches
+    futures = []
+    for path in paths:
+        if storage_type == StorageType.LOCAL:
+            # Use process_and_save_locally for local storage
+            future = client.submit(
+                process_and_save_locally,
+                path=path,
+                local_save_path=local_save_path,
+                gcs_bucket=gcs_bucket,
+                date_str=date_str,
+                run_str=run_str,
+                latlon_bounds=latlon_bounds,
+                pure=False
+            )
+        else:
+            # Use process_and_save for GCS storage
+            future = client.submit(
+                process_and_save,
+                path=path,
+                gcs_bucket=gcs_bucket,
+                gcs_path=gcs_path,
+                date_str=date_str,
+                run_str=run_str,
+                latlon_bounds=latlon_bounds,
+                pure=False
+            )
+        futures.append(future)
+    
+    results = client.gather(futures)
+    
+    # Create summary message
+    storage_type_str = "locally" if storage_type == StorageType.LOCAL else "to GCS"
+    print(f"Processed {len(results)} datasets {storage_type_str}")
+    
+    return results
+
