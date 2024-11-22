@@ -20,10 +20,10 @@ def main(date_str: str, run_str: str, storage_type: str = "local"):
     
     storage_choice = StorageType.GCS if storage_type.lower() == "gcs" else StorageType.LOCAL
     latlon_bounds = {
-        "lat_min": 1.0,
-        "lat_max": 5.0,
-        "lon_min": 25.0,
-        "lon_max": 30.0
+        "lat_min": -15.0,
+        "lat_max": 25.0,
+        "lon_min": 15.0,
+        "lon_max": 55.0
     }
 
     if not gcs_bucket_name or not gcp_service_account_json or not project_id:
@@ -67,7 +67,7 @@ def main(date_str: str, run_str: str, storage_type: str = "local"):
             run_str=run_str,
             project_id=project_id,
             storage_type=storage_choice,
-            local_save_path=f"./zarr_stores/{date_str}_{run_str}",
+            local_save_path=f"./zarr_stores/{date_str}{run_str}",
             latlon_bounds=latlon_bounds
         )
         # Print results

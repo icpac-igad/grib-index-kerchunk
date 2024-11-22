@@ -1792,7 +1792,7 @@ def load_datatree_on_worker(parquet_path: str):
     )
 
 
-def process_and_save_locally(
+def old_process_and_save_locally(
     path: str,
     local_save_path: str,
     gcs_bucket: str,
@@ -1835,7 +1835,7 @@ def process_and_save_locally(
 
     try:
         # Create local save directory if it doesn't exist
-        os.makedirs(local_save_path, exist_ok=True)
+        #os.makedirs(local_save_path, exist_ok=True)
 
         # Load the dataset
         gfs_dt = load_datatree_on_worker(path)
@@ -1849,14 +1849,16 @@ def process_and_save_locally(
 
         # Apply lat/lon bounds
         ds1 = ds.sel(
-            lat=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
+            latitude=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
             lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
         )
 
         # Construct the store path
         var_name = path.strip("/").replace("/", "_")
         store_path = os.path.join(local_save_path, f"{var_name}.zarr")
-
+        # Ensure parent directories exist
+        parent_dir = os.path.dirname(store_path)
+        os.makedirs(parent_dir, exist_ok=True)
         # Save dataset to local Zarr store
         ds1.to_zarr(store_path, mode="w", consolidated=True)
 
@@ -1944,7 +1946,7 @@ def old_process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: st
         return f"Error processing {path}: {str(e)}"
 
 def process_and_save(
-    path: str,
+    var_path: str,
     gcs_bucket: str,
     gcs_path: str,
     date_str: str,
@@ -1993,19 +1995,19 @@ def process_and_save(
 
         # Get worker-specific paths
         worker = get_worker()
-        paths = get_worker_paths(worker, date_str, run_str)
+        location_paths_worker = get_worker_paths(worker, date_str, run_str)
         
         # Initialize GCS filesystem with proper credentials
         gcs = gcsfs.GCSFileSystem(
-            token=paths['credentials'],
+            token=location_paths_worker['credentials'],
             project=project_id
         )
         
         # Load datatree on worker
-        gfs_dt = load_datatree_on_worker(paths['parquet'])
+        gfs_dt = load_datatree_on_worker(location_paths_worker['parquet'])
         
         # Process dataset
-        ds = gfs_dt[path].to_dataset()
+        ds = gfs_dt[var_path].to_dataset()
         if 'step' in ds.coords:
             ds = ds.drop_vars(['step'])
         if 'isobaricInhPa' in ds.coords:
@@ -2013,7 +2015,7 @@ def process_and_save(
             
         # Apply lat/lon bounds
         ds = ds.sel(
-            lat=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
+            lat=slice(latlon_bounds["lat_max"], latlon_bounds["lat_min"]),
             lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
         )
             
@@ -2118,7 +2120,7 @@ class StorageType(Enum):
     LOCAL = auto()
     GCS = auto()
 
-def process_and_upload_datatree(
+def old2_process_and_upload_datatree(
     parquet_path: str,
     gcs_bucket: str, 
     gcs_path: str,
@@ -2128,7 +2130,7 @@ def process_and_upload_datatree(
     run_str: str, 
     project_id: str,
     storage_type: StorageType = StorageType.GCS,
-    local_save_path: Optional[str] = "./zarr_stores",
+    local_save_path: Optional[str] = None,
     latlon_bounds: Dict[str, float] = {
         "lat_min": -90.0,
         "lat_max": 90.0,
@@ -2169,6 +2171,12 @@ def process_and_upload_datatree(
     List[str]
         List of messages indicating processing results
     """
+    # Set default local_save_path if not provided
+    if local_save_path is None:
+        local_save_path = os.path.join("zarr_stores", f"{date_str}_{run_str}") 
+    # Create the local save directory if it doesn't exist
+    if storage_type == StorageType.LOCAL:
+        os.makedirs(local_save_path, exist_ok=True)
     # Upload required files to workers
     worker_upload_required_files(client, parquet_path, credentials_path)
     
@@ -2210,6 +2218,184 @@ def process_and_upload_datatree(
         futures.append(future)
     
     results = client.gather(futures)
+    
+    # Create summary message
+    storage_type_str = "locally" if storage_type == StorageType.LOCAL else "to GCS"
+    print(f"Processed {len(results)} datasets {storage_type_str}")
+    
+    return results
+
+
+def process_dataset_on_worker(
+    var_path: str,
+    date_str: str,
+    run_str: str, 
+    latlon_bounds: Dict[str, float],
+    ) -> Tuple[str, xr.Dataset]:
+    """
+    Process dataset on worker and return the processed dataset.
+    This function runs on the worker and returns data to the client.
+    """
+    # Validate latlon_bounds
+    required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+    if not all(key in latlon_bounds for key in required_keys):
+        raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+
+    # Get worker-specific paths
+    worker = get_worker()
+    location_paths_worker = get_worker_paths(worker, date_str, run_str)
+    
+       
+    # Load datatree on worker
+    gfs_dt = load_datatree_on_worker(location_paths_worker['parquet'])
+
+    # Load the dataset
+    ds = gfs_dt[var_path].to_dataset()
+    
+    # Drop unnecessary variables
+    if "step" in ds.coords:
+        ds = ds.drop_vars(["step"])
+    if "isobaricInhPa" in ds.coords:
+        ds = ds.sel(isobaricInhPa=200)
+    
+    # Apply lat/lon bounds
+    ds1 = ds.sel(
+        latitude=slice(latlon_bounds["lat_max"], latlon_bounds["lat_min"]),
+        longitude=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
+    )
+    
+    # Create safe name for the dataset
+    safe_name = var_path.strip("/").replace("/", "_")
+    
+    # Compute the dataset to bring it back to client
+    ds1 = ds1.compute()
+    print(f'message from worker {safe_name}') 
+    return safe_name, ds1
+
+def save_dataset_locally(
+    safe_name: str,
+    dataset: xr.Dataset,
+    local_save_path: str
+) -> str:
+    """
+    Save the processed dataset locally on the client machine.
+    This function runs on the client side.
+    """
+    try:
+        # Create the save directory
+        os.makedirs(local_save_path, exist_ok=True)
+        
+        # Construct the store path
+        store_path = os.path.join(local_save_path, f"{safe_name}.zarr")
+        
+        # Save dataset to local Zarr store
+        dataset.to_zarr(store_path, mode="w", consolidated=True)
+        
+        return f"Created new store at {store_path}"
+    except Exception as e:
+        return f"Error saving dataset {safe_name}: {str(e)}"
+
+def del_process_and_save_locally(
+    path: str,
+    local_save_path: str,
+    gcs_bucket: str,
+    date_str: str,
+    run_str: str,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> str:
+    """
+    Process a single dataset path and save to a local Zarr store with specified lat/lon bounds.
+    This function coordinates between worker and client operations.
+    """
+    try:
+        # Validate latlon_bounds
+        required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+        if not all(key in latlon_bounds for key in required_keys):
+            raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+        
+        # Process dataset on worker and get results back to client
+        safe_name, processed_ds = process_dataset_on_worker(path, latlon_bounds)
+        
+        # Save the dataset locally on the client
+        return save_dataset_locally(safe_name, processed_ds, local_save_path)
+        
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
+
+# Updated process_and_upload_datatree function
+def process_and_upload_datatree(
+    parquet_path: str,
+    gcs_bucket: str, 
+    gcs_path: str,
+    client: Client,
+    credentials_path: str,
+    date_str: str,
+    run_str: str, 
+    project_id: str,
+    storage_type: StorageType = StorageType.LOCAL,
+    local_save_path: Optional[str] = None,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> List[str]:
+    """Process datatree and handle storage appropriately."""
+    
+    # Set default local_save_path if not provided
+    if local_save_path is None:
+        local_save_path = os.path.join("zarr_stores", f"{date_str}_{run_str}")
+    
+    # Create the local save directory if using local storage
+    if storage_type == StorageType.LOCAL:
+        os.makedirs(local_save_path, exist_ok=True)
+
+    # Upload required files to workers
+    worker_upload_required_files(client, parquet_path, credentials_path)
+    
+    # Load datatree locally just to get paths
+    temp_dt = load_datatree_on_worker(parquet_path)
+    variable_paths = [node.path for node in temp_dt.subtree if node.has_data]
+    
+    results = []
+    for var_path in variable_paths:
+        try:
+            if storage_type == StorageType.LOCAL:
+                # Process on worker and get data back to client
+                print(f'original path {var_path}')
+                future = client.submit(
+                    process_dataset_on_worker,
+                    var_path=var_path,
+                    date_str=date_str,
+                    run_str=run_str,
+                    latlon_bounds=latlon_bounds
+                )
+                safe_name, processed_ds = future.result()
+                print(safe_name) 
+                # Save locally on client
+                result = save_dataset_locally(safe_name, processed_ds, local_save_path)
+                results.append(result)
+            else:
+                # Use GCS storage method
+                future = client.submit(
+                    process_and_save,
+                    var_path=var_path,
+                    gcs_bucket=gcs_bucket,
+                    gcs_path=gcs_path,
+                    date_str=date_str,
+                    run_str=run_str,
+                    project_id=project_id,
+                    latlon_bounds=latlon_bounds
+                )
+                results.append(future.result())
+        except Exception as e:
+            results.append(f"Error processing {var_path}: {str(e)}")
     
     # Create summary message
     storage_type_str = "locally" if storage_type == StorageType.LOCAL else "to GCS"
