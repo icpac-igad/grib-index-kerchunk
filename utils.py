@@ -1621,7 +1621,7 @@ def _map_grib_file_by_group(
             except Exception as e:
                 failed_groups += 1
                 processed_groups += 1
-                print(f"Error processing group {i}: {str(e)}")
+                print(f"Skipping processing of group {i}: {str(e)}")
                 continue
 
     with warnings.catch_warnings():
@@ -2014,13 +2014,13 @@ def process_and_save(
             ds = ds.sel(isobaricInhPa=200)
             
         # Apply lat/lon bounds
-        ds = ds.sel(
-            lat=slice(latlon_bounds["lat_max"], latlon_bounds["lat_min"]),
-            lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
-        )
+        #ds = ds.sel(
+        #    latitude=slice(latlon_bounds["lat_max"], latlon_bounds["lat_min"]),
+        #    longitude=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
+        #)
             
         # Construct store path
-        var_name = path.strip('/').replace('/', '_')
+        var_name = var_path.strip('/').replace('/', '_')
         store_path = f"{gcs_bucket}/{gcs_path}/{var_name}.zarr"
         
         # Check if zarr store already exists
@@ -2073,7 +2073,7 @@ def process_and_save(
             return f"Created new store at gs://{store_path}"
             
     except Exception as e:
-        return f"Error processing {path}: {str(e)}"
+        return f"Error processing {var_path}: {str(e)}"
 
 
 def old_process_and_upload_datatree(
