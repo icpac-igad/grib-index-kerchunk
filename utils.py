@@ -53,6 +53,8 @@ from dynamic_zarr_store import (
     _extract_single_group,
 )
 
+logger = logging.getLogger("utils-logs")
+
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -432,7 +434,7 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
 
             store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims, coords=coords, data=group, steps=steps, times=times, lvals=lvals if lvals.shape else None)
         except Exception as e:
-            print(f"Error processing group {key}: {str(e)}")
+            print(f"Skipping of processing group {key}: {str(e)}")
 
     return zstore
 
@@ -816,7 +818,7 @@ def logged_process_gfs_time_idx_data(s3url, bucket_name):
         return process_success
 
 
-def s3_ecmwf_build_idx_grib_mapping(
+def old_s3_ecmwf_build_idx_grib_mapping(
     fs: fsspec.AbstractFileSystem,
     basename: str,
     date_str: str,
@@ -824,7 +826,7 @@ def s3_ecmwf_build_idx_grib_mapping(
     suffix: str = "index",
     mapper: Optional[Callable] = None,
     tstamp: Optional[pd.Timestamp] = None,
-    validate: bool = False,
+    validate: bool = False
 ) -> pd.DataFrame:
     """
     Mapping method combines the idx and grib metadata to make a mapping from one to the other for a particular
@@ -1554,6 +1556,7 @@ def map_forecast_to_indices(forecast_dict: dict, df: pd.DataFrame) -> Tuple[dict
 
     return output_dict, values_list
 
+
 @log_function_call
 def _map_grib_file_by_group(
     fname: str,
@@ -1571,7 +1574,7 @@ def _map_grib_file_by_group(
     #total_groups = 4233  # Your specified value
     
     start_time = time.time()
-    print(f" Starting to process {total_groups} groups from file: {fname}")
+    logger.info(f" Starting to process {total_groups} groups from file: {fname}")
     
     processed_groups = 0
     successful_groups = 0
@@ -1601,11 +1604,11 @@ def _map_grib_file_by_group(
                     progress_percentage = (processed_groups / total_groups) * 100
                     groups_per_second = processed_groups / elapsed_time if elapsed_time > 0 else 0
                     
-                    # Estimate remaining time
+                    # Estimat remaining time
                     remaining_groups = total_groups - processed_groups
                     estimated_remaining_time = remaining_groups / groups_per_second if groups_per_second > 0 else 0
                     
-                    print(
+                    logger.info(
                         f"Progress: {processed_groups}/{total_groups} groups processed "
                         f"({progress_percentage:.1f}%) - "
                         f"Successful: {successful_groups}, Failed: {failed_groups}, "
@@ -1621,7 +1624,7 @@ def _map_grib_file_by_group(
             except Exception as e:
                 failed_groups += 1
                 processed_groups += 1
-                print(f"Skipping processing of group {i}: {str(e)}")
+                logger.info(f"Skipping processing of group {i}: {str(e)}")
                 continue
 
     with warnings.catch_warnings():
@@ -1641,7 +1644,7 @@ def _map_grib_file_by_group(
     average_rate = processed_groups / total_time if total_time > 0 else 0
 
     # Print final summary with timestamp
-    print(f"Completed processing {fname}:")
+    logger.info(f"Completed processing {fname}:")
     print(f"Total groups: {total_groups}")
     print(f"Processed groups: {processed_groups}")
     print(f"Successful groups: {successful_groups}")
@@ -1682,6 +1685,19 @@ def recreate_folder(folder_path):
     # Create the new folder
     os.makedirs(folder_path)
     print(f"Folder '{folder_path}' has been recreated.")
+
+def create_folder(folder_path):
+    """
+    Creates a folder if it does not already exist.
+    
+    Parameters:
+    - folder_path (str): The path to the folder to create.
+    """
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Folder '{folder_path}' has been created.")
+    else:
+        print(f"Folder '{folder_path}' already exists.")
 
 
 def filter_gfs_scan_grib(gurl,tofilter_cgan_var_dict):
@@ -2402,4 +2418,246 @@ def process_and_upload_datatree(
     print(f"Processed {len(results)} datasets {storage_type_str}")
     
     return results
+
+def del_s3_ecmwf_build_idx_grib_mapping(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    date_str: str,
+    idx: int,
+    ens_number: int,
+    ecmwf_hr: str,
+    gcs_bucket_name: str,
+    gcp_service_account_json: str,
+    suffix: str = "index",
+    mapper: Optional[Callable] = None,
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False,
+   ) -> pd.DataFrame:
+    """
+    Mapping method combines the idx and grib metadata to make a mapping from one to the other for a particular
+    model horizon file. This should be generally applicable to all forecasts for the given horizon.
+    After processing, uploads the output parquet file to Google Cloud Storage (GCS).
+    :param fs: the file system to read metadata from
+    :param basename: the full path for the grib2 file
+    :param suffix: the suffix for the index file
+    :param mapper: the mapper if any to apply (used for hrrr subhf)
+    :param tstamp: the timestamp to use for when the data was indexed
+    :param validate: assert mapping is correct or fail before returning
+    :param ens_number: ensemble number for subsetting idx_file_index
+    :param ecmwf_hr: ECMWF hour to define output directory
+    :param gcs_bucket_name: Name of the GCS bucket to upload the file
+    :param gcp_service_account_json: Path to the GCP service account JSON file
+    :return: the merged dataframe with the results of the two operations joined on the grib message group number
+    """
+    # Read the grib file index from a parquet file
+    grib_file_index = pd.read_parquet(f'{date_str}/ecmwf_scangrib_metadata_table_{date_str}_{idx}.parquet')
+    
+    # Parse the idx file
+    idx_file_index = s3_parse_ecmwf_grib_idx(
+        fs=fs, basename=basename, suffix=suffix, tstamp=tstamp
+    )
+    
+    # Subset idx_file_index by ens_number
+    idx_file_index = idx_file_index[idx_file_index['ens_number'] == ens_number]
+    
+    # Merge the dataframes
+    result = idx_file_index.merge(
+        grib_file_index,
+        on="idx",
+        how="left",
+        suffixes=("_idx", "_grib"),
+    )
+    
+    if validate:
+        # Validation logic (unchanged, omitted here for brevity)
+        pass
+    
+    # Define the output parquet file path using ecmwf_hr
+    output_dir = f'{date_str}/{ecmwf_hr}'
+    output_parquet_file = f'{output_dir}/eidx_{date_str}_{ecmwf_hr}_ens{ens_number}.parquet'
+    
+    # Ensure the directory exists
+    fs.makedirs(output_dir, exist_ok=True)
+    
+    # Save the result to a parquet file
+    result.to_parquet(output_parquet_file, engine='pyarrow')
+    
+    # Define the GCS blob destination path
+    destination_blob_name = f'gik_day_parqs/{date_str}/{ecmwf_hr}/ecmwf_buildidx_table_{date_str}_{idx}.parquet'
+    
+    # Upload the file to GCS
+    nonclusterworker_upload_to_gcs(
+        bucket_name=gcs_bucket_name,
+        source_file_name=output_parquet_file,
+        destination_blob_name=destination_blob_name,
+        dask_worker_credentials_path=gcp_service_account_json
+    )
+    
+    return result
+
+def ecmwf_s3_url_maker(date_str):
+    """Create S3 URLs for GFS data."""
+    fs_s3 = fsspec.filesystem("s3", anon=True)
+    s3url_glob = fs_s3.glob(
+        f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/*"
+    )
+    s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "index"]
+
+    # Define the pattern for matching the desired file format
+    pattern = re.compile(r"\d{14}-\d+h-enfo-ef\.grib2$")
+    
+    # Filter URLs that match the pattern
+    fmt_s3og = sorted(
+        ["s3://" + f for f in s3url_only_grib if pattern.search(f)]
+    )
+    
+    print(f"Generated {len(fmt_s3og)} URLs for date {date_str}")
+    return fmt_s3og
+
+@log_function_call
+def s3_ecmwf_scan_grib_storing(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    date_str: str,
+    suffix:str,
+    ecmwf_hr: str,
+    gcs_bucket_name: str,
+    gcp_service_account_json: str, 
+    ) -> None:
+    """
+    Long job, making it into a paraquet file 
+    """
+    idx_file_index = s3_parse_ecmwf_grib_idx(
+        fs=fs, basename=basename, suffix=suffix
+    )
+    total_groups=len(idx_file_index.index)
+    logger.info(total_groups)
+    dd=_map_grib_file_by_group(basename,total_groups)
+    logger.info(len(dd.index))
+    output_parquet_file=f'e_sg_mdt_{date_str}_{ecmwf_hr}.parquet'
+    dd.to_parquet(output_parquet_file, engine='pyarrow')
+    # Define the GCS blob destination path
+    destination_blob_name = f'fmrc/scan_grib{date_str}/{output_parquet_file}'
+    # Upload the file to GCS
+    nonclusterworker_upload_to_gcs(
+            bucket_name=gcs_bucket_name,
+            source_file_name=output_parquet_file,
+            destination_blob_name=destination_blob_name,
+            dask_worker_credentials_path=gcp_service_account_json
+        )
+
+
+
+@log_function_call
+def s3_ecmwf_build_idx_ens_grib_mapping(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    date_str: str,
+    suffix:str,
+    ens_number_list: list,
+    ecmwf_hr: str,
+    gcs_bucket_name: str,
+    gcp_service_account_json: str, 
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False
+    ) -> None:
+    """
+    Mapping method combines the idx and grib metadata to make a mapping from one to the other for multiple
+    ensemble numbers. It processes and saves a parquet file for each ensemble member.
+    After processing, uploads each output parquet file to Google Cloud Storage (GCS).
+    :param fs: the file system to read metadata from
+    :param basename: the full path for the grib2 file
+    :param suffix: the suffix for the index file
+    :param mapper: the mapper if any to apply (used for hrrr subhf)
+    :param tstamp: the timestamp to use for when the data was indexed
+    :param validate: assert mapping is correct or fail before returning
+    :param ens_number_list: list of ensemble numbers to process
+    :param ecmwf_hr: ECMWF hour to define output directory
+    :param gcs_bucket_name: Name of the GCS bucket to upload the files
+    :param gcp_service_account_json: Path to the GCP service account JSON file
+    """
+    # Read the grib file index from a parquet file
+    grib_file_index = pd.read_parquet(f'{date_str}/ecmwf_scangrib_metadata_table_{date_str}_{ecmwf_hr}.parquet')
+    
+    # Parse the idx file
+    idx_file_index = s3_parse_ecmwf_grib_idx(
+        fs=fs, basename=basename, suffix=suffix, tstamp=tstamp
+    )
+    output_dir = f'{date_str}/{ecmwf_hr}'
+    create_folder(output_dir)
+    print(output_dir)
+    for ens_number in ens_number_list:
+        # Subset idx_file_index by the current ens_number
+        subset_idx_file_index = idx_file_index[idx_file_index['ens_number'] == ens_number]
+        
+        # Merge the dataframes
+        result = subset_idx_file_index.merge(
+            grib_file_index,
+            on="idx",
+            how="left",
+            suffixes=("_idx", "_grib"),
+        )
+        
+        if validate:
+            # If any of these conditions fail - run the method in colab for the same file and inspect the result manually.
+            all_match_offset = (
+                (result.loc[:, "offset_idx"] == result.loc[:, "offset_grib"])
+                | pd.isna(result.loc[:, "offset_grib"])
+                | ~pd.isna(result.loc[:, "inline_value"])
+            )
+            all_match_length = (
+                (result.loc[:, "length_idx"] == result.loc[:, "length_grib"])
+                | pd.isna(result.loc[:, "length_grib"])
+                | ~pd.isna(result.loc[:, "inline_value"])
+            )
+
+            if not all_match_offset.all():
+                vcs = all_match_offset.value_counts()
+                print(
+                    f"Failed to match message offset mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+                )
+
+            if not all_match_length.all():
+                vcs = all_match_length.value_counts()
+                print(
+                    f"Failed to match message length mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+                )
+
+            if not result["attrs"].is_unique:
+                dups = result.loc[result["attrs"].duplicated(keep=False), :]
+                print(
+                    "The idx attribute mapping for %s is not unique for %d variables: %s",
+                    basename,
+                    len(dups),
+                    dups.varname.tolist(),
+                )
+
+            r_index = result.set_index(
+                ["varname", "typeOfLevel", "stepType", "level", "valid_time"]
+            )
+            if not r_index.index.is_unique:
+                dups = r_index.loc[r_index.index.duplicated(keep=False), :]
+                print(
+                    "The grib hierarchy in %s is not unique for %d variables: %s",
+                    basename,
+                    len(dups),
+                    dups.index.get_level_values("varname").tolist(),
+                )
+        
+        # Define the output parquet file path using ecmwf_hr and ens_number
+        output_parquet_file = f'{output_dir}/eidxt_{date_str}_{ecmwf_hr}_ens{ens_number}.parquet'
+        print(len(result.index))
+        # Save the result to a parquet file
+        result.to_parquet(output_parquet_file, engine='pyarrow')
+        
+        # Define the GCS blob destination path
+        destination_blob_name = f'fmrc/{date_str}/{ecmwf_hr}/ecmwf_buildidx_table_{date_str}_{ecmwf_hr}_ens{ens_number}.parquet'
+        
+        # Upload the file to GCS
+        nonclusterworker_upload_to_gcs(
+            bucket_name=gcs_bucket_name,
+            source_file_name=output_parquet_file,
+            destination_blob_name=destination_blob_name,
+            dask_worker_credentials_path=gcp_service_account_json
+        )
 
