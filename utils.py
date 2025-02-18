@@ -2661,3 +2661,30 @@ def s3_ecmwf_build_idx_ens_grib_mapping(
             dask_worker_credentials_path=gcp_service_account_json
         )
 
+
+def ecmwf_s3_url_maker(date_str):
+    """Create S3 URLs for GFS data."""
+    def extract_hour(url):
+        match = re.search(r'-(\d+)h-enfo', url)
+        if match:
+            return int(match.group(1))
+        return float('inf')  # In case there's no hour value, push it to the end.
+    # Sort the URLs using the extracted hour value
+
+    fs_s3 = fsspec.filesystem("s3", anon=True)
+    s3url_glob = fs_s3.glob(
+        f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/*"
+    )
+    s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "index"]
+
+    # Define the pattern for matching the desired file format
+    pattern = re.compile(r"\d{14}-\d+h-enfo-ef\.grib2$")
+    
+    # Filter URLs that match the pattern
+    fmt_s3og = sorted(
+        ["s3://" + f for f in s3url_only_grib if pattern.search(f)]
+    )
+    sorted_urls = sorted(fmt_s3og, key=extract_hour)
+    print(f"Generated {len(fmt_s3og)} URLs for date {date_str}")
+    return sorted_urls 
+
