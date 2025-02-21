@@ -516,7 +516,7 @@ def create_parquet_df(zstore: dict, date_str: str, run_str: str, source: str = "
 
 
 
-def generate_axes(date_str: str) -> List[pd.Index]:
+def generate_axes(date_str: str, fhr_min: str) -> List[pd.Index]:
     """
     Generate temporal axes indices for a given forecast start date over a predefined forecast period.
     
@@ -543,10 +543,13 @@ def generate_axes(date_str: str) -> List[pd.Index]:
     start_date = pd.Timestamp(date_str)
     end_date = start_date + pd.Timedelta(days=5)  # Forecast period of 5 days
 
-    valid_time_index = pd.date_range(start_date, end_date, freq="60min", name="valid_time")
+    valid_time_index = pd.date_range(start_date, end_date, freq=fhr_min, name="valid_time")
     time_index = pd.Index([start_date], name="time")
 
-    return [valid_time_index, time_index]
+    forecast_hours = ((valid_time_index - start_date).total_seconds() / 3600).astype(int).tolist()
+
+
+    return [valid_time_index, forecast_hours, time_index] 
 
 
 
@@ -2708,15 +2711,11 @@ async def process_single_file_ecmwf(
     """
     async with sem:  # Control concurrent operations
         try:
-            fname = f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/ifs-0p25-enfo-ef_{date_str}_{idx:03}h.grib2"
-            gcs_mapping_path = f"gs://{gcs_bucket_name}/fmrc/{date_str}/{idx:03}/ecmwf_buildidx_table_{date_str}_{idx:03}.parquet"
-            
+            fname = f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-{idx}h-enfo-ef.grib2"
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/fmrc/scan_grib20240529/e_sg_mdt_20240529_{idx}h.parquet"            
             # Initialize GCS filesystem with credentials
-            gcs_fs = gcsfs.GCSFileSystem(
-                token=gcp_service_account_json,
-                project='your-project-id'  # Add your GCP project ID here
-            )
-            
+            gcs_fs = gcsfs.GCSFileSystem(token=gcp_service_account_json) # Add your GCP project ID here
+           
             loop = asyncio.get_event_loop()
             
             # Read idx file
