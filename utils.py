@@ -2984,6 +2984,43 @@ def ecmwf_enfo_index_df_create_with_keys(ecmwf_s3url):
     fs = fsspec.filesystem("s3")
     suffix = 'index'
     idx_file_index = ecmwf_enfo_s3_parse_index(fs=fs, basename=ecmwf_s3url, suffix=suffix)
+    
+    # Expand 'attr' column into separate columns and merge with original DataFrame
+    edf = pd.concat([
+        idx_file_index.drop('attr', axis=1),
+        idx_file_index['attr'].apply(pd.Series)
+    ], axis=1)
+    
+    combined_dict = ecmwf_enfo_index_unique_dict(edf)
+    all_em = ecmwf_enfo_duplicate_dict_ens_mem(combined_dict)
+    
+    idx_mapping = {}
+    subset_dfs = []
+
+    for ens_key, conditions in all_em.items():
+        mask = True
+        for col, value in conditions.items():
+            if value == 'null':
+                mask &= (edf[col] == 'null')
+            else:
+                mask &= (edf[col] == value)
+        
+        matching_rows = edf[mask]
+        if not matching_rows.empty:
+            subset_dfs.append(matching_rows)
+            for idx in matching_rows.index:
+                idx_mapping[idx] = ens_key
+
+    # Combine all subset DataFrames into a single DataFrame
+    subset_edf = pd.concat(subset_dfs) if subset_dfs else pd.DataFrame(columns=edf.columns)
+    
+    return subset_edf, idx_mapping, combined_dict
+
+
+def DEL_ecmwf_enfo_index_df_create_with_keys(ecmwf_s3url):
+    fs = fsspec.filesystem("s3")
+    suffix = 'index'
+    idx_file_index = ecmwf_enfo_s3_parse_index(fs=fs, basename=ecmwf_s3url, suffix=suffix)
     edf = pd.concat([
         idx_file_index.drop('attr', axis=1),
         idx_file_index['attr'].apply(pd.Series)
