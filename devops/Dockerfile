@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     vim \
     bash \
+    git \
     && rm -rf /var/lib/apt/lists/* \
     && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
     && unzip awscliv2.zip \
@@ -55,9 +56,7 @@ RUN micromamba create -n $ENV_NAME -f environment.yml \
 WORKDIR /app
 
 # Copy application files to the working directory
-COPY app_gfs_v1.py ./app.py
-COPY utils_gfs_aws_v2.py ./utils.py
-COPY dynamic_zarr_store.py ./dynamic_zarr_store.py
+RUN git clone https://github.com/nishadhka/grib-index-kerchunk.git /app
 #COPY aws_gfs_built_map ./aws_gfs_built_map
 
 # Set the PATH to include the new environment

@@ -39,7 +39,7 @@ import zarr
 import gcsfs
 import pathlib
 import pandas as pd
-import datatree
+#import datatree
 
 from enum import Enum, auto
 from dynamic_zarr_store import (
@@ -1804,7 +1804,7 @@ def load_datatree_on_worker(parquet_path: str):
         lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
     )
     zstore = {row['key']: eval(row['value']) for _, row in zstore_df.iterrows()}
-    return datatree.open_datatree(
+    return xr.open_datatree(
         fsspec.filesystem("reference", fo=zstore).get_mapper(""),
         engine="zarr",
         consolidated=False
