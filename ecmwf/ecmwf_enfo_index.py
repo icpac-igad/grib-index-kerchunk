@@ -199,16 +199,17 @@ def extract_metadata_from_idx(idx_df):
     expanded_df['stepType'] = 'instant'  # Default for ECMWF
     expanded_df['name'] = expanded_df['varname']  # Name mirrors variable name
     
-    # Convert step to pandas timedelta if not already
-    if 'step' in expanded_df.columns and not pd.api.types.is_timedelta64_dtype(expanded_df['step']):
-        try:
-            # Try to convert to integer first, then to timedelta
-            expanded_df['step'] = pd.to_timedelta(expanded_df['step'].astype(int), unit='h')
-        except:
-            # If that fails, set to 0
-            expanded_df['step'] = pd.Timedelta(hours=0)
-    
-    # Make sure level is numeric
+     # Convert step to int32 (directly from JSON's "step" field)
+    if 'step' in expanded_df.columns:
+        # Handle non-numeric values and convert to integer
+        expanded_df['step'] = (
+            pd.to_numeric(expanded_df['step'], errors='coerce')
+            .fillna(0)
+            .astype('int32')
+        )
+    else:
+        expanded_df['step'] = 0  # Default for missing steps    # Make sure level is numeric
+        
     expanded_df['level'] = pd.to_numeric(expanded_df['level'], errors='coerce').fillna(0)
     
     # Additional required columns for downstream processing
