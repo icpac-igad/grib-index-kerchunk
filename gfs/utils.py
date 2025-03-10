@@ -42,7 +42,7 @@ import pandas as pd
 #import datatree
 
 from enum import Enum, auto
-from dynamic_zarr_store import (
+from kerchunk._grib_idx import (
     AggregationType,
     build_idx_grib_mapping,
     map_from_index,
@@ -231,7 +231,6 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
             fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
             
             idxdf = parse_grib_idx(
-                fs=fsspec.filesystem("s3"),
                 basename=fname
             )
             deduped_mapping = pd.read_parquet(f"{mapping_parquet_file_path}gfs-mapping-{idx:03}.parquet")
@@ -293,7 +292,6 @@ def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str:
             
             # Parse the idx file from S3
             idxdf = parse_grib_idx(
-                fs=fsspec.filesystem("s3"),
                 basename=fname
             )
             
@@ -1228,7 +1226,7 @@ async def old_process_single_file(
             # Read idx file
             idxdf = await loop.run_in_executor(
                 executor,
-                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
+                partial(parse_grib_idx, basename=fname)
             )
             
             # Initialize GCS filesystem
@@ -1289,7 +1287,7 @@ async def process_single_file(
             # Read idx file
             idxdf = await loop.run_in_executor(
                 executor,
-                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
+                partial(parse_grib_idx, basename=fname)
             )
             
             # Read parquet in chunks if chunk_size is specified
@@ -1704,7 +1702,7 @@ def filter_gfs_scan_grib(gurl,tofilter_cgan_var_dict):
     fs=fsspec.filesystem("s3")
     suffix= "idx"
     gsc = scan_grib(gurl)
-    idx_gfs = aws_parse_grib_idx(fs=fs, basename=gurl, suffix=suffix)
+    idx_gfs = aws_parse_grib_idx(fs, basename=gurl, suffix=suffix)
     output_dict0, vl_gfs = map_forecast_to_indices(tofilter_cgan_var_dict, idx_gfs)
     return [gsc[i] for i in vl_gfs]
 
