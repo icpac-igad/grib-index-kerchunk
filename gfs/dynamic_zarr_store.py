@@ -37,7 +37,7 @@ import fsspec
 
 import pandas as pd
 import xarray as xr
-import datatree
+#import datatree
 
 from kerchunk.grib2 import scan_grib, grib_tree, _split_file
 
@@ -432,7 +432,7 @@ def grib_coord(name: str) -> str:
 
 
 def extract_dataset_chunk_index(
-    dset: datatree.DataTree | xr.Dataset,
+    dset: xr.DataTree | xr.Dataset,
     ref_store: dict,
     grib: bool = False,
 ) -> list[dict]:
@@ -452,7 +452,7 @@ def extract_dataset_chunk_index(
     attributes = dset.attrs.copy()
 
     dpath = None
-    if isinstance(dset, datatree.DataTree):
+    if isinstance(dset, xr.DataTree):
         dpath = dset.path
         walk_group = dset.parent
         while walk_group:
@@ -522,7 +522,7 @@ def extract_dataset_chunk_index(
 
 
 def extract_datatree_chunk_index(
-    dtree: datatree.DataTree, kerchunk_store: dict, grib: bool = False
+    dtree: xr.DataTree, kerchunk_store: dict, grib: bool = False
 ) -> pd.DataFrame:
     """
     Recursive method to iterate over the data tree and extract the data variable chunks with index metadata
@@ -825,7 +825,7 @@ def _extract_single_group(grib_group: dict, idx: int):
         logger.info("Empty DT: %s", grib_tree_store)
         return None
 
-    dt = datatree.open_datatree(
+    dt = xr.open_datatree(
         fsspec.filesystem("reference", fo=grib_tree_store).get_mapper(""),
         engine="zarr",
         consolidated=False,
