@@ -26,7 +26,7 @@ def main(date_str: str, run_str: str):
         raise ValueError("GCS_BUCKET_NAME or GCP_SERVICE_ACCOUNT_JSON not set in the environment.")
 
     # Generate axes for processing
-    axes = generate_axes(date_str,"60min")
+    axes = generate_axes(date_str)
 
     # Define GFS file paths
     gfs_files = [
