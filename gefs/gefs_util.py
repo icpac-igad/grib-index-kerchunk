@@ -434,10 +434,10 @@ def gefs_s3_url_maker(date_str, ensemble_member="gep01"):
 
 def filter_gefs_scan_grib(gurl, tofilter_gefs_var_dict):
     """Filter and scan GEFS GRIB files based on variable dictionary."""
-    fs = fsspec.filesystem("s3")
     suffix = "idx"
-    gsc = scan_grib(gurl)
-    idx_gefs = parse_grib_idx(fs, basename=gurl, suffix=suffix)
+    storage_options = {"anon": True}
+    gsc = scan_grib(gurl, storage_options=storage_options)
+    idx_gefs = parse_grib_idx(basename=gurl, suffix=suffix, storage_options=storage_options)
     output_dict0, vl_gefs = map_forecast_to_indices(tofilter_gefs_var_dict, idx_gefs)
     return [gsc[i] for i in vl_gefs]
 
@@ -497,29 +497,41 @@ async def process_single_gefs_file(
     sem: asyncio.Semaphore,
     executor: ThreadPoolExecutor,
     gcp_service_account_json: str,
-    chunk_size: Optional[int] = None
+    chunk_size: Optional[int] = None,
+    reference_date_str: Optional[str] = None
 ) -> Optional[pd.DataFrame]:
     """
     Process a single GEFS file asynchronously using pre-built GCS mappings.
-    This reads from the mappings created by gefs_index_preprocessing.py
+    
+    Parameters:
+    - date_str: Target date for GRIB index reading (where fresh data comes from)
+    - reference_date_str: Reference date for parquet mapping templates (defaults to date_str)
+    
+    The function combines:
+    1. Fresh GRIB index (.idx) from target date (binary positions)
+    2. Existing parquet mappings from reference date (structure template)
     """
     async with sem:
         try:
             # GEFS uses 3-hour intervals
             forecast_hour = idx * 3
+            
+            # Target date: where we get fresh GRIB data and index from
             fname = f"s3://noaa-gefs-pds/gefs.{date_str}/00/atmos/pgrb2sp25/{ensemble_member}.t00z.pgrb2s.0p25.f{forecast_hour:03d}"
             
-            # Use the GCS structure created by preprocessing
-            year = date_str[:4]
-            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/gefs/{year}/{date_str}/{ensemble_member}/gefs-time-{date_str}-{ensemble_member}-rt{forecast_hour:03d}.parquet"
+            # Reference date: where we get parquet mapping templates from
+            ref_date = reference_date_str if reference_date_str else date_str
+            ref_year = ref_date[:4]
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/gefs/{ref_year}/{ref_date}/{ensemble_member}/gefs-time-{ref_date}-{ensemble_member}-rt{forecast_hour:03d}.parquet"
             
             gcs_fs = gcsfs.GCSFileSystem(token=gcp_service_account_json)
             loop = asyncio.get_event_loop()
             
-            # Read idx file
+            # Read idx file (fresh binary positions from target date)
+            storage_options = {"anon": True}
             idxdf = await loop.run_in_executor(
                 executor,
-                partial(parse_grib_idx, basename=fname)
+                partial(parse_grib_idx, basename=fname, storage_options=storage_options)
             )
             
             # Read pre-built mapping from GCS
@@ -557,7 +569,8 @@ async def process_gefs_files_in_batches(
     max_concurrent: int = 3,
     batch_size: int = 5,
     chunk_size: Optional[int] = None,
-    gcp_service_account_json: Optional[str] = None
+    gcp_service_account_json: Optional[str] = None,
+    reference_date_str: Optional[str] = None
 ) -> pd.DataFrame:
     """
     Process GEFS files in batches using pre-built GCS mappings.
@@ -584,7 +597,8 @@ async def process_gefs_files_in_batches(
                     sem,
                     executor,
                     gcp_service_account_json,
-                    chunk_size
+                    chunk_size,
+                    reference_date_str
                 )
                 for idx in batch_indices
             ]
@@ -625,10 +639,15 @@ def cs_create_mapped_index(
     max_concurrent: int = 10,
     batch_size: int = 20,
     chunk_size: Optional[int] = None,
-    gcp_service_account_json: Optional[str] = None
+    gcp_service_account_json: Optional[str] = None,
+    reference_date_str: Optional[str] = None
 ) -> pd.DataFrame:
     """
     Async wrapper for creating GEFS mapped index with memory management.
+    
+    Parameters:
+    - date_str: Target date for GRIB index reading
+    - reference_date_str: Reference date for parquet mapping templates
     """
     return asyncio.run(
         process_gefs_files_in_batches(
@@ -639,7 +658,8 @@ def cs_create_mapped_index(
             max_concurrent,
             batch_size,
             chunk_size,
-            gcp_service_account_json
+            gcp_service_account_json,
+            reference_date_str
         )
     )
 
