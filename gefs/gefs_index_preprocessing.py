@@ -65,12 +65,35 @@ def get_gefs_details(url):
         return None, None, None, None
 
 
-def gefs_s3_url_maker(date_str, ensemble_member="gep01", max_forecast_hour=240):
+def gefs_s3_url_generator(date, run, ensemble_member, file_pattern=".*"):
+    """
+    Centralized function to generate consistent GEFS S3 URLs.
+    
+    Parameters:
+    - date (str): Date in YYYYMMDD format
+    - run (str): Run time (00, 06, 12, 18)
+    - ensemble_member (int or str): Ensemble member number (1-30) or string like 'gep01'
+    - file_pattern (str): File pattern (default: '.*')
+    
+    Returns:
+    - str: Formatted S3 URL
+    """
+    if isinstance(ensemble_member, int):
+        ensemble_str = f"gep{ensemble_member:02d}"
+    else:
+        ensemble_str = ensemble_member
+    
+    url = f"s3://noaa-gefs-pds/gefs.{date}/{run}/atmos/pgrb2sp25/{ensemble_str}{file_pattern}"
+    return url
+
+
+def gefs_s3_url_maker(date_str, run="00", ensemble_member="gep01", max_forecast_hour=240):
     """
     Create S3 URLs for GEFS data for a specific ensemble member.
     
     Parameters:
     - date_str (str): Date in YYYYMMDD format
+    - run (str): Run time (00, 06, 12, 18) - default '00'
     - ensemble_member (str): Ensemble member (e.g., 'gep01', 'gep02', etc.)
     - max_forecast_hour (int): Maximum forecast hour (default 240 for 10 days)
     
@@ -78,9 +101,9 @@ def gefs_s3_url_maker(date_str, ensemble_member="gep01", max_forecast_hour=240):
     - List[str]: List of S3 URLs for GEFS files
     """
     fs_s3 = fsspec.filesystem("s3", anon=True)
-    s3url_glob = fs_s3.glob(
-        f"s3://noaa-gefs-pds/gefs.{date_str}/00/atmos/pgrb2sp25/{ensemble_member}.*"
-    )
+    # Use centralized URL generator
+    base_pattern = gefs_s3_url_generator(date_str, run, ensemble_member, ".*")
+    s3url_glob = fs_s3.glob(base_pattern.replace("s3://", ""))
     s3url_only_grib = [f for f in s3url_glob if f.split(".")[-1] != "idx"]
     
     # Filter by forecast hour if needed
@@ -92,7 +115,7 @@ def gefs_s3_url_maker(date_str, ensemble_member="gep01", max_forecast_hour=240):
             fmt_s3og.append(full_url)
     
     fmt_s3og = sorted(fmt_s3og)
-    print(f"Generated {len(fmt_s3og)} GEFS URLs for date {date_str}, member {ensemble_member}")
+    print(f"Generated {len(fmt_s3og)} GEFS URLs for date {date_str}, run {run}, member {ensemble_member}")
     return fmt_s3og
 
 
@@ -159,11 +182,9 @@ def process_gefs_time_idx_data(s3url, bucket_name):
 
         print(f"Processing GEFS: {date_str}, {member}, forecast hour {forecast_hour}")
 
-        # Build mapping for the specified GEFS file
-        mapping = build_idx_grib_mapping(
-            fs=fsspec.filesystem("s3"),
-            basename=s3url 
-        )
+        # Build mapping for the specified GEFS file with anonymous S3 access
+        storage_options = {"anon": True}
+        mapping = build_idx_grib_mapping(s3url, storage_options=storage_options)
         deduped_mapping = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
         deduped_mapping.set_index('attrs', inplace=True)
         
@@ -176,7 +197,12 @@ def process_gefs_time_idx_data(s3url, bucket_name):
         # Upload to GCS in organized structure
         year = date_str[:4]
         destination_blob_name = f"time_idx/gefs/{year}/{date_str}/{member}/{os.path.basename(parquet_path)}"
-        upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name)
+        
+        # Try to use Dask worker upload, fallback to non-cluster upload
+        try:
+            upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name)
+        except ValueError:  # No worker found
+            noncluster_upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name, "/home/runner/workspace/coiled-data.json")
         
         # Cleanup local file
         os.remove(parquet_path)
@@ -206,11 +232,9 @@ def logged_process_gefs_time_idx_data(s3url, bucket_name):
                 gefs_logger.error(f"Invalid GEFS URL format: {s3url}")
                 return False
 
-            # Build mapping for the specified GEFS file
-            mapping = build_idx_grib_mapping(
-                fs=fsspec.filesystem("s3"),
-                basename=s3url 
-            )
+            # Build mapping for the specified GEFS file with anonymous S3 access
+            storage_options = {"anon": True}
+            mapping = build_idx_grib_mapping(s3url, storage_options=storage_options)
             deduped_mapping = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
             deduped_mapping.set_index('attrs', inplace=True)
 
@@ -223,7 +247,12 @@ def logged_process_gefs_time_idx_data(s3url, bucket_name):
             # Upload to GCS
             year = date_str[:4]
             destination_blob_name = f"time_idx/gefs/{year}/{date_str}/{member}/{os.path.basename(parquet_path)}"
-            upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name)
+            
+            # Try to use Dask worker upload, fallback to non-cluster upload
+            try:
+                upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name)
+            except ValueError:  # No worker found
+                noncluster_upload_gefs_to_gcs(bucket_name, parquet_path, destination_blob_name, "/home/runner/workspace/coiled-data.json")
 
             # Cleanup
             os.remove(parquet_path)
@@ -244,13 +273,14 @@ def logged_process_gefs_time_idx_data(s3url, bucket_name):
         return process_success
 
 
-def create_gefs_ensemble_member_mappings(date_str: str, ensemble_member: str, bucket_name: str, 
+def create_gefs_ensemble_member_mappings(date_str: str, run: str, ensemble_member: str, bucket_name: str, 
                                        max_forecast_hour: int = 240, use_dask: bool = True):
     """
     Create index mappings for all forecast hours of a single GEFS ensemble member.
     
     Parameters:
     - date_str (str): Date in YYYYMMDD format
+    - run (str): Run time (00, 06, 12, 18)
     - ensemble_member (str): Ensemble member (e.g., 'gep01')
     - bucket_name (str): GCS bucket name
     - max_forecast_hour (int): Maximum forecast hour to process
@@ -259,10 +289,10 @@ def create_gefs_ensemble_member_mappings(date_str: str, ensemble_member: str, bu
     Returns:
     - List: Results from processing
     """
-    print(f"Creating GEFS mappings for {date_str}, member {ensemble_member}")
+    print(f"Creating GEFS mappings for {date_str}, run {run}, member {ensemble_member}")
     
     # Generate all GEFS URLs for this member
-    gefs_urls = gefs_s3_url_maker(date_str, ensemble_member, max_forecast_hour)
+    gefs_urls = gefs_s3_url_maker(date_str, run, ensemble_member, max_forecast_hour)
     
     if use_dask:
         # Use Dask for parallel processing
@@ -287,7 +317,7 @@ def create_gefs_ensemble_member_mappings(date_str: str, ensemble_member: str, bu
         return results
 
 
-def create_gefs_full_ensemble_mappings(date_str: str, bucket_name: str, 
+def create_gefs_full_ensemble_mappings(date_str: str, run: str, bucket_name: str, 
                                      ensemble_members: List[str] = None,
                                      max_forecast_hour: int = 240):
     """
@@ -295,6 +325,7 @@ def create_gefs_full_ensemble_mappings(date_str: str, bucket_name: str,
     
     Parameters:
     - date_str (str): Date in YYYYMMDD format  
+    - run (str): Run time (00, 06, 12, 18)
     - bucket_name (str): GCS bucket name
     - ensemble_members (List[str]): List of ensemble members (default: gep01-gep30)
     - max_forecast_hour (int): Maximum forecast hour to process
@@ -303,10 +334,10 @@ def create_gefs_full_ensemble_mappings(date_str: str, bucket_name: str,
     - Dict: Results organized by ensemble member
     """
     if ensemble_members is None:
-        # Default GEFS ensemble members (gep01 through gep30)
+        # Default GEFS ensemble members (gep01 through gep30) - consistent with utils.py
         ensemble_members = [f"gep{i:02d}" for i in range(1, 31)]
     
-    print(f"Creating GEFS mappings for {date_str}, {len(ensemble_members)} ensemble members")
+    print(f"Creating GEFS mappings for {date_str}, run {run}, {len(ensemble_members)} ensemble members")
     
     all_results = {}
     
@@ -314,7 +345,7 @@ def create_gefs_full_ensemble_mappings(date_str: str, bucket_name: str,
         print(f"Processing ensemble member: {member}")
         try:
             member_results = create_gefs_ensemble_member_mappings(
-                date_str, member, bucket_name, max_forecast_hour, use_dask=True
+                date_str, run, member, bucket_name, max_forecast_hour, use_dask=True
             )
             all_results[member] = member_results
             print(f"Completed processing for {member}")
@@ -355,18 +386,18 @@ def verify_gefs_mappings_in_gcs(bucket_name: str, date_str: str, ensemble_member
 
 
 # Example usage functions
-def main_create_daily_gefs_mappings(date_str: str, bucket_name: str = "gik-gefs-aws-tf"):
+def main_create_daily_gefs_mappings(date_str: str, run: str = "00", bucket_name: str = "gik-gefs-aws-tf"):
     """
     Main function to create GEFS mappings for a full day (all ensemble members).
     Run this once per date to set up mappings for fast GEFS processing.
     """
     setup_gefs_logging()
     
-    print(f"Starting GEFS mapping creation for {date_str}")
+    print(f"Starting GEFS mapping creation for {date_str}, run {run}")
     start_time = time.time()
     
     # Create mappings for all ensemble members
-    results = create_gefs_full_ensemble_mappings(date_str, bucket_name)
+    results = create_gefs_full_ensemble_mappings(date_str, run, bucket_name)
     
     end_time = time.time()
     processing_time = end_time - start_time
@@ -377,7 +408,7 @@ def main_create_daily_gefs_mappings(date_str: str, bucket_name: str = "gik-gefs-
     return results
 
 
-def main_create_single_member_mappings(date_str: str, ensemble_member: str, 
+def main_create_single_member_mappings(date_str: str, run: str, ensemble_member: str, 
                                      bucket_name: str = "gik-gefs-aws-tf"):
     """
     Create mappings for a single GEFS ensemble member.
@@ -385,23 +416,48 @@ def main_create_single_member_mappings(date_str: str, ensemble_member: str,
     """
     setup_gefs_logging()
     
-    print(f"Creating GEFS mappings for {date_str}, member {ensemble_member}")
+    print(f"Creating GEFS mappings for {date_str}, run {run}, member {ensemble_member}")
     
-    results = create_gefs_ensemble_member_mappings(date_str, ensemble_member, bucket_name)
+    results = create_gefs_ensemble_member_mappings(date_str, run, ensemble_member, bucket_name)
     
     print(f"Completed GEFS mapping creation for {ensemble_member}")
     return results
 
 
 if __name__ == "__main__":
-    # Example usage - create mappings for a specific date
-    date_str = "20241112"
-    bucket_name = "gik-gefs-aws-tf"
+    import argparse
     
-    # Option 1: Create mappings for all ensemble members
-    # results = main_create_daily_gefs_mappings(date_str, bucket_name)
+    parser = argparse.ArgumentParser(description="Process GEFS data and create index mappings")
+    parser.add_argument("--date", required=True, help="Date in YYYYMMDD format")
+    parser.add_argument("--run", default="00", help="Run time (00, 06, 12, 18) - default: 00")
+    parser.add_argument("--bucket", default="gik-gefs-aws-tf", help="GCS bucket name")
+    parser.add_argument("--member", help="Process single ensemble member (e.g., gep01)")
+    parser.add_argument("--all-members", action="store_true", help="Process all ensemble members (gep01-gep30)")
     
-    # Option 2: Create mappings for a single member (for testing)
-    results = main_create_single_member_mappings(date_str, "gep01", bucket_name)
+    args = parser.parse_args()
+    
+    # Validate inputs
+    if not args.member and not args.all_members:
+        print("Please specify either --member or --all-members")
+        exit(1)
+    
+    if args.member and args.all_members:
+        print("Please specify either --member OR --all-members, not both")
+        exit(1)
+    
+    # Validate run parameter
+    if args.run not in ["00", "06", "12", "18"]:
+        print("Run parameter must be one of: 00, 06, 12, 18")
+        exit(1)
+    
+    print(f"GEFS preprocessing starting for date: {args.date}, run: {args.run}")
+    
+    if args.member:
+        # Process single member
+        results = main_create_single_member_mappings(args.date, args.run, args.member, args.bucket)
+    else:
+        # Process all members
+        results = main_create_daily_gefs_mappings(args.date, args.run, args.bucket)
     
     print("GEFS preprocessing completed!")
+    print(f"Results: {results}")
