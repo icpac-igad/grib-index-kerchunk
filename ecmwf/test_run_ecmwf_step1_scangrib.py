@@ -848,10 +848,11 @@ def save_datatree_structure(dt, output_file: str):
 
 script_start = log_checkpoint("Starting ECMWF ensemble processing script")
 
-date_str = '20240229'
+date_str = '20250628'
+run='18'
 ecmwf_files = [
-    f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-0h-enfo-ef.grib2",
-    f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-3h-enfo-ef.grib2"
+    f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-0h-enfo-ef.grib2",
+    f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-3h-enfo-ef.grib2"
 ]
 
 log_checkpoint(
@@ -885,7 +886,8 @@ log_checkpoint(
 )
 
 # Create output directory for results
-output_dir = f"ecmwf_test_results_{date_str}"
+#output_dir = f"ecmwf_test_results_{date_str}"
+output_dir = f"e_{date_str}_{run}"
 os.makedirs(output_dir, exist_ok=True)
 log_checkpoint(f"Created output directory: {output_dir}")
 
