@@ -522,7 +522,7 @@ async def process_single_gefs_file(
             # Reference date: where we get parquet mapping templates from
             ref_date = reference_date_str if reference_date_str else date_str
             ref_year = ref_date[:4]
-            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/gefs/{ref_year}/{ref_date}/{ensemble_member}/gefs-time-{ref_date}-{ensemble_member}-rt{forecast_hour:03d}.parquet"
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/gefs/{ensemble_member}/gefs-time-{ref_date}-{ensemble_member}-rt{forecast_hour:03d}.parquet"
             
             gcs_fs = gcsfs.GCSFileSystem(token=gcp_service_account_json)
             loop = asyncio.get_event_loop()

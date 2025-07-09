@@ -55,7 +55,7 @@ FORECAST_HOUR_FROM_LOCAL = TARGET_UTC_TIME if TARGET_UTC_TIME >= 0 else TARGET_U
 TIMESTEP_INDEX = FORECAST_HOUR // 3  # For 12 hours: 12/3 = 4
 
 # Configuration for the specific run
-TARGET_DATE_STR = '20250624'
+TARGET_DATE_STR = '20250709'
 TARGET_RUN = '00'  # 00Z run
 REFERENCE_DATE_STR = '20241112'  # Date with existing parquet mappings
 ENSEMBLE_MEMBERS = [f'gep{i:02d}' for i in range(1, 31)]  # All 30 members
@@ -191,8 +191,8 @@ def process_single_ensemble_member(member, target_date_str, target_run, referenc
         
         # Create zarr store using reference mappings
         print(f"🗃️ Creating zarr store for {member}...")
-        gcs_bucket_name = 'gik-gefs-aws-tf'
-        gcp_service_account_json = 'coiled-data.json'
+        gcs_bucket_name = 'gik-fmrc'
+        gcp_service_account_json = 'coiled-data-e4drr_202505.json'
         
         try:
             # Use the original function with reference date

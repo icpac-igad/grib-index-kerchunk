@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
 # Configuration
-PARQUET_DIR = Path("20240323_18")  # Directory containing parquet files
+PARQUET_DIR = Path("20250709_00")  # Directory containing parquet files
 BOUNDARY_JSON = "ea_ghcf_simple.json"  # GeoJSON file for boundaries
 
 # Extract date and run hour from directory name
