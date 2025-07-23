@@ -21,7 +21,7 @@ warnings.filterwarnings('ignore')
 
 # Configuration
 ZARR_URL = "https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr?email=optional@email.com"
-BOUNDARY_JSON = "ea_ghcf_simple.geojson"  # GeoJSON file for boundaries
+BOUNDARY_JSON = "ea_ghcf_simple.json"  # GeoJSON file for boundaries
 
 # Date Configuration - Set TARGET_DATE to specify which date to process
 # Format: 'YYYY-MM-DD' or None for latest available date

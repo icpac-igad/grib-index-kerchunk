@@ -1,7 +1,7 @@
 ## To run the full ens member run and emprical probablity test 
 
 ```
-coiled notebook start --name dask-thresholds --vm-type n2-standard-2 --software  gik-zarr2--workspace=geosfm
+coiled notebook start --name dask-thresholds --vm-type n2-standard-2 --software  gik-zarr2 --workspace=geosfm
 ```
 upload the coiled the data service account, and the files 
 

@@ -3,6 +3,11 @@
 GEFS 24-hour Rainfall Accumulation Processing V2
 This script processes GEFS ensemble data to create 24-hour rainfall accumulation
 plots with threshold exceedance probabilities.
+
+Additional plotting functions moved from run_day_gefs_ensemble_full.py:
+- Ensemble comparison plots
+- Multiple timestep plotting
+- Probability maps and summaries
 """
 
 import pandas as pd
@@ -18,6 +23,7 @@ import cartopy.feature as cfeature
 from datetime import datetime
 import fsspec
 import geopandas as gp
+import matplotlib.patches as mpatches
 import time
 
 warnings.filterwarnings('ignore')
@@ -27,7 +33,7 @@ os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
 # Configuration
 PARQUET_DIR = Path("20250709_00")  # Directory containing parquet files
-BOUNDARY_JSON = "ea_ghcf_simple.json"  # GeoJSON file for boundaries
+BOUNDARY_JSON = "ea_ghcf_simple.geojson"  # GeoJSON file for boundaries
 
 # Extract date and run hour from directory name
 dir_name = PARQUET_DIR.name
@@ -345,11 +351,14 @@ def create_24h_probability_plot(probabilities, lons, lats, n_members, n_days, ou
                  f'Based on {n_members} ensemble members | Coverage: {LAT_MIN}°-{LAT_MAX}°N, {LON_MIN}°-{LON_MAX}°E',
                  fontsize=14, y=0.98)
     
-    # Save figure
+    # Save figure with date and run info
+    date_str = MODEL_DATE.strftime('%Y%m%d')
+    run_str = f'{MODEL_RUN_HOUR:02d}'
+    
     if output_dir:
-        output_file = output_dir / 'probability_24h_accumulation_all_thresholds.png'
+        output_file = output_dir / f'probability_24h_accumulation_{date_str}_{run_str}z_all_thresholds.png'
     else:
-        output_file = 'probability_24h_accumulation_all_thresholds.png'
+        output_file = f'probability_24h_accumulation_{date_str}_{run_str}z_all_thresholds.png'
     
     plt.tight_layout(rect=[0, 0, 0.9, 0.96])
     plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
@@ -359,11 +368,553 @@ def create_24h_probability_plot(probabilities, lons, lats, n_members, n_days, ou
     return str(output_file)
 
 
+# ============================================================================
+# ADDITIONAL PLOTTING FUNCTIONS MOVED FROM run_day_gefs_ensemble_full.py
+# ============================================================================
+
+def create_ensemble_comparison_plot(ensemble_numpy, ensemble_xarray, variable='tp', output_dir=None, timestep_index=4):
+    """Create comprehensive ensemble comparison plot using correct TP plotting approach."""
+    print(f"\n🎨 Creating ensemble comparison plot for {variable}...")
+    
+    num_members = len(ensemble_numpy)
+    if num_members == 0:
+        print("❌ No ensemble data to plot")
+        return None
+    
+    # Sort members
+    members = sorted(ensemble_numpy.keys())
+    
+    # Create figure - 6 rows x 5 columns for 30 members
+    fig, axes = plt.subplots(6, 5, figsize=(25, 30), 
+                            subplot_kw={'projection': ccrs.PlateCarree()})
+    axes = axes.flatten()
+    
+    # Use configured timestep
+    timestep_idx = timestep_index
+    
+    # Calculate actual times for title
+    forecast_hour = timestep_idx * 3
+    utc_hour = (MODEL_RUN_HOUR + forecast_hour) % 24
+    nairobi_hour = (utc_hour + 3) % 24
+    
+    print(f"📊 Plotting data for:")
+    print(f"   - Timestep {timestep_idx} (T+{forecast_hour}h)")
+    print(f"   - {utc_hour:02d}:00 UTC")
+    print(f"   - {nairobi_hour:02d}:00 Nairobi time")
+    
+    # Get coordinates from first member
+    first_member = members[0]
+    first_xr = ensemble_xarray[first_member]
+    lons = first_xr.longitude.values
+    lats = first_xr.latitude.values
+    
+    # Check if we're plotting accumulated or instantaneous precipitation
+    if forecast_hour <= 12:
+        plot_title_suffix = f"T+{forecast_hour}h ({forecast_hour}-hour accumulation)"
+    else:
+        plot_title_suffix = f"T+{forecast_hour}h"
+    
+    # Plot each member
+    all_data = []
+    
+    for idx, member in enumerate(members):
+        ax = axes[idx]
+        member_numpy = ensemble_numpy[member]
+        
+        if timestep_idx < member_numpy.shape[0]:
+            # Get data for timestep
+            data = member_numpy[timestep_idx]
+            
+            # Data is already in mm (kg/m²), no conversion needed
+            plot_data = data
+            
+            # Store for ensemble statistics
+            all_data.append(plot_data)
+            
+            # Calculate adaptive colorbar range
+            finite_data = plot_data[np.isfinite(plot_data)]
+            if len(finite_data) > 0:
+                data_max = np.max(finite_data)
+                # Adjust colorbar scaling for shorter forecasts
+                if forecast_hour <= 6:
+                    vmax = np.ceil(data_max * 1.2 / 5) * 5  # Round to nearest 5mm
+                    vmax = max(5, vmax)  # Minimum 5mm for 6h
+                elif forecast_hour <= 12:
+                    vmax = np.ceil(data_max * 1.2 / 10) * 10  # Round to nearest 10mm
+                    vmax = max(10, vmax)  # Minimum 10mm for 12h
+                else:
+                    vmax = np.ceil(data_max * 1.2 / 10) * 10
+                    vmax = max(10, vmax)
+            else:
+                vmax = 10 if forecast_hour <= 6 else 20
+            
+            # Create plot
+            levels = np.linspace(0, vmax, 11)
+            im = ax.contourf(lons, lats, plot_data,
+                           levels=levels, cmap='Blues',
+                           transform=ccrs.PlateCarree(),
+                           extend='max')
+            
+            # Add map features
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.3)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3)
+            ax.add_feature(cfeature.LAND, alpha=0.1)
+            
+            # Set extent
+            ax.set_extent([LON_MIN, LON_MAX, LAT_MIN, LAT_MAX])
+            
+            # Title
+            ax.set_title(f'{member}\nMax: {data_max:.1f}mm', fontsize=10)
+            
+        else:
+            ax.text(0.5, 0.5, f'{member}\nNo data', 
+                   transform=ax.transAxes, ha='center', va='center')
+            ax.set_title(f'{member}')
+    
+    # Hide unused subplots
+    for idx in range(len(members), len(axes)):
+        axes[idx].set_visible(False)
+    
+    # Add colorbar
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    cbar = plt.colorbar(im, cax=cbar_ax)
+    cbar.set_label('Total Precipitation (mm)', rotation=270, labelpad=20)
+    
+    # UPDATED TITLE with time information
+    date_str = MODEL_DATE.strftime('%Y%m%d')
+    plt.suptitle(f'GEFS Ensemble Total Precipitation Forecast - East Africa\n'
+                f'{date_str} {MODEL_RUN_HOUR:02d}Z Run - {plot_title_suffix}\n'
+                f'Valid: {utc_hour:02d}:00 UTC ({nairobi_hour:02d}:00 Nairobi)', 
+                fontsize=16, y=0.98)
+    
+    # Save with timestep in filename
+    if output_dir:
+        output_file = output_dir / f'ensemble_all_members_comparison_T{forecast_hour:03d}.png'
+    else:
+        output_file = f'gefs_ensemble_{date_str}_{MODEL_RUN_HOUR:02d}z_all_members_comparison_T{forecast_hour:03d}.png'
+    
+    plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+    plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
+    print(f"✅ Ensemble comparison plot saved: {output_file}")
+    plt.close()
+    
+    return str(output_file)
+
+
+def plot_multiple_timesteps(ensemble_numpy, ensemble_xarray, timesteps_to_plot, output_dir=None):
+    """
+    Plot ensemble data for multiple timesteps
+    
+    Parameters:
+    -----------
+    timesteps_to_plot : list of tuples
+        Each tuple contains (timestep_index, description)
+        Example: [(2, "6h"), (4, "12h"), (8, "24h")]
+    """
+    for timestep_idx, description in timesteps_to_plot:
+        print(f"\n{'='*60}")
+        print(f"Creating plot for {description} forecast (timestep {timestep_idx})")
+        print(f"{'='*60}")
+        
+        # Create plot
+        create_ensemble_comparison_plot(ensemble_numpy, ensemble_xarray, 'tp', output_dir, timestep_idx)
+
+
+def calculate_ensemble_probabilities(ensemble_numpy, thresholds=[5, 10, 15, 20, 25], timestep_idx=4):
+    """
+    Calculate empirical probabilities for precipitation exceeding thresholds.
+    
+    Parameters:
+    -----------
+    ensemble_numpy : dict
+        Dictionary with member names as keys and numpy arrays as values
+    thresholds : list
+        List of precipitation thresholds in mm
+    timestep_idx : int
+        Time step index to analyze (default: 4 = 12h forecast)
+    
+    Returns:
+    --------
+    probabilities : dict
+        Dictionary with thresholds as keys and probability arrays as values
+    """
+    print(f"\n📊 Calculating ensemble probabilities for {len(thresholds)} thresholds...")
+    
+    # Get ensemble data for the specified timestep
+    members = sorted(ensemble_numpy.keys())
+    n_members = len(members)
+    
+    if n_members == 0:
+        print("❌ No ensemble data available")
+        return None
+    
+    # Get data shape from first member
+    first_data = ensemble_numpy[members[0]][timestep_idx]
+    data_shape = first_data.shape
+    
+    # Stack all member data for the timestep
+    ensemble_stack = np.zeros((n_members, *data_shape))
+    
+    for i, member in enumerate(members):
+        member_data = ensemble_numpy[member]
+        if timestep_idx < member_data.shape[0]:
+            ensemble_stack[i] = member_data[timestep_idx]
+        else:
+            ensemble_stack[i] = np.nan
+    
+    # Calculate probabilities for each threshold
+    probabilities = {}
+    
+    for threshold in thresholds:
+        # Count how many members exceed threshold at each grid point
+        exceedance_count = np.sum(ensemble_stack >= threshold, axis=0)
+        
+        # Convert to probability (percentage)
+        probability = (exceedance_count / n_members) * 100
+        
+        probabilities[threshold] = probability
+        
+        # Print statistics
+        max_prob = np.nanmax(probability)
+        area_above_50 = np.sum(probability >= 50)
+        print(f"   Threshold {threshold}mm: Max probability = {max_prob:.1f}%, "
+              f"Grid points with P>=50% = {area_above_50}")
+    
+    return probabilities, n_members
+
+
+def plot_probability_map(probability, threshold, lons, lats, timestep_idx, n_members, output_dir=None):
+    """
+    Plot probability map for a single threshold with Nairobi location.
+    
+    Parameters:
+    -----------
+    probability : numpy array
+        Probability values (0-100%)
+    threshold : float
+        Precipitation threshold in mm
+    lons, lats : numpy arrays
+        Longitude and latitude coordinates
+    """
+    # Nairobi coordinates
+    NAIROBI_LAT = -1.2921
+    NAIROBI_LON = 36.8219
+    
+    # Calculate forecast hour and times
+    forecast_hour = timestep_idx * 3
+    utc_hour = (MODEL_RUN_HOUR + forecast_hour) % 24
+    nairobi_hour = (utc_hour + 3) % 24
+    
+    # Create figure
+    fig = plt.figure(figsize=(12, 10))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    
+    # Define probability levels and colors
+    levels = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    colors = ['white', '#FFFFCC', '#FFFF99', '#FFCC66', '#FF9933', 
+              '#FF6600', '#FF3300', '#CC0000', '#990000', '#660000']
+    
+    # Create contour plot
+    cf = ax.contourf(lons, lats, probability, levels=levels, colors=colors,
+                     transform=ccrs.PlateCarree(), extend='neither')
+    
+    # Add contour lines at key probability levels
+    cs = ax.contour(lons, lats, probability, levels=[25, 50, 75], 
+                    colors='black', linewidths=0.5, alpha=0.5,
+                    transform=ccrs.PlateCarree())
+    ax.clabel(cs, inline=True, fontsize=8, fmt='%d%%')
+    
+    # Add map features
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8, color='navy')
+    ax.add_feature(cfeature.BORDERS, linewidth=0.6, color='gray')
+    ax.add_feature(cfeature.LAND, alpha=0.1, facecolor='lightgray')
+    ax.add_feature(cfeature.OCEAN, alpha=0.1, facecolor='lightblue')
+    ax.add_feature(cfeature.LAKES, alpha=0.3, facecolor='lightblue')
+    
+    # Add rivers for context
+    ax.add_feature(cfeature.RIVERS, linewidth=0.5, alpha=0.5, color='blue')
+    
+    # Set extent to East Africa
+    ax.set_extent([LON_MIN, LON_MAX, LAT_MIN, LAT_MAX])
+    
+    # Add Nairobi marker
+    ax.plot(NAIROBI_LON, NAIROBI_LAT, marker='*', markersize=20, 
+            color='red', markeredgecolor='darkred', markeredgewidth=1,
+            transform=ccrs.PlateCarree(), zorder=10)
+    
+    # Add Nairobi label with background
+    ax.text(NAIROBI_LON + 0.3, NAIROBI_LAT + 0.3, 'Nairobi', 
+            transform=ccrs.PlateCarree(), fontsize=12, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                     edgecolor='darkred', alpha=0.8),
+            zorder=11)
+    
+    # Add gridlines
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                      linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {'size': 10}
+    gl.ylabel_style = {'size': 10}
+    
+    # Add colorbar
+    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, aspect=30)
+    cbar.set_label(f'Probability of exceeding {threshold}mm (%)', rotation=270, labelpad=20)
+    cbar.ax.tick_params(labelsize=10)
+    
+    # Title with comprehensive information
+    date_str = MODEL_DATE.strftime('%Y%m%d')
+    plt.title(f'GEFS Ensemble Probability: Precipitation > {threshold}mm\n'
+              f'{date_str} {MODEL_RUN_HOUR:02d}Z Run - T+{forecast_hour}h '
+              f'({utc_hour:02d}:00 UTC / {nairobi_hour:02d}:00 EAT)\n'
+              f'Based on {n_members} ensemble members',
+              fontsize=14, pad=20)
+    
+    # Add text box with key information
+    textstr = f'Max Probability: {np.nanmax(probability):.1f}%\n'
+    textstr += f'Area with P≥50%: {np.sum(probability >= 50)} grid points\n'
+    textstr += f'Area with P≥75%: {np.sum(probability >= 75)} grid points'
+    
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=props)
+    
+    # Save figure
+    if output_dir:
+        output_file = output_dir / f'probability_exceeding_{threshold:02d}mm_T{forecast_hour:03d}.png'
+    else:
+        output_file = f'gefs_probability_{date_str}_{MODEL_RUN_HOUR:02d}z_{threshold:02d}mm_T{forecast_hour:03d}.png'
+    
+    plt.tight_layout()
+    plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
+    print(f"✅ Probability map saved: {output_file}")
+    plt.close()
+    
+    return str(output_file)
+
+
+def create_probability_summary_plot(probabilities, thresholds, lons, lats, timestep_idx, n_members, output_dir=None):
+    """
+    Create a multi-panel plot showing probabilities for all thresholds.
+    """
+    # Calculate times
+    forecast_hour = timestep_idx * 3
+    utc_hour = (MODEL_RUN_HOUR + forecast_hour) % 24
+    nairobi_hour = (utc_hour + 3) % 24
+    
+    # Nairobi coordinates
+    NAIROBI_LAT = -1.2921
+    NAIROBI_LON = 36.8219
+    
+    # Create figure with subplots
+    n_thresholds = len(thresholds)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12), 
+                            subplot_kw={'projection': ccrs.PlateCarree()})
+    axes = axes.flatten()
+    
+    # Common color levels for all subplots
+    levels = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    colors = ['white', '#FFFFCC', '#FFFF99', '#FFCC66', '#FF9933', 
+              '#FF6600', '#FF3300', '#CC0000', '#990000', '#660000']
+    
+    for i, threshold in enumerate(thresholds):
+        ax = axes[i]
+        probability = probabilities[threshold]
+        
+        # Create contour plot
+        cf = ax.contourf(lons, lats, probability, levels=levels, colors=colors,
+                         transform=ccrs.PlateCarree(), extend='neither')
+        
+        # Add 50% contour line
+        cs = ax.contour(lons, lats, probability, levels=[50], 
+                       colors='black', linewidths=1, alpha=0.7,
+                       transform=ccrs.PlateCarree())
+        
+        # Add map features
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5, color='navy')
+        ax.add_feature(cfeature.BORDERS, linewidth=0.4, color='gray')
+        ax.add_feature(cfeature.LAND, alpha=0.1)
+        
+        # Set extent
+        ax.set_extent([LON_MIN, LON_MAX, LAT_MIN, LAT_MAX])
+        
+        # Add Nairobi marker
+        ax.plot(NAIROBI_LON, NAIROBI_LAT, marker='*', markersize=10, 
+                color='red', markeredgecolor='darkred', markeredgewidth=0.5,
+                transform=ccrs.PlateCarree(), zorder=10)
+        
+        # Add title for each subplot
+        max_prob = np.nanmax(probability)
+        ax.set_title(f'P(TP > {threshold}mm) - Max: {max_prob:.0f}%', fontsize=12)
+        
+        # Add gridlines for first subplot only
+        if i == 0:
+            gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                             linewidth=0.3, color='gray', alpha=0.3, linestyle='--')
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.xlabel_style = {'size': 8}
+            gl.ylabel_style = {'size': 8}
+    
+    # Hide the 6th subplot if we have 5 thresholds
+    if n_thresholds < 6:
+        axes[5].set_visible(False)
+    
+    # Add common colorbar
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    cbar = plt.colorbar(cf, cax=cbar_ax)
+    cbar.set_label('Probability (%)', rotation=270, labelpad=20)
+    
+    # Overall title
+    date_str = MODEL_DATE.strftime('%Y%m%d')
+    fig.suptitle(f'GEFS Ensemble Exceedance Probabilities - East Africa\n'
+                 f'{date_str} {MODEL_RUN_HOUR:02d}Z Run - T+{forecast_hour}h '
+                 f'({utc_hour:02d}:00 UTC / {nairobi_hour:02d}:00 EAT)\n'
+                 f'{n_members} ensemble members',
+                 fontsize=16, y=0.98)
+    
+    # Add legend for Nairobi
+    nairobi_marker = mpatches.Patch(color='red', label='★ Nairobi')
+    plt.figlegend(handles=[nairobi_marker], loc='lower right', 
+                 bbox_to_anchor=(0.9, 0.05), fontsize=12)
+    
+    # Save figure
+    if output_dir:
+        output_file = output_dir / f'probability_summary_all_thresholds_T{forecast_hour:03d}.png'
+    else:
+        output_file = f'gefs_probability_summary_{date_str}_{MODEL_RUN_HOUR:02d}z_T{forecast_hour:03d}.png'
+    
+    plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+    plt.savefig(str(output_file), dpi=150, bbox_inches='tight')
+    print(f"✅ Probability summary plot saved: {output_file}")
+    plt.close()
+    
+    return str(output_file)
+
+
+def process_ensemble_probabilities(ensemble_numpy, ensemble_xarray, timestep_idx=4, 
+                                  thresholds=[5, 10, 15, 20, 25], output_dir=None):
+    """
+    Main function to process and plot ensemble probabilities.
+    
+    Parameters:
+    -----------
+    ensemble_numpy : dict
+        Dictionary of ensemble member data
+    ensemble_xarray : dict
+        Dictionary of xarray datasets
+    timestep_idx : int
+        Timestep index to analyze (default: 4 = 12h)
+    thresholds : list
+        List of precipitation thresholds in mm
+    output_dir : Path
+        Output directory for plots
+    """
+    print(f"\n{'='*80}")
+    print(f"Processing Ensemble Exceedance Probabilities")
+    print(f"{'='*80}")
+    
+    if len(ensemble_numpy) == 0:
+        print("❌ No ensemble data available")
+        return None
+    
+    # Get coordinates from first member
+    first_member = sorted(ensemble_xarray.keys())[0]
+    first_xr = ensemble_xarray[first_member]
+    lons = first_xr.longitude.values
+    lats = first_xr.latitude.values
+    
+    # Calculate probabilities
+    probabilities, n_members = calculate_ensemble_probabilities(
+        ensemble_numpy, thresholds, timestep_idx
+    )
+    
+    if probabilities is None:
+        return None
+    
+    # Create individual plots for each threshold
+    print(f"\n📊 Creating individual probability maps...")
+    plot_files = []
+    
+    for threshold in thresholds:
+        plot_file = plot_probability_map(
+            probabilities[threshold], threshold, lons, lats, timestep_idx, n_members, output_dir
+        )
+        plot_files.append(plot_file)
+    
+    # Create summary plot
+    print(f"\n📊 Creating summary probability plot...")
+    summary_file = create_probability_summary_plot(
+        probabilities, thresholds, lons, lats, timestep_idx, n_members, output_dir
+    )
+    
+    print(f"\n✅ Probability processing complete!")
+    print(f"   - Individual plots: {len(plot_files)}")
+    print(f"   - Summary plot: {summary_file}")
+    
+    return probabilities, plot_files, summary_file
+
+
+# ============================================================================
+# TESTING ROUTINES - SWITCHED OFF AS REQUESTED
+# ============================================================================
+
+def run_additional_plotting_tests(ensemble_numpy, ensemble_xarray, output_dir=None):
+    """
+    Test routine for additional plotting functions moved from run_day_gefs_ensemble_full.py.
+    This routine is switched off by default as requested.
+    
+    To enable testing, call this function from main() with enable_testing=True
+    """
+    print("\n" + "="*80)
+    print("TESTING ADDITIONAL PLOTTING ROUTINES (SWITCHED OFF)")
+    print("="*80)
+    print("This testing routine is currently disabled.")
+    print("To enable, modify the main() function and set enable_testing=True")
+    
+    # Uncomment the code below to enable testing
+    """
+    # Test ensemble comparison plot
+    if len(ensemble_numpy) > 0:
+        print("\n📊 Testing ensemble comparison plot...")
+        create_ensemble_comparison_plot(ensemble_numpy, ensemble_xarray, 'tp', output_dir, timestep_index=4)
+    
+    # Test multiple timesteps
+    timesteps_to_plot = [
+        (2, "6h"),   # 06:00 UTC = 09:00 Nairobi
+        (4, "12h"),  # 12:00 UTC = 15:00 Nairobi  
+        (6, "18h"),  # 18:00 UTC = 21:00 Nairobi
+    ]
+    print("\n📊 Testing multiple timesteps...")
+    plot_multiple_timesteps(ensemble_numpy, ensemble_xarray, timesteps_to_plot, output_dir)
+    
+    # Test ensemble probabilities
+    if len(ensemble_numpy) > 0:
+        print("\n📊 Testing ensemble probabilities...")
+        thresholds = [5, 10, 15, 20, 25]
+        timestep_idx = 4
+        
+        probabilities, prob_files, summary_file = process_ensemble_probabilities(
+            ensemble_numpy, ensemble_xarray, 
+            timestep_idx=timestep_idx,
+            thresholds=thresholds,
+            output_dir=output_dir
+        )
+    
+    print("\n✅ Testing routines completed!")
+    """
+    
+    return None
+
+
 def main():
     """Main processing function."""
     print("="*80)
     print("GEFS 24-Hour Rainfall Accumulation Processing V2")
     print("="*80)
+    
+    # TESTING CONTROL - Set to True to enable additional plotting tests
+    enable_testing = False  # SWITCHED OFF as requested
     
     # Display model run information
     print(f"\n📅 Model Run Information:")
@@ -491,6 +1042,14 @@ def main():
     print(f"   ⏱️  TOTAL TIME:             {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
     print(f"\n📁 Output directory: {output_dir}")
     print("="*80)
+    
+    # TESTING ROUTINES - SWITCHED OFF AS REQUESTED
+    if enable_testing:
+        print("\n🌡️ Running additional plotting tests...")
+        run_additional_plotting_tests(ensemble_numpy, ensemble_xarray, output_dir)
+    else:
+        print("\n📝 Additional plotting tests are DISABLED.")
+        print("     To enable, set enable_testing=True in main() function.")
     
     return True
 
