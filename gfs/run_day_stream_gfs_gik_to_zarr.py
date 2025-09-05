@@ -33,7 +33,7 @@ def main(date_str: str, run_str: str, storage_type: str = "local"):
     cluster = coiled.Cluster(
         n_workers=2,
         name=f"gfs-par-zarr-stream-{date_str}",
-        software="gik-coiled-v6",
+        software="gik-zarr2",
         scheduler_vm_types=["n2-standard-4"],
         worker_vm_types="n2-standard-4",
         region="us-east1",
@@ -46,7 +46,6 @@ def main(date_str: str, run_str: str, storage_type: str = "local"):
     try:
         # Define paths and configurations
         # Download and save Parquet file locally
-        client.upload_file("dynamic_zarr_store.py")
         parquet_path = download_parquet_from_gcs(
         gcs_bucket_name=gcs_bucket_name,
         year=year,

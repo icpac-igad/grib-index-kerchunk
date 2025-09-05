@@ -39,10 +39,10 @@ import zarr
 import gcsfs
 import pathlib
 import pandas as pd
-#import datatree
+from xarray import DataTree, open_datatree
 
 from enum import Enum, auto
-from kerchunk._grib_idx import (
+from dynamic_zarr_store import (
     AggregationType,
     build_idx_grib_mapping,
     map_from_index,
@@ -52,8 +52,6 @@ from kerchunk._grib_idx import (
     strip_datavar_chunks,
     _extract_single_group,
 )
-
-logger = logging.getLogger("utils-logs")
 
 
 class JSONFormatter(logging.Formatter):
@@ -231,6 +229,7 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
             fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
             
             idxdf = parse_grib_idx(
+                fs=fsspec.filesystem("s3"),
                 basename=fname
             )
             deduped_mapping = pd.read_parquet(f"{mapping_parquet_file_path}gfs-mapping-{idx:03}.parquet")
@@ -261,6 +260,102 @@ def create_mapped_index(axes: List[pd.Index], mapping_parquet_file_path: str, da
     final_var_list=final_df_var['varname'].tolist() 
 
     print(f"Mapped collected multiple variables index info: {len(final_var_list)} and {final_var_list}")
+    return final_df
+
+def cs_create_mapped_index(axes: List[pd.Index], gcs_bucket_name: str, date_str: str) -> pd.DataFrame:
+    """
+    Create a mapped index from GFS files for a specific date, using the mapping from a parquet file stored in GCS.
+    
+    Parameters:
+    - axes (List[pd.Index]): List of time axes to map.
+    - gcs_bucket_name (str): Name of the GCS bucket containing mapping files.
+    - date_str (str): Date string for the data being processed (format: YYYYMMDD).
+    
+    Returns:
+    - pd.DataFrame: DataFrame containing the mapped index for the specified date.
+    """
+    #logger = logging.getLogger()
+    mapped_index_list = []
+    dtaxes = axes[0]
+
+    # Convert date_str to first day of the month
+    first_day_of_month = pd.to_datetime(date_str).replace(day=1).strftime('%Y%m%d')
+    
+    # Initialize GCS filesystem
+    gcs_fs = fsspec.filesystem('gcs')
+    
+    for idx, datestr in enumerate(dtaxes):
+        try:
+            # S3 path for the GFS data
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            
+            # Parse the idx file from S3
+            idxdf = parse_grib_idx(
+                fs=fsspec.filesystem("s3"),
+                basename=fname
+            )
+            
+            # Construct GCS path for mapping file
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/20231201/agfs-time-20231201-rt{idx:03}.parquet"
+            
+            # Read parquet directly from GCS using fsspec
+            deduped_mapping = pd.read_parquet(
+                gcs_mapping_path,
+                filesystem=gcs_fs
+            )
+            
+            mapped_index = map_from_index(
+                datestr,
+                deduped_mapping,
+                idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+            )
+            mapped_index_list.append(mapped_index)
+            
+            logger.info(json.dumps({
+                "event": "file_processed",
+                "date": date_str,
+                "file_index": idx,
+                "mapping_file": gcs_mapping_path
+            }))
+            
+        except Exception as e:
+            logger.error(json.dumps({
+                "event": "error_processing_file",
+                "date": date_str,
+                "file_index": idx,
+                "error": str(e)
+            }))
+            continue
+
+    if not mapped_index_list:
+        raise ValueError(f"No valid mapped indices created for date {date_str}")
+
+    # Combine all mapped indices
+    gfs_kind = pd.concat(mapped_index_list)
+    
+    # Get unique variables
+    gfs_kind_var = gfs_kind.drop_duplicates('varname')
+    var_list = gfs_kind_var['varname'].tolist()
+    
+    # Define variables to process separately
+    var_to_remove = ['acpcp', 'cape', 'cin', 'pres', 'r', 'soill', 'soilw', 'st', 't', 'tp']
+    
+    # Filter variables
+    var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
+    gfs_kind1 = gfs_kind.loc[gfs_kind.varname.isin(var1_list)]
+    
+    # Process special variables
+    to_process_df = gfs_kind[gfs_kind['varname'].isin(var_to_remove)]
+    processed_df = process_dataframe(to_process_df, var_to_remove)
+    
+    # Combine processed and unprocessed data
+    final_df = pd.concat([gfs_kind1, processed_df], ignore_index=True)
+    final_df = final_df.sort_values(by=['time', 'varname'])
+    
+    # Get final variable list for logging
+    final_df_var = final_df.drop_duplicates('varname')
+    final_var_list = final_df_var['varname'].tolist()
+        
     return final_df
 
 def prepare_zarr_store(deflated_gfs_grib_tree_store: dict, gfs_kind: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
@@ -337,7 +432,7 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
 
             store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims, coords=coords, data=group, steps=steps, times=times, lvals=lvals if lvals.shape else None)
         except Exception as e:
-            print(f"Skipping of processing group {key}: {str(e)}")
+            print(f"Error processing group {key}: {str(e)}")
 
     return zstore
 
@@ -721,6 +816,169 @@ def logged_process_gfs_time_idx_data(s3url, bucket_name):
         return process_success
 
 
+def s3_ecmwf_build_idx_grib_mapping(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    date_str: str,
+    idx:int,
+    suffix: str = "index",
+    mapper: Optional[Callable] = None,
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False,
+) -> pd.DataFrame:
+    """
+    Mapping method combines the idx and grib metadata to make a mapping from one to the other for a particular
+    model horizon file. This should be generally applicable to all forecasts for the given horizon.
+    :param fs: the file system to read metatdata from
+    :param basename: the full path for the grib2 file
+    :param suffix: the suffix for the index file
+    :param mapper: the mapper if any to apply (used for hrrr subhf)
+    :param tstamp: the timestamp to use for when the data was indexed
+    :param validate: assert mapping is correct or fail before returning
+    :return: the merged dataframe with the results of the two operations joined on the grib message group number
+    """
+    #grib_file_index = _map_grib_file_by_group(fname=basename, mapper=mapper)
+    grib_file_index = pd.read_parquet(f'{date_str}/ecmwf_scangrib_metadata_table_{date_str}_{idx}.parquet')
+    idx_file_index = s3_parse_ecmwf_grib_idx(
+        fs=fs, basename=basename, suffix=suffix, tstamp=tstamp
+    )
+    result = idx_file_index.merge(
+        # Left merge because the idx file should be authoritative - one record per grib message
+        grib_file_index,
+        on="idx",
+        how="left",
+        suffixes=("_idx", "_grib"),
+    )
+
+    if validate:
+        # If any of these conditions fail - run the method in colab for the same file and inspect the result manually.
+        all_match_offset = (
+            (result.loc[:, "offset_idx"] == result.loc[:, "offset_grib"])
+            | pd.isna(result.loc[:, "offset_grib"])
+            | ~pd.isna(result.loc[:, "inline_value"])
+        )
+        all_match_length = (
+            (result.loc[:, "length_idx"] == result.loc[:, "length_grib"])
+            | pd.isna(result.loc[:, "length_grib"])
+            | ~pd.isna(result.loc[:, "inline_value"])
+        )
+
+        if not all_match_offset.all():
+            vcs = all_match_offset.value_counts()
+            raise ValueError(
+                f"Failed to match message offset mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+            )
+
+        if not all_match_length.all():
+            vcs = all_match_length.value_counts()
+            raise ValueError(
+                f"Failed to match message length mapping for grib file {basename}: {vcs[True]} matched, {vcs[False]} didn't"
+            )
+
+        if not result["attrs"].is_unique:
+            dups = result.loc[result["attrs"].duplicated(keep=False), :]
+            logger.warning(
+                "The idx attribute mapping for %s is not unique for %d variables: %s",
+                basename,
+                len(dups),
+                dups.varname.tolist(),
+            )
+
+        r_index = result.set_index(
+            ["varname", "typeOfLevel", "stepType", "level", "valid_time"]
+        )
+        if not r_index.index.is_unique:
+            dups = r_index.loc[r_index.index.duplicated(keep=False), :]
+            logger.warning(
+                "The grib hierarchy in %s is not unique for %d variables: %s",
+                basename,
+                len(dups),
+                dups.index.get_level_values("varname").tolist(),
+            )
+
+    return result
+
+
+def s3_parse_ecmwf_grib_idx(
+    fs: fsspec.AbstractFileSystem,
+    basename: str,
+    suffix: str = "index",
+    tstamp: Optional[pd.Timestamp] = None,
+    validate: bool = False,
+) -> pd.DataFrame:
+    """
+    Standalone method used to extract metadata from a grib2 index file
+
+    :param fs: the file system to read from
+    :param basename: the base name is the full path to the grib file
+    :param suffix: the suffix is the ending for the index file
+    :param tstamp: the timestamp to record for this index process
+    :return: the data frame containing the results
+    """
+    fname = f"{basename.rsplit('.', 1)[0]}.{suffix}"
+
+    fs.invalidate_cache(fname)
+    fs.invalidate_cache(basename)
+
+    baseinfo = fs.info(basename)
+
+    with fs.open(fname, "r") as f:
+        splits = []
+        for idx, line in enumerate(f):
+            try:
+                # Removing the trailing characters if there's any at the end of the line
+                clean_line = line.strip().rstrip(',')
+                # Convert the JSON-like string to a dictionary
+                data = json.loads(clean_line)
+                # Extracting required fields using .get() method to handle missing keys
+                lidx = idx
+                offset = data.get("_offset", 0)  # Default to 0 if missing
+                length = data.get("_length", 0)
+                date = data.get("date", "Unknown Date")  # Default to 'Unknown Date' if missing
+                ens_number = data.get("number", -1)  # Default to -1 if missing
+                # Append to the list as integers or the original data type
+                splits.append([int(lidx), int(offset),int(length), date, data, int(ens_number)])
+            except json.JSONDecodeError as e:
+                # Handle cases where JSON conversion fails
+                raise ValueError(f"Could not parse JSON from line: {line}") from e
+
+    result = pd.DataFrame(splits, columns=["idx", "offset", "length", "date", "attr", "ens_number"])
+
+    # Subtract the next offset to get the length using the filesize for the last value 
+
+    result.loc[:, "idx_uri"] = fname
+    result.loc[:, "grib_uri"] = basename
+
+    if tstamp is None:
+        tstamp = pd.Timestamp.now()
+    #result.loc[:, "indexed_at"] = tstamp
+    result['indexed_at'] = result.apply(lambda x: tstamp, axis=1)
+
+    # Check for S3 or GCS filesystem instances to handle metadata
+    if "s3" in fs.protocol:
+        # Use ETag as the S3 equivalent to crc32c
+        result.loc[:, "grib_etag"] = baseinfo.get("ETag")
+        result.loc[:, "grib_updated_at"] = pd.to_datetime(
+            baseinfo.get("LastModified")
+        ).tz_localize(None)
+
+        idxinfo = fs.info(fname)
+        result.loc[:, "idx_etag"] = idxinfo.get("ETag")
+        result.loc[:, "idx_updated_at"] = pd.to_datetime(
+            idxinfo.get("LastModified")
+        ).tz_localize(None)
+    else:
+        # TODO: Fix metadata for other filesystems
+        result.loc[:, "grib_crc32"] = None
+        result.loc[:, "grib_updated_at"] = None
+        result.loc[:, "idx_crc32"] = None
+        result.loc[:, "idx_updated_at"] = None
+
+    if validate and not result["attrs"].is_unique:
+        raise ValueError(f"Attribute mapping for grib file {basename} is not unique)")
+    print(f'Completed index files and found {len(result.index)} entries in it')
+    return result.set_index("idx")
+
 
 class KerchunkZarrDictStorageManager:
     """Manages storage and retrieval of Kerchunk Zarr dictionaries in Google Cloud Storage."""
@@ -931,6 +1189,74 @@ class KerchunkZarrDictStorageManager:
 
 
 
+async def old_process_single_file(
+    date_str: str,
+    first_day_of_month: str,
+    gcs_bucket_name: str,
+    idx: int,
+    datestr: pd.Timestamp,
+    sem: asyncio.Semaphore,
+    executor: ThreadPoolExecutor,
+    chunk_size: Optional[int] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Process a single file asynchronously with memory management.
+    
+    Parameters:
+    - date_str: The date string for the GFS data
+    - first_day_of_month: First day of the month for mapping files
+    - gcs_bucket_name: GCS bucket name
+    - idx: File index
+    - datestr: Timestamp for the data
+    - sem: Semaphore for controlling concurrent operations
+    - executor: ThreadPoolExecutor for CPU-bound operations
+    - chunk_size: Optional size for chunked reading
+    """
+    async with sem:  # Control concurrent operations
+        try:
+            # S3 path for GFS data
+            fname = f"s3://noaa-gfs-bdp-pds/gfs.{date_str}/00/atmos/gfs.t00z.pgrb2.0p25.f{idx:03}"
+            #gcs_mapping_path = f"gs://{gcs_bucket_name}/gfs_mapping/{first_day_of_month}/gfs-mapping-{idx:03}.parquet"
+            gcs_mapping_path = f"gs://{gcs_bucket_name}/time_idx/20231201/agfs-time-20231201-rt{idx:03}.parquet"
+
+            
+            # Use ThreadPoolExecutor for I/O operations
+            loop = asyncio.get_event_loop()
+            
+            # Read idx file
+            idxdf = await loop.run_in_executor(
+                executor,
+                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
+            )
+            
+            # Initialize GCS filesystem
+            gcs_fs = fsspec.filesystem('gcs')
+            
+            # Read parquet in chunks if chunk_size is specified
+            if chunk_size:
+                deduped_mapping_chunks = []
+                for chunk in pd.read_parquet(gcs_mapping_path, filesystem=gcs_fs, chunksize=chunk_size):
+                    deduped_mapping_chunks.append(chunk)
+                deduped_mapping = pd.concat(deduped_mapping_chunks, ignore_index=True)
+            else:
+                deduped_mapping = await loop.run_in_executor(
+                    executor,
+                    partial(pd.read_parquet, gcs_mapping_path, filesystem=gcs_fs)
+                )
+            
+            # Process the mapping
+            idxdf_filtered = idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+            mapped_index = await loop.run_in_executor(
+                executor,
+                partial(map_from_index, datestr, deduped_mapping, idxdf_filtered)
+            )
+            
+            return mapped_index
+            
+        except Exception as e:
+            print(f'Error in {str(e)}')
+            return None
+
 async def process_single_file(
     date_str: str,
     first_day_of_month: str,
@@ -961,7 +1287,7 @@ async def process_single_file(
             # Read idx file
             idxdf = await loop.run_in_executor(
                 executor,
-                partial(parse_grib_idx, basename=fname)
+                partial(parse_grib_idx, fs=fsspec.filesystem("s3"), basename=fname)
             )
             
             # Read parquet in chunks if chunk_size is specified
@@ -1228,7 +1554,6 @@ def map_forecast_to_indices(forecast_dict: dict, df: pd.DataFrame) -> Tuple[dict
 
     return output_dict, values_list
 
-
 @log_function_call
 def _map_grib_file_by_group(
     fname: str,
@@ -1246,7 +1571,7 @@ def _map_grib_file_by_group(
     #total_groups = 4233  # Your specified value
     
     start_time = time.time()
-    logger.info(f" Starting to process {total_groups} groups from file: {fname}")
+    print(f" Starting to process {total_groups} groups from file: {fname}")
     
     processed_groups = 0
     successful_groups = 0
@@ -1276,11 +1601,11 @@ def _map_grib_file_by_group(
                     progress_percentage = (processed_groups / total_groups) * 100
                     groups_per_second = processed_groups / elapsed_time if elapsed_time > 0 else 0
                     
-                    # Estimat remaining time
+                    # Estimate remaining time
                     remaining_groups = total_groups - processed_groups
                     estimated_remaining_time = remaining_groups / groups_per_second if groups_per_second > 0 else 0
                     
-                    logger.info(
+                    print(
                         f"Progress: {processed_groups}/{total_groups} groups processed "
                         f"({progress_percentage:.1f}%) - "
                         f"Successful: {successful_groups}, Failed: {failed_groups}, "
@@ -1288,6 +1613,7 @@ def _map_grib_file_by_group(
                         f"Rate: {groups_per_second:.1f} groups/sec | "
                         f"Elapsed: {elapsed_time:.1f}s | "
                         f"Est. Remaining: {estimated_remaining_time:.1f}s",
+                        end=""
                     )
                 
                 yield result
@@ -1295,7 +1621,7 @@ def _map_grib_file_by_group(
             except Exception as e:
                 failed_groups += 1
                 processed_groups += 1
-                logger.info(f"Skipping processing of group {i}: {str(e)}")
+                print(f"Skipping processing of group {i}: {str(e)}")
                 continue
 
     with warnings.catch_warnings():
@@ -1315,7 +1641,7 @@ def _map_grib_file_by_group(
     average_rate = processed_groups / total_time if total_time > 0 else 0
 
     # Print final summary with timestamp
-    logger.info(f"Completed processing {fname}:")
+    print(f"Completed processing {fname}:")
     print(f"Total groups: {total_groups}")
     print(f"Processed groups: {processed_groups}")
     print(f"Successful groups: {successful_groups}")
@@ -1357,25 +1683,12 @@ def recreate_folder(folder_path):
     os.makedirs(folder_path)
     print(f"Folder '{folder_path}' has been recreated.")
 
-def create_folder(folder_path):
-    """
-    Creates a folder if it does not already exist.
-    
-    Parameters:
-    - folder_path (str): The path to the folder to create.
-    """
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-        print(f"Folder '{folder_path}' has been created.")
-    else:
-        print(f"Folder '{folder_path}' already exists.")
-
 
 def filter_gfs_scan_grib(gurl,tofilter_cgan_var_dict):
     fs=fsspec.filesystem("s3")
     suffix= "idx"
     gsc = scan_grib(gurl)
-    idx_gfs = aws_parse_grib_idx(fs, basename=gurl, suffix=suffix)
+    idx_gfs = aws_parse_grib_idx(fs=fs, basename=gurl, suffix=suffix)
     output_dict0, vl_gfs = map_forecast_to_indices(tofilter_cgan_var_dict, idx_gfs)
     return [gsc[i] for i in vl_gfs]
 
@@ -1455,7 +1768,9 @@ def worker_upload_required_files(client, parquet_path: str, credentials_path: st
     """Upload required files to all workers."""
     client.upload_file(credentials_path)
     client.upload_file(parquet_path)
+    client.upload_file('./dynamic_zarr_store.py')
     client.upload_file('./utils.py')
+    
     
 def get_worker_paths(dask_worker, date_str: str, run_str: str):
     """Get paths for required files on worker."""
@@ -1472,12 +1787,165 @@ def load_datatree_on_worker(parquet_path: str):
         lambda x: x.decode('utf-8') if isinstance(x, bytes) else x
     )
     zstore = {row['key']: eval(row['value']) for _, row in zstore_df.iterrows()}
-    return xr.open_datatree(
+    return open_datatree(
         fsspec.filesystem("reference", fo=zstore).get_mapper(""),
         engine="zarr",
         consolidated=False
     )
 
+
+def old_process_and_save_locally(
+    path: str,
+    local_save_path: str,
+    gcs_bucket: str,
+    date_str: str,
+    run_str: str,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> str:
+    """
+    Process a single dataset path and save to a local Zarr store with specified lat/lon bounds.
+
+    Parameters:
+    - path (str): The dataset path to process.
+    - local_save_path (str): The local directory where the Zarr store should be saved.
+    - gcs_bucket (str): The GCS bucket name.
+    - date_str (str): The date string in YYYYMMDD format.
+    - run_str (str): The run string (e.g., "00", "06", "12", "18").
+    - latlon_bounds (Dict[str, float]): Dictionary containing lat/lon bounds with keys:
+        - lat_min: Minimum latitude (-90 to 90)
+        - lat_max: Maximum latitude (-90 to 90)
+        - lon_min: Minimum longitude (-180 to 180)
+        - lon_max: Maximum longitude (-180 to 180)
+
+    Returns:
+    - str: A message indicating the result of the processing and saving operation.
+
+    Raises:
+    - ValueError: If lat/lon bounds are invalid or missing required keys
+    - FileNotFoundError: If local_save_path cannot be created
+    - Exception: For other processing errors
+    """
+    # Validate latlon_bounds
+    required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+    if not all(key in latlon_bounds for key in required_keys):
+        raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+
+    try:
+        # Create local save directory if it doesn't exist
+        #os.makedirs(local_save_path, exist_ok=True)
+
+        # Load the dataset
+        gfs_dt = load_datatree_on_worker(path)
+        ds = gfs_dt[path].to_dataset()
+
+        # Drop unnecessary variables
+        if "step" in ds.coords:
+            ds = ds.drop_vars(["step"])
+        if "isobaricInhPa" in ds.coords:
+            ds = ds.sel(isobaricInhPa=200)
+
+        # Apply lat/lon bounds
+        ds1 = ds.sel(
+            latitude=slice(latlon_bounds["lat_min"], latlon_bounds["lat_max"]),
+            lon=slice(latlon_bounds["lon_min"], latlon_bounds["lon_max"])
+        )
+
+        # Construct the store path
+        var_name = path.strip("/").replace("/", "_")
+        store_path = os.path.join(local_save_path, f"{var_name}.zarr")
+        # Ensure parent directories exist
+        parent_dir = os.path.dirname(store_path)
+        os.makedirs(parent_dir, exist_ok=True)
+        # Save dataset to local Zarr store
+        ds1.to_zarr(store_path, mode="w", consolidated=True)
+
+        return f"Created new store at {store_path}"
+
+    except FileNotFoundError as e:
+        return f"Error creating directory {local_save_path}: {str(e)}"
+    except ValueError as e:
+        return f"Error with lat/lon bounds: {str(e)}"
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
+
+
+def old_process_and_save(path: str, gcs_bucket: str, gcs_path: str, date_str: str, run_str: str):
+    """Process a single path and save to GCS, appending if zarr store exists."""
+    try:
+        # Get worker-specific paths
+        worker = get_worker()
+        paths = get_worker_paths(worker, date_str, run_str)
+        
+        # Initialize GCS filesystem with proper credentials
+        gcs = gcsfs.GCSFileSystem(
+            token=paths['credentials'],
+            project='your-project-id'  # Add your GCP project ID here
+        )
+        
+        # Load datatree on worker
+        gfs_dt = load_datatree_on_worker(paths['parquet'])
+        
+        # Process dataset
+        ds = gfs_dt[path].to_dataset()
+        if 'step' in ds.coords:
+            ds = ds.drop_vars(['step'])
+        if 'isobaricInhPa' in ds.coords:
+            ds = ds.sel(isobaricInhPa=200)
+            
+        # Construct store path
+        var_name = path.strip('/').replace('/', '_')
+        store_path = f"{gcs_bucket}/{gcs_path}/{var_name}.zarr"
+        
+        # Check if zarr store already exists
+        store_exists = gcs.exists(store_path)
+        
+        if store_exists:
+            # If store exists, try to append
+            try:
+                existing_ds = xr.open_zarr(gcs.get_mapper(store_path))
+                
+                # Check if we have new times to append
+                new_times = ds.valid_times.values
+                existing_times = existing_ds.valid_times.values
+                times_to_append = new_times[~np.isin(new_times, existing_times)]
+                
+                if len(times_to_append) > 0:
+                    # Filter dataset to only new times
+                    ds_to_append = ds.sel(valid_times=times_to_append)
+                    
+                    # Append to existing store
+                    ds_to_append.to_zarr(
+                        store=gcs.get_mapper(store_path),
+                        mode='a',  # Append mode
+                        append_dim='valid_times',  # Dimension to append along
+                        consolidated=True
+                    )
+                    return f"Appended {len(times_to_append)} new times to gs://{store_path}"
+                else:
+                    return f"No new times to append for gs://{store_path}"
+                    
+            except Exception as e:
+                # If append fails, log error and create new store
+                print(f"Error appending to store: {e}")
+                print("Creating new store instead")
+                store_exists = False
+        
+        if not store_exists:
+            # Create new store if doesn't exist or append failed
+            ds.to_zarr(
+                store=gcs.get_mapper(store_path),
+                mode='w',  # Write mode (creates new store)
+                consolidated=True
+            )
+            return f"Created new store at gs://{store_path}"
+            
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
 
 def process_and_save(
     var_path: str,
@@ -1610,11 +2078,154 @@ def process_and_save(
         return f"Error processing {var_path}: {str(e)}"
 
 
+def old_process_and_upload_datatree(
+    parquet_path: str,
+    gcs_bucket: str, 
+    gcs_path: str,
+    client: Client,
+    credentials_path: str,
+    date_str: str,
+    run_str: str, 
+    project_id: str  # Add project_id parameter
+) -> List[str]:
+    """Process datatree and upload to GCS as Zarr stores."""
+    # Upload required files to workers
+    worker_upload_required_files(client, parquet_path, credentials_path)
+    
+    # Set GCS credentials for client
+    client.run(lambda: gcsfs.GCSFileSystem(token='coiled-data-key.json', project=project_id))
+    
+    # Load datatree locally just to get paths
+    temp_dt = load_datatree_on_worker(parquet_path)
+    paths = [node.path for node in temp_dt.subtree if node.has_data]
+    
+    # Submit jobs in batches
+    futures = []
+    for path in paths:
+        future = client.submit(
+            process_and_save_locally,
+            path, 
+            gcs_bucket, 
+            gcs_path,
+            date_str,
+            run_str,
+            pure=False
+        )
+        futures.append(future)
+    
+    return client.gather(futures)
+
+
 
 class StorageType(Enum):
     """Enum for storage type options"""
     LOCAL = auto()
     GCS = auto()
+
+def old2_process_and_upload_datatree(
+    parquet_path: str,
+    gcs_bucket: str, 
+    gcs_path: str,
+    client: Client,
+    credentials_path: str,
+    date_str: str,
+    run_str: str, 
+    project_id: str,
+    storage_type: StorageType = StorageType.GCS,
+    local_save_path: Optional[str] = None,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> List[str]:
+    """
+    Process datatree and upload to either local storage or GCS as Zarr stores.
+
+    Parameters:
+    ----------
+    parquet_path : str
+        Path to the input parquet file
+    gcs_bucket : str
+        GCS bucket name
+    gcs_path : str
+        Path within GCS bucket
+    client : Client
+        Dask client instance
+    credentials_path : str
+        Path to GCP credentials file
+    date_str : str
+        Date string in YYYYMMDD format
+    run_str : str
+        Run string (e.g., '00', '06', '12', '18')
+    project_id : str
+        GCP project ID
+    storage_type : StorageType
+        Whether to store locally or in GCS (default: StorageType.GCS)
+    local_save_path : str, optional
+        Local path for saving Zarr stores if storage_type is LOCAL
+    latlon_bounds : Dict[str, float]
+        Dictionary containing lat/lon bounds
+
+    Returns:
+    -------
+    List[str]
+        List of messages indicating processing results
+    """
+    # Set default local_save_path if not provided
+    if local_save_path is None:
+        local_save_path = os.path.join("zarr_stores", f"{date_str}_{run_str}") 
+    # Create the local save directory if it doesn't exist
+    if storage_type == StorageType.LOCAL:
+        os.makedirs(local_save_path, exist_ok=True)
+    # Upload required files to workers
+    worker_upload_required_files(client, parquet_path, credentials_path)
+    
+    # Set GCS credentials for client if using GCS storage
+    if storage_type == StorageType.GCS:
+        client.run(lambda: gcsfs.GCSFileSystem(token='coiled-data-key.json', project=project_id))
+    
+    # Load datatree locally just to get paths
+    temp_dt = load_datatree_on_worker(parquet_path)
+    paths = [node.path for node in temp_dt.subtree if node.has_data]
+    
+    # Submit jobs in batches
+    futures = []
+    for path in paths:
+        if storage_type == StorageType.LOCAL:
+            # Use process_and_save_locally for local storage
+            future = client.submit(
+                process_and_save_locally,
+                path=path,
+                local_save_path=local_save_path,
+                gcs_bucket=gcs_bucket,
+                date_str=date_str,
+                run_str=run_str,
+                latlon_bounds=latlon_bounds,
+                pure=False
+            )
+        else:
+            # Use process_and_save for GCS storage
+            future = client.submit(
+                process_and_save,
+                path=path,
+                gcs_bucket=gcs_bucket,
+                gcs_path=gcs_path,
+                date_str=date_str,
+                run_str=run_str,
+                latlon_bounds=latlon_bounds,
+                pure=False
+            )
+        futures.append(future)
+    
+    results = client.gather(futures)
+    
+    # Create summary message
+    storage_type_str = "locally" if storage_type == StorageType.LOCAL else "to GCS"
+    print(f"Processed {len(results)} datasets {storage_type_str}")
+    
+    return results
 
 
 def process_dataset_on_worker(
@@ -1685,6 +2296,38 @@ def save_dataset_locally(
         return f"Created new store at {store_path}"
     except Exception as e:
         return f"Error saving dataset {safe_name}: {str(e)}"
+
+def del_process_and_save_locally(
+    path: str,
+    local_save_path: str,
+    gcs_bucket: str,
+    date_str: str,
+    run_str: str,
+    latlon_bounds: Dict[str, float] = {
+        "lat_min": -90.0,
+        "lat_max": 90.0,
+        "lon_min": -180.0,
+        "lon_max": 180.0
+    }
+) -> str:
+    """
+    Process a single dataset path and save to a local Zarr store with specified lat/lon bounds.
+    This function coordinates between worker and client operations.
+    """
+    try:
+        # Validate latlon_bounds
+        required_keys = {"lat_min", "lat_max", "lon_min", "lon_max"}
+        if not all(key in latlon_bounds for key in required_keys):
+            raise ValueError(f"latlon_bounds must contain all required keys: {required_keys}")
+        
+        # Process dataset on worker and get results back to client
+        safe_name, processed_ds = process_dataset_on_worker(path, latlon_bounds)
+        
+        # Save the dataset locally on the client
+        return save_dataset_locally(safe_name, processed_ds, local_save_path)
+        
+    except Exception as e:
+        return f"Error processing {path}: {str(e)}"
 
 # Updated process_and_upload_datatree function
 def process_and_upload_datatree(
@@ -1761,5 +2404,4 @@ def process_and_upload_datatree(
     print(f"Processed {len(results)} datasets {storage_type_str}")
     
     return results
-
 
