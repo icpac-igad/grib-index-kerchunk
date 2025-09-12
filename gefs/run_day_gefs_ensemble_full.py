@@ -44,8 +44,8 @@ FORECAST_HOUR_FROM_LOCAL = TARGET_UTC_TIME if TARGET_UTC_TIME >= 0 else TARGET_U
 TIMESTEP_INDEX = FORECAST_HOUR // 3  # For 12 hours: 12/3 = 4
 
 # Configuration for the specific run
-TARGET_DATE_STR = '20250909'
-TARGET_RUN = '18'  # 00Z run
+TARGET_DATE_STR = '20250910'
+TARGET_RUN = '00'  # 00Z run
 REFERENCE_DATE_STR = '20241112'  # Date with existing parquet mappings
 ENSEMBLE_MEMBERS = [f'gep{i:02d}' for i in range(1, 31)]  # All 30 members
 
@@ -305,8 +305,6 @@ def stream_ensemble_precipitation(members_data, variable='tp', output_dir=None):
     
     return ensemble_numpy, ensemble_xarray
 
-
-
 def main():
     """Main processing function for full ensemble GEFS data."""
     print("="*80)
@@ -327,15 +325,13 @@ def main():
     # 2. Define forecast variables
     forecast_dict = {
         "Surface pressure": "PRES:surface",
-        "Downward short-wave radiation flux": "DSWRF:surface", 
-        "Convective available potential energy": "CAPE:surface",
-        "Upward short-wave radiation flux": "USWRF:surface",
-        "Total Precipitation": "APCP:surface",
-        "Wind speed (gust)": "GUST:surface",
         "2 metre temperature": "TMP:2 m above ground",
-        "2 metre relative humidity": "RH:2 m above ground",
         "10 metre U wind component": "UGRD:10 m above ground",
         "10 metre V wind component": "VGRD:10 m above ground",
+        "Precipitable water": "PWAT:entire atmosphere (considered as a single layer)",
+        "Convective available potential energy": "CAPE:surface",
+        "Mean sea level pressure": "MSLET:mean sea level",
+        "Total Precipitation": "APCP:surface",
     }
     
     # 3. Calculate time dimensions (same for all members)
