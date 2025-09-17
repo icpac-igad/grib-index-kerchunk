@@ -341,15 +341,13 @@ def main():
     # 2. Define forecast variables
     forecast_dict = {
         "Surface pressure": "PRES:surface",
-        "Downward short-wave radiation flux": "DSWRF:surface", 
-        "Convective available potential energy": "CAPE:surface",
-        "Upward short-wave radiation flux": "USWRF:surface",
-        "Total Precipitation": "APCP:surface",
-        "Wind speed (gust)": "GUST:surface",
         "2 metre temperature": "TMP:2 m above ground",
-        "2 metre relative humidity": "RH:2 m above ground",
         "10 metre U wind component": "UGRD:10 m above ground",
         "10 metre V wind component": "VGRD:10 m above ground",
+        "Precipitable water": "PWAT:entire atmosphere (considered as a single layer)",
+        "Convective available potential energy": "CAPE:surface",
+        "Mean sea level pressure": "MSLET:mean sea level",
+        "Total Precipitation": "APCP:surface",
     }
     
     # 3. Calculate time dimensions (same for all members)

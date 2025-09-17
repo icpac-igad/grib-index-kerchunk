@@ -100,9 +100,9 @@ VARIABLE_MAPPING = {
     'tmp': 't2m',          # 2m temperature
     'ugrd': 'u10',         # 10m U wind component
     'vgrd': 'v10',         # 10m V wind component
-    'pwat': None,          # Precipitable water (not available)
+    'pwat': 'pwat',        # Precipitable water (check if available)
     'cape': 'cape',        # Convective available potential energy
-    'msl': None,           # Mean sea level pressure (not available)
+    'msl': 'mslet',        # Mean sea level pressure
     'apcp': 'tp'           # Total precipitation
 }
 
@@ -187,6 +187,8 @@ def filter_variables(variable_groups, requested_vars=None):
         return variable_groups
 
     print(f"🔧 Filtering variables: requested {requested_vars}")
+    print(f"🔍 Available variables: {available_var_names}")
+    print(f"🗺️ Variable mapping: {VARIABLE_MAPPING}")
 
     # Filter variable groups to include only requested variables
     filtered_groups = {}
@@ -209,15 +211,26 @@ def filter_variables(variable_groups, requested_vars=None):
                     print(f"   ✅ {req_var} → {var_name}: Mapped match")
                     break
 
-    # Report missing variables
-    missing_vars = [v for v in requested_vars if v not in found_vars and (v not in VARIABLE_MAPPING or VARIABLE_MAPPING[v] not in found_vars)]
+    # Report missing variables with more detail
+    missing_vars = []
+    for req_var in requested_vars:
+        if req_var not in found_vars:
+            mapped_var = VARIABLE_MAPPING.get(req_var)
+            if mapped_var and mapped_var not in found_vars:
+                missing_vars.append(f"{req_var} → {mapped_var}")
+            elif not mapped_var:
+                missing_vars.append(f"{req_var} (no mapping)")
+            else:
+                missing_vars.append(req_var)
+
     if missing_vars:
         print(f"   ⚠️ Variables not found: {missing_vars}")
 
     if not filtered_groups:
         raise ValueError("No valid variables found. Check variable names and availability.")
 
-    print(f"📋 Processing {len(filtered_groups)} filtered variables")
+    final_var_names = [info['variable'] for info in filtered_groups.values()]
+    print(f"📋 Processing {len(filtered_groups)} filtered variables: {final_var_names}")
     return filtered_groups
 
 def subset_region(ds, region):
@@ -292,9 +305,21 @@ def save_combined_zarr_v2(dt, member_name, output_dir, variable_groups, region='
             print(f"   ❌ No datasets to combine")
             return None
 
-        # Combine all datasets into one
+        # Combine all datasets into one with simplified approach to avoid coordinate conflicts
         print(f"   🔗 Combining {len(datasets_to_combine)} datasets...")
-        combined_ds = xr.merge(datasets_to_combine, compat='override')
+
+        # Use a simpler approach: start with first dataset and add variables one by one
+        if datasets_to_combine:
+            combined_ds = datasets_to_combine[0].copy()
+
+            # Add variables from other datasets
+            for ds in datasets_to_combine[1:]:
+                for var_name in ds.data_vars:
+                    if var_name not in combined_ds.data_vars:
+                        # Add variable with its essential coordinates only
+                        combined_ds[var_name] = ds[var_name]
+        else:
+            raise ValueError("No datasets to combine")
 
         # Add global attributes
         combined_ds.attrs.update({

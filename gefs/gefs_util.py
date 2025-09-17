@@ -735,18 +735,13 @@ def process_gefs_data(date_str: str, ensemble_member: str, mapping_parquet_file_
         ]
         forecast_dict = {
             "Surface pressure": "PRES:surface",
-            "Downward short-wave radiation flux": "DSWRF:surface",
-            "Convective available potential energy": "CAPE:surface",
-            "Upward short-wave radiation flux": "USWRF:surface",
-            "Total Precipitation": "APCP:surface",
-            "Wind speed (gust)": "GUST:surface",
             "2 metre temperature": "TMP:2 m above ground",
-            "2 metre relative humidity": "RH:2 m above ground",
             "10 metre U wind component": "UGRD:10 m above ground",
             "10 metre V wind component": "VGRD:10 m above ground",
-            "Precipitable water": "PWAT:atmosphere",
-            "Total Cloud Cover": "TCDC:atmosphere",
-            "Geopotential height": "HGT:cloud ceiling"
+            "Precipitable water": "PWAT:entire atmosphere (considered as a single layer)",
+            "Convective available potential energy": "CAPE:surface",
+            "Mean sea level pressure": "MSLET:mean sea level",
+            "Total Precipitation": "APCP:surface",
         }
         _, deflated_gefs_grib_tree_store = filter_build_grib_tree(gefs_files, forecast_dict)
         time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
