@@ -185,7 +185,7 @@ def process_gefs_dataframe(df, varnames_to_process):
         'rh': 'heightAboveGround',
         'ugrd': 'heightAboveGround',
         'vgrd': 'heightAboveGround',
-        'pwat': 'atmosphere',
+        'pwat': ['entire atmosphere (considered as a single layer)', 'atmosphereSingleLayer'],
         'tcdc': 'atmosphere',
         'hgt': 'cloudCeiling'
     }
@@ -197,12 +197,19 @@ def process_gefs_dataframe(df, varnames_to_process):
             if isinstance(level, list):
                 for l in level:
                     filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == l)]
+                    if varname == 'pwat':
+                        print(f"PWAT: Looking for typeOfLevel='{l}', found {len(filtered_df)} entries")
                     filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
                     processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
             else:
                 filtered_df = df[(df['varname'] == varname) & (df['typeOfLevel'] == level)]
+                if varname == 'pwat':
+                    print(f"PWAT: Looking for typeOfLevel='{level}', found {len(filtered_df)} entries")
                 filtered_df = filtered_df.sort_values(by='length', ascending=False).drop_duplicates(subset=['time'], keep='first')
                 processed_df = pd.concat([processed_df, filtered_df], ignore_index=True)
+        else:
+            if varname == 'pwat':
+                print(f"WARNING: PWAT not found in conditions mapping!")
 
     return processed_df
 
@@ -298,10 +305,38 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
     print("Processing GEFS Unique Groups and Updating Zarr Store")
     unique_groups = chunk_index.set_index(["varname", "stepType", "typeOfLevel"]).index.unique()
 
+    # Debug: Print what we have in chunk_index
+    print(f"Chunk index contains {len(chunk_index)} rows")
+    print(f"Unique variables in chunk_index: {chunk_index['varname'].unique()}")
+    print(f"Unique groups identified: {len(unique_groups)}")
+
+    # Debug: Check specifically for pwat
+    pwat_entries = chunk_index[chunk_index['varname'] == 'pwat']
+    if not pwat_entries.empty:
+        print(f"PWAT found in chunk_index with typeOfLevel: {pwat_entries['typeOfLevel'].unique()}")
+    else:
+        print("WARNING: PWAT not found in chunk_index!")
+
+    # Count keys before deletion
+    original_key_count = len(zstore.keys())
+    keys_to_delete = []
+
     for key in list(zstore.keys()):
         lookup = tuple([val for val in os.path.dirname(key).split("/")[:3] if val != ""])
         if lookup not in unique_groups:
-            del zstore[key]
+            keys_to_delete.append(key)
+
+    # Debug: Check if pwat keys are being deleted
+    pwat_keys_to_delete = [k for k in keys_to_delete if 'pwat' in k.lower()]
+    if pwat_keys_to_delete:
+        print(f"WARNING: About to delete {len(pwat_keys_to_delete)} pwat-related keys!")
+        print(f"Sample pwat keys being deleted: {pwat_keys_to_delete[:3]}")
+
+    # Delete the keys
+    for key in keys_to_delete:
+        del zstore[key]
+
+    print(f"Deleted {len(keys_to_delete)} keys from zarr store (from {original_key_count} to {len(zstore.keys())})")
 
     for key, group in chunk_index.groupby(["varname", "stepType", "typeOfLevel"]):
         try:
@@ -309,6 +344,24 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
             lvals = group.level.unique()
             dims = time_dims.copy()
             coords = time_coords.copy()
+
+            # Check if this group has the required zarr structure
+            required_keys = [
+                f"{base_path}/time/.zattrs",
+                f"{base_path}/valid_time/.zattrs",
+                f"{base_path}/step/.zattrs",
+                f"{base_path}/{key[2]}/.zattrs" if key[2] else None
+            ]
+            required_keys = [k for k in required_keys if k is not None]
+
+            missing_keys = [k for k in required_keys if k not in zstore]
+            if missing_keys:
+                if key[0] == 'pwat':
+                    print(f"PWAT missing zarr structure keys: {missing_keys}")
+                    print(f"PWAT available keys matching pattern: {[k for k in zstore.keys() if 'pwat' in k.lower()][:5]}")
+                    print(f"PWAT group will be skipped - not included in original GRIB tree structure")
+                # Skip this group if it's missing required zarr structure
+                continue
 
             if len(lvals) == 1:
                 lvals = lvals.squeeze()
@@ -326,8 +379,20 @@ def process_unique_groups(zstore: dict, chunk_index: pd.DataFrame, time_dims: Di
             store_coord_var(key=f"{base_path}/{key[2]}", zstore=zstore, coords=(key[2],) if lvals.shape else (), data=lvals)
 
             store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims, coords=coords, data=group, steps=steps, times=times, lvals=lvals if lvals.shape else None)
+
+            # Success message for PWAT
+            if key[0] == 'pwat':
+                print(f"✅ PWAT successfully processed and stored in zarr!")
+
         except Exception as e:
             print(f"Skipping processing of GEFS group {key}: {str(e)}")
+            if key[0] == 'pwat':  # Special attention to PWAT errors
+                print(f"PWAT SPECIFIC ERROR: {type(e).__name__}: {str(e)}")
+                print(f"PWAT group details: varname={key[0]}, stepType={key[1]}, typeOfLevel={key[2]}")
+                print(f"PWAT group size: {len(group)}")
+                print(f"PWAT level values: {group.level.unique()}")
+                import traceback
+                traceback.print_exc()
 
     return zstore
 
@@ -439,6 +504,16 @@ def filter_gefs_scan_grib(gurl, tofilter_gefs_var_dict):
     gsc = scan_grib(gurl, storage_options=storage_options)
     idx_gefs = parse_grib_idx(basename=gurl, suffix=suffix, storage_options=storage_options)
     output_dict0, vl_gefs = map_forecast_to_indices(tofilter_gefs_var_dict, idx_gefs)
+
+    # Debug PWAT filtering
+    pwat_found = any('PWAT' in str(value) for value in tofilter_gefs_var_dict.values())
+    if pwat_found:
+        pwat_entries = idx_gefs[idx_gefs['attrs'].str.contains('PWAT', na=False)]
+        print(f"GRIB filtering debug - PWAT entries in idx: {len(pwat_entries)}")
+        if not pwat_entries.empty:
+            print(f"PWAT attrs sample: {pwat_entries['attrs'].iloc[0]}")
+        print(f"Indices selected for PWAT: {[i for i, v in output_dict0.items() if 'PWAT' in str(v)]}")
+
     return [gsc[i] for i in vl_gefs]
 
 
@@ -477,12 +552,19 @@ def map_forecast_to_indices(forecast_dict: dict, df: pd.DataFrame) -> Tuple[dict
     output_dict = {}
     
     for key, value in forecast_dict.items():
-        matching_rows = df[df['attrs'].str.contains(value, na=False)]
-        
+        # Use regex=False to treat the search string as literal text, not regex
+        matching_rows = df[df['attrs'].str.contains(value, na=False, regex=False)]
+
         if not matching_rows.empty:
             output_dict[key] = int(matching_rows.index[0] - 1)
+            if 'PWAT' in value:  # Debug PWAT matching
+                print(f"PWAT MATCH FOUND: {key} -> index {matching_rows.index[0] - 1}")
         else:
             output_dict[key] = 9999
+            if 'PWAT' in value:  # Debug PWAT not matching
+                print(f"PWAT NO MATCH: searching for '{value}' in {len(df)} entries")
+                pwat_attrs = df[df['attrs'].str.contains('PWAT', na=False, regex=False)]['attrs'].tolist()
+                print(f"Available PWAT attrs: {pwat_attrs[:3]}")
     
     values_list = [value for value in output_dict.values() if value != 9999]
     return output_dict, values_list
@@ -620,10 +702,30 @@ async def process_gefs_files_in_batches(
     var_list = gefs_kind_var['varname'].tolist()
     var_to_remove = ['pres','dswrf','cape','uswrf','apcp','gust','tmp','rh','ugrd','vgrd','pwat','tcdc','hgt']
     var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
-    
+
+    print(f"Variables found in gefs_kind: {var_list}")
+    print(f"Variables to be specially processed: {[v for v in var_to_remove if v in var_list]}")
+    print(f"Variables to be kept as-is: {var1_list}")
+
     gefs_kind1 = gefs_kind.loc[gefs_kind.varname.isin(var1_list)]
     to_process_df = gefs_kind[gefs_kind['varname'].isin(var_to_remove)]
+
+    # Debug pwat specifically
+    if 'pwat' in var_list:
+        pwat_df = gefs_kind[gefs_kind['varname'] == 'pwat']
+        print(f"PWAT entries before processing: {len(pwat_df)}")
+        print(f"PWAT typeOfLevel values: {pwat_df['typeOfLevel'].unique()}")
+
     processed_df = process_gefs_dataframe(to_process_df, var_to_remove)
+
+    # Debug pwat after processing
+    if 'pwat' in var_to_remove:
+        pwat_processed = processed_df[processed_df['varname'] == 'pwat']
+        print(f"PWAT entries after processing: {len(pwat_processed)}")
+        if not pwat_processed.empty:
+            print(f"PWAT typeOfLevel after processing: {pwat_processed['typeOfLevel'].unique()}")
+        else:
+            print("WARNING: PWAT lost during processing!")
     
     final_df = pd.concat([gefs_kind1, processed_df], ignore_index=True)
     final_df = final_df.sort_values(by=['time', 'varname'])
