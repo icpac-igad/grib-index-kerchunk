@@ -493,7 +493,7 @@ Examples:
     parser.add_argument('date', help='Date in YYYYMMDD format (e.g., 20250909)')
     parser.add_argument('run', help='Run hour in HH format (e.g., 18)')
     parser.add_argument('member', help='Ensemble member (e.g., gep01)')
-    parser.add_argument('--region', choices=list(REGIONS.keys()), default='global',
+    parser.add_argument('--region', choices=list(REGIONS.keys()), default='east_africa',
                        help='Region to subset (default: global)')
     parser.add_argument('--variables', type=str,
                        help='Comma-separated list of variables to process (default: all available)')
