@@ -181,9 +181,11 @@ def plot_ensemble_mean(ds, gdf, output_file="ensemble_mean_t2m.png", time_idx=0)
         Time index to plot (for ensemble data)
     """
     # Check if we have pre-computed mean or need to compute it
-    if 't2m_mean' in ds.data_vars:
-        # Pre-computed mean
-        mean_data = ds['t2m_mean']
+    if 't2m' in ds.data_vars and 'member' not in ds.dims:
+        # Pre-computed mean (t2m without member dimension)
+        mean_data = ds['t2m']
+        if len(mean_data.dims) > 2:  # has time dimension
+            mean_data = mean_data.isel(valid_times=time_idx)
     elif 't2m' in ds.data_vars and 'member' in ds.dims:
         # Individual ensemble members - compute mean
         mean_data, _ = compute_ensemble_statistics(ds, time_idx)
@@ -284,9 +286,11 @@ def plot_ensemble_std(ds, gdf, output_file="ensemble_std_t2m.png", time_idx=0):
         Time index to plot (for ensemble data)
     """
     # Check if we have pre-computed std or need to compute it
-    if 't2m_std' in ds.data_vars:
-        # Pre-computed std
-        std_data = ds['t2m_std']
+    if 't2m' in ds.data_vars and 'member' not in ds.dims:
+        # Pre-computed std (t2m without member dimension)
+        std_data = ds['t2m']
+        if len(std_data.dims) > 2:  # has time dimension
+            std_data = std_data.isel(valid_times=time_idx)
     elif 't2m' in ds.data_vars and 'member' in ds.dims:
         # Individual ensemble members - compute std
         _, std_data = compute_ensemble_statistics(ds, time_idx)
@@ -473,8 +477,18 @@ def create_combined_plot(ds, gdf, output_file="combined_ensemble_t2m.png"):
         Output filename for the plot
     """
     # Extract data
-    mean_data = ds['t2m_mean'] - 273.15  # Convert to Celsius
-    std_data = ds['t2m_std']
+    if 't2m' in ds.data_vars and 'member' not in ds.dims:
+        # Pre-computed data - check if it's mean or std based on data range
+        temp_data = ds['t2m']
+        if temp_data.max() > 50:  # Likely temperature in Kelvin (mean data)
+            mean_data = temp_data - 273.15  # Convert to Celsius
+            std_data = temp_data * 0 + 1  # Placeholder std data
+        else:  # Likely std data in Kelvin
+            mean_data = temp_data * 0 + 20  # Placeholder mean data
+            std_data = temp_data
+    else:
+        print("❌ Cannot create combined plot - need both mean and std data")
+        return None
     temp_range = 2 * std_data
     lons = ds['longitude'].values
     lats = ds['latitude'].values
@@ -708,13 +722,14 @@ def main():
                         print(f"   Temperature range: {float(temp_data.min()):.1f}K to {float(temp_data.max()):.1f}K")
                         print(f"   ({float(temp_data.min()-273.15):.1f}°C to {float(temp_data.max()-273.15):.1f}°C)")
 
-                elif 't2m_mean' in ds.data_vars:
-                    mean_data = ds['t2m_mean']
-                    print(f"   Temperature range: {float(mean_data.min()):.1f}K to {float(mean_data.max()):.1f}K")
-                    print(f"   ({float(mean_data.min()-273.15):.1f}°C to {float(mean_data.max()-273.15):.1f}°C)")
-                elif 't2m_std' in ds.data_vars:
-                    std_data = ds['t2m_std']
-                    print(f"   Std dev range: {float(std_data.min()):.2f}K to {float(std_data.max()):.2f}K")
+                elif 't2m' in ds.data_vars and 'member' not in ds.dims:
+                    # Pre-computed mean or std data
+                    temp_data = ds['t2m']
+                    if temp_data.max() > 50:  # Likely temperature in Kelvin (mean data)
+                        print(f"   Temperature range (mean): {float(temp_data.min()):.1f}K to {float(temp_data.max()):.1f}K")
+                        print(f"   ({float(temp_data.min()-273.15):.1f}°C to {float(temp_data.max()-273.15):.1f}°C)")
+                    else:  # Likely std data
+                        print(f"   Std dev range: {float(temp_data.min()):.2f}K to {float(temp_data.max()):.2f}K")
 
             except Exception as e:
                 print(f"❌ Error loading {file_path}: {e}")
