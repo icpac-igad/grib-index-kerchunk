@@ -1,0 +1,79 @@
+name: geospatial-data-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Core Python
+  - python==3.11
+  
+  # AWS SDK
+ 
+  # Geospatial data processing
+  - cartopy>=0.24.1
+  
+  # Cloud Dask clusters
+  - coiled>=1.33.0
+ 
+  - cfgrib==0.9.15.0 
+  # Parallel computing
+  - dask>=2025.5.1
+  - distributed>=2025.5.1
+  
+  # Environment variables
+  - python-dotenv>=1.0.1
+  
+  # Filesystem interfaces
+  - fsspec>=2025.5.1
+  - gcsfs>=2025.5.1
+  
+  # Geographic data
+  - geopandas>=1.1.1
+  
+  # Google Cloud
+  - google-auth>=2.35.0
+  - google-cloud-storage>=2.20.0
+  - google-auth-oauthlib>=1.2.1
+  
+  # Chunked archival formats
+  - kerchunk==0.2.7
+  
+  # Plotting
+  - matplotlib>=3.10.0
+  
+  # Data analysis
+  - pandas>=2.2.3
+  
+  # Apache Arrow
+  - pyarrow>=20.0.0
+  
+  # Scientific computing
+  - scipy>=1.14.1
+  - s3fs==2025.5.1
+
+  # Fast JSON
+  - ujson>=5.10.0
+  
+  # N-dimensional arrays
+  - xarray>=2025.6.1
+  
+  # Chunked arrays
+  - zarr==2.18.7  
+  # Additional useful packages
+  - netcdf4>=1.7.2
+  - h5netcdf>=1.4.0
+  - cftime>=1.6.4
+  - rioxarray>=0.18.1
+  - bottleneck>=1.4.2
+  - numbagg>=0.8.1
+  - dask-geopandas>=0.4.1
+  
+  # Development and Jupyter
+  - jupyter>=1.1.1
+  - jupyterlab>=4.3.0
+  - ipywidgets>=8.1.5
+  
+  # Optional: pip packages not available in conda
+  - pip
+  - pip:
+    - coiled>=1.33.0  # if not available in conda-forge
+    - kerchunk>=0.2.7  # if not available in conda-forge
