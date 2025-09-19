@@ -241,6 +241,8 @@ def extract_member_refs(all_refs: Dict, target_member: int) -> Dict:
     """
     Extract references for a specific ensemble member from the complete ensemble tree.
 
+    Fixed version that properly handles hierarchical zarr structure and chunk references.
+
     Parameters:
     - all_refs: Complete ensemble references dictionary
     - target_member: Ensemble member number (-1 for control, 1-50 for perturbed)
@@ -254,112 +256,141 @@ def extract_member_refs(all_refs: Dict, target_member: int) -> Dict:
     # Control member (-1) maps to index 0, perturbed members (1-50) map to indices 1-50
     member_index = 0 if target_member == -1 else target_member
 
-    for key, value in all_refs.items():
-        if key.endswith('/.zgroup'):
-            # Copy group definitions as-is
-            member_refs[key] = value
+    # First, identify all variables that have ensemble dimension
+    variables_with_ensemble = set()
+    hierarchical_paths = set()
 
-        elif key.endswith('/.zattrs'):
-            # Process attributes, removing number dimension where needed
-            attrs = json.loads(value) if isinstance(value, str) else value
+    for key in all_refs:
+        if '/.zattrs' in key:
+            # Get the variable path (everything before /.zattrs)
+            var_path = key.replace('/.zattrs', '')
+            attrs = json.loads(all_refs[key]) if isinstance(all_refs[key], str) else all_refs[key]
 
-            # Check if this is a variable with number dimension
+            # Check if this has number dimension
             if '_ARRAY_DIMENSIONS' in attrs and 'number' in attrs['_ARRAY_DIMENSIONS']:
-                # Remove number from dimensions for individual member
-                new_dims = [d for d in attrs['_ARRAY_DIMENSIONS'] if d != 'number']
-                attrs['_ARRAY_DIMENSIONS'] = new_dims
+                variables_with_ensemble.add(var_path)
+                # Track hierarchical structure
+                parts = var_path.split('/')
+                for i in range(1, len(parts) + 1):
+                    hierarchical_paths.add('/'.join(parts[:i]))
 
-            member_refs[key] = json.dumps(attrs) if not isinstance(value, str) else json.dumps(attrs)
-
-        elif key.endswith('/.zarray'):
-            # Process array metadata, adjusting for ensemble member extraction
-            zarray = json.loads(value) if isinstance(value, str) else value
-
-            # Check if this array has the number dimension
-            # The number dimension is typically the 3rd dimension (index 2) in ECMWF data
-            # Structure is often: [time, step, number, latitude, longitude]
-            if 'shape' in zarray and len(zarray['shape']) >= 3:
-                # Check if this looks like it has ensemble dimension
-                # (51 members = control + 50 perturbed)
-                has_ensemble = any(dim == 51 for dim in zarray['shape'])
-
-                if has_ensemble:
-                    # Find which dimension is the ensemble dimension
-                    ensemble_dim_idx = None
-                    for idx, dim in enumerate(zarray['shape']):
-                        if dim == 51:
-                            ensemble_dim_idx = idx
-                            break
-
-                    if ensemble_dim_idx is not None:
-                        # Remove the ensemble dimension from shape
-                        new_shape = list(zarray['shape'])
-                        del new_shape[ensemble_dim_idx]
-                        zarray['shape'] = new_shape
-
-                        # Adjust chunks if present
-                        if 'chunks' in zarray:
-                            new_chunks = list(zarray['chunks'])
-                            del new_chunks[ensemble_dim_idx]
-                            zarray['chunks'] = new_chunks
-
-            member_refs[key] = json.dumps(zarray) if not isinstance(value, str) else json.dumps(zarray)
-
-        elif key == 'number/.zarray':
-            # Skip the number coordinate array for individual members
+    # Process all references
+    for key, value in all_refs.items():
+        # Skip pure number coordinate references
+        if key.startswith('number/') and not key.endswith('/.zattrs') and not key.endswith('/.zarray'):
             continue
 
-        elif key == 'number/0':
-            # Skip the number coordinate data for individual members
-            continue
+        # Determine the variable this key belongs to
+        if '/' in key:
+            # Find the variable path by removing the last component
+            key_parts = key.split('/')
 
-        else:
-            # Process data chunks
-            # Data chunks for variables with ensemble dimension need special handling
-            if isinstance(value, (list, tuple)) and len(value) == 3:
-                # This is a chunk reference [url, offset, size]
-                # Check if this chunk belongs to our target member
+            # Check if this is a chunk reference (contains dots in last part)
+            is_chunk = '.' in key_parts[-1] and not key_parts[-1].startswith('.')
 
-                # Parse the key to determine which chunk this is
-                # Format is typically: variable_name/chunk_indices
-                parts = key.split('/')
-                if len(parts) == 2 and '.' in parts[1]:
+            if is_chunk:
+                # This is a data chunk
+                var_path = '/'.join(key_parts[:-1])
+                chunk_indices = key_parts[-1]
+
+                # Check if this variable has ensemble dimension
+                if var_path in variables_with_ensemble:
                     # Parse chunk indices
-                    indices = parts[1].split('.')
+                    indices = chunk_indices.split('.')
 
-                    # If we have a 5D variable (time, step, number, lat, lon)
-                    # the 3rd index (index 2) would be the ensemble member
-                    if len(indices) >= 3:
+                    # The ensemble dimension is typically the 3rd one (index 2)
+                    # Structure: time.step.number.lat.lon or similar
+                    if len(indices) > 2:
                         try:
-                            ensemble_chunk_idx = int(indices[2])
-                            # Only include this chunk if it matches our target member
-                            if ensemble_chunk_idx == member_index:
-                                # Adjust the key to remove the ensemble dimension
-                                new_indices = indices[:2] + indices[3:]  # Skip the ensemble index
-                                new_key = f"{parts[0]}/{'.'.join(new_indices)}"
+                            chunk_member_idx = int(indices[2])
+
+                            # Only include if it matches our target member
+                            if chunk_member_idx == member_index:
+                                # Create new key without ensemble index
+                                new_indices = indices[:2] + indices[3:]
+                                new_key = f"{var_path}/{'.'.join(new_indices)}"
                                 member_refs[new_key] = value
                         except (ValueError, IndexError):
-                            # If parsing fails, check variable name for coordinate vars
-                            if parts[0] not in ['number', 'valid_time']:
-                                member_refs[key] = value
-                    else:
-                        # No ensemble dimension in this chunk
-                        if parts[0] != 'number':
-                            member_refs[key] = value
+                            # Can't parse member index, skip this chunk
+                            pass
                 else:
-                    # Not a chunk reference or special format, copy if not number-related
-                    if 'number' not in key:
-                        member_refs[key] = value
-            else:
-                # Other types of values, copy if not number-related
-                if 'number' not in key:
+                    # Variable doesn't have ensemble dimension, copy as-is
                     member_refs[key] = value
 
-    # Update root attributes to indicate this is a single member
+            elif key.endswith('/.zattrs'):
+                # Handle attributes
+                var_path = key.replace('/.zattrs', '')
+                attrs = json.loads(value) if isinstance(value, str) else value
+
+                # Remove number dimension if present
+                if var_path in variables_with_ensemble:
+                    if '_ARRAY_DIMENSIONS' in attrs:
+                        attrs['_ARRAY_DIMENSIONS'] = [d for d in attrs['_ARRAY_DIMENSIONS'] if d != 'number']
+
+                # Skip number coordinate attributes
+                if var_path == 'number':
+                    continue
+
+                member_refs[key] = json.dumps(attrs)
+
+            elif key.endswith('/.zarray'):
+                # Handle array metadata
+                var_path = key.replace('/.zarray', '')
+
+                # Skip number coordinate array
+                if var_path == 'number':
+                    continue
+
+                zarray = json.loads(value) if isinstance(value, str) else value
+
+                # Modify shape and chunks if this variable has ensemble dimension
+                if var_path in variables_with_ensemble:
+                    if 'shape' in zarray:
+                        # Find and remove dimension with size 51
+                        new_shape = []
+                        ensemble_dim_idx = None
+
+                        for idx, dim in enumerate(zarray['shape']):
+                            if dim == 51:
+                                ensemble_dim_idx = idx
+                            else:
+                                new_shape.append(dim)
+
+                        zarray['shape'] = new_shape
+
+                        # Update chunks if present
+                        if ensemble_dim_idx is not None and 'chunks' in zarray:
+                            new_chunks = []
+                            for idx, chunk in enumerate(zarray['chunks']):
+                                if idx != ensemble_dim_idx:
+                                    new_chunks.append(chunk)
+                            zarray['chunks'] = new_chunks
+
+                member_refs[key] = json.dumps(zarray)
+
+            elif key.endswith('/.zgroup'):
+                # Copy group definitions
+                # Skip if it's the number group
+                var_path = key.replace('/.zgroup', '')
+                if var_path != 'number':
+                    member_refs[key] = value
+            else:
+                # Other metadata or coordinate values
+                # Skip if it's number-related
+                if not key.startswith('number'):
+                    member_refs[key] = value
+        else:
+            # Root level keys
+            member_refs[key] = value
+
+    # Add extraction metadata
     if '.zattrs' in member_refs:
         root_attrs = json.loads(member_refs['.zattrs'])
         root_attrs['extracted_ensemble_member'] = target_member
+        root_attrs['extraction_method'] = 'fixed_hierarchical'
         member_refs['.zattrs'] = json.dumps(root_attrs)
+
+    log_message(f"Extracted {len(member_refs)} references for member {target_member} (from {len(all_refs)} total)")
 
     return member_refs
 
