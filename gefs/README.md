@@ -12,7 +12,7 @@ This pipeline uses a **two-step process** that separates expensive one-time prep
 
 #### **Step 0: One-Time Expensive Preprocessing** (ONLY ONCE PER ENSEMBLE MEMBER)
 ```bash
-# Run ONCE to create reusable parquet mapping templates in GCS
+# Step 1: Run ONCE to create reusable parquet mapping templates in GCS
 python run_gefs_preprocessing.py  # Wrapper script for all members
 # OR for individual member:
 python gefs_index_preprocessing_fixed.py --date 20241112 --run 00 --member gep01 --bucket gik-gefs-aws-tf
@@ -27,7 +27,7 @@ python gefs_index_preprocessing_fixed.py --date 20241112 --run 00 --member gep01
 #### **Daily Processing Workflow** (RUN FOR EACH NEW FORECAST)
 
 ```bash
-# Step 1: Fast parquet creation using existing GCS mappings
+# Step 2: Fast parquet creation using existing GCS mappings
 python run_day_gefs_ensemble_full.py  # Uses mappings from Step 0
 
 # Step 3: Convert all 30 ensemble members to zarr
@@ -40,7 +40,7 @@ done
 # Step 4: Concatenate ensemble and compute statistics
 python process_ensemble_by_variable.py zarr_stores/20250922_00/
 
-# Step 4: Create plots (optional)
+# Step 5: Create plots (optional)
 python run_gefs_24h_accumulation.py
 python plot_ensemble_east_africa.py 
 ```
