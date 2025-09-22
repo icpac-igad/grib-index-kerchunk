@@ -30,14 +30,14 @@ python gefs_index_preprocessing_fixed.py --date 20241112 --run 00 --member gep01
 # Step 1: Fast parquet creation using existing GCS mappings
 python run_day_gefs_ensemble_full.py  # Uses mappings from Step 0
 
-# Step 2: Convert all 30 ensemble members to zarr
+# Step 3: Convert all 30 ensemble members to zarr
 for i in $(seq -f "%02g" 1 30); do
-    python run_single_gefs_to_zarr_v2.py 20250709 00 gep$i \
+    python run_single_gefs_to_zarr.py 20250709 00 gep$i \
         --region east_africa \
         --variables t2m,tp,u10,v10,cape,sp,mslet,pwat
 done
 
-# Step 3: Concatenate ensemble and compute statistics
+# Step 4: Concatenate ensemble and compute statistics
 python process_ensemble_by_variable.py zarr_stores/20250709_00/
 
 # Step 4: Create plots (optional)

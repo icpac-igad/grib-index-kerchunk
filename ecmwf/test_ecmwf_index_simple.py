@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Simple test routine to download and analyze ECMWF index files
-before doing expensive GRIB processing. This helps debug ensemble
-member extraction and NaN value issues.
+ECMWF Index-Based Processing for Steps 2-3
+Implements index file parsing and mapped index creation for ECMWF ensemble processing.
+Based on the GEFS cs_create_mapped_index pattern but adapted for ECMWF structure.
 """
 
 import fsspec
@@ -10,8 +10,24 @@ import pandas as pd
 import numpy as np
 import json
 import os
-from typing import Dict, Optional, Tuple
+import re
+import gcsfs
+from typing import Dict, Optional, Tuple, List
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+# Import required kerchunk functions
+try:
+    from kerchunk._grib_idx import (
+        build_idx_grib_mapping,
+        strip_datavar_chunks,
+        store_coord_var,
+        store_data_var
+    )
+    from kerchunk.grib2 import grib_tree, scan_grib
+except ImportError:
+    print("Warning: kerchunk not available, some functions will be limited")
 
 
 def download_index_file(s3_url: str, local_path: str = None) -> str:
@@ -293,6 +309,306 @@ def validate_target_members(df: pd.DataFrame, target_members: list = None) -> Di
     return results
 
 
+# ================== Step 2: Time Dimension Functions ==================
+
+def generate_axes(date_str: str) -> List[pd.Index]:
+    """
+    Generate temporal axes for ECMWF forecast (15-day period).
+
+    Parameters:
+    - date_str: Start date formatted as 'YYYYMMDD'
+
+    Returns:
+    - List containing valid_time and time indices
+    """
+    start_date = pd.Timestamp(date_str)
+
+    # ECMWF forecast structure
+    hours_3h = np.arange(0, 93, 3)      # 0-90h at 3h intervals
+    hours_6h = np.arange(96, 150, 6)    # 96-144h at 6h intervals
+    hours_12h = np.arange(156, 372, 12) # 156-360h at 12h intervals
+
+    forecast_hours = np.concatenate([hours_3h, hours_6h, hours_12h])
+    valid_times = start_date + pd.to_timedelta(forecast_hours, unit='h')
+
+    valid_time_index = pd.Index(valid_times, name="valid_time")
+    time_index = pd.Index([start_date], name="time")
+
+    return [valid_time_index, time_index]
+
+
+def create_ecmwf_time_dimensions(date_str: str, run: str = "00"):
+    """
+    Create time dimensions for ECMWF ensemble forecast.
+
+    Returns:
+    - time_dims: Dictionary of dimensions
+    - time_coords: Dictionary of coordinate arrays
+    - times, valid_times, steps: numpy arrays
+    """
+    reference_time = pd.Timestamp(f"{date_str} {run}:00:00")
+
+    # ECMWF forecast hour structure
+    hours_3h = np.arange(0, 93, 3)
+    hours_6h = np.arange(96, 150, 6)
+    hours_12h = np.arange(156, 372, 12)
+
+    forecast_hours = np.concatenate([hours_3h, hours_6h, hours_12h])
+    valid_times = reference_time + pd.to_timedelta(forecast_hours, unit='h')
+
+    times = np.array([reference_time] * len(forecast_hours))
+    steps = pd.to_timedelta(forecast_hours, unit='h')
+
+    time_dims = {
+        'time': len(times),
+        'step': len(steps),
+        'valid_time': len(valid_times)
+    }
+
+    time_coords = {
+        'time': ('time',),
+        'step': ('step',),
+        'valid_time': ('valid_time',),
+        'datavar': ('time', 'latitude', 'longitude')
+    }
+
+    return time_dims, time_coords, times, valid_times, steps
+
+
+# ================== Step 3: Mapped Index Creation ==================
+
+def parse_ecmwf_index_for_mapping(index_url: str) -> Dict[int, int]:
+    """
+    Parse ECMWF index file and create index-to-ensemble-member mapping.
+
+    Parameters:
+    - index_url: URL to ECMWF .index file
+
+    Returns:
+    - Dictionary mapping index to ensemble member number
+    """
+    fs = fsspec.filesystem("s3", anon=True)
+    idx_to_member = {}
+
+    with fs.open(index_url, 'r') as f:
+        for idx, line in enumerate(f):
+            try:
+                clean_line = line.strip().rstrip(',')
+                data = json.loads(clean_line)
+
+                # Extract ensemble number with NaN handling
+                ens_number = data.get('number', None)
+
+                # Handle NaN: default to control member (-1)
+                if ens_number is None or pd.isna(ens_number):
+                    ens_number = -1
+                else:
+                    ens_number = int(float(ens_number))
+
+                idx_to_member[idx] = ens_number
+
+            except Exception as e:
+                # Default to control for parse errors
+                idx_to_member[idx] = -1
+
+    return idx_to_member
+
+
+def cs_create_mapped_index_ecmwf(
+    axes: List[pd.Index],
+    gcs_bucket_name: str,
+    date_str: str,
+    member_number: int,
+    gcp_service_account_json: str,
+    reference_date_str: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Create mapped index for ECMWF ensemble member using index files.
+    Adapted from GEFS cs_create_mapped_index pattern.
+
+    Parameters:
+    - axes: Time axes from generate_axes()
+    - gcs_bucket_name: GCS bucket containing scan_grib parquet files
+    - date_str: Date string (YYYYMMDD)
+    - member_number: Ensemble member (-1 for control, 1-50 for perturbed)
+    - gcp_service_account_json: Path to GCS credentials
+    - reference_date_str: Optional reference date for template mappings
+
+    Returns:
+    - DataFrame with mapped index for the ensemble member
+    """
+    print(f"Creating mapped index for ECMWF member {member_number} on {date_str}")
+
+    # Setup GCS filesystem
+    fs = gcsfs.GCSFileSystem(token=gcp_service_account_json)
+
+    # Get list of forecast hour parquet files
+    parquet_prefix = f"fmrc/scan_grib{date_str}/"
+    parquet_files = fs.glob(f"{gcs_bucket_name}/{parquet_prefix}*.parquet")
+
+    print(f"Found {len(parquet_files)} parquet files")
+
+    mapped_indices = []
+
+    for pfile in sorted(parquet_files):
+        # Extract forecast hour from filename
+        hour_match = re.search(r'_(\d+)h\.parquet', pfile)
+        if not hour_match:
+            continue
+        forecast_hour = int(hour_match.group(1))
+
+        print(f"Processing forecast hour {forecast_hour}h")
+
+        # Load parquet file
+        df = pd.read_parquet(f"gs://{pfile}", filesystem=fs)
+
+        # Get GRIB URL from first row
+        if 'uri' in df.columns:
+            grib_url = df['uri'].iloc[0]
+        else:
+            # Construct GRIB URL from metadata
+            grib_url = f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-{forecast_hour}h-enfo-ef.grib2"
+
+        # Parse index file for ensemble mapping
+        index_url = grib_url.replace('.grib2', '.index')
+        idx_to_member = parse_ecmwf_index_for_mapping(index_url)
+
+        # Filter groups for target ensemble member
+        member_groups = []
+
+        for _, row in df.iterrows():
+            groups = json.loads(row['groups']) if isinstance(row['groups'], str) else row['groups']
+
+            for group in groups:
+                # Get index from group metadata
+                group_idx = group.get('idx', 0)
+                group_member = idx_to_member.get(group_idx, -1)
+
+                # Keep only groups for target member
+                if group_member == member_number:
+                    # Add metadata
+                    group['forecast_hour'] = forecast_hour
+                    group['ensemble_member'] = member_number
+                    member_groups.append(group)
+
+        if member_groups:
+            print(f"  Found {len(member_groups)} groups for member {member_number}")
+
+            # Create mapping entry
+            mapping_entry = {
+                'forecast_hour': forecast_hour,
+                'grib_url': grib_url,
+                'index_url': index_url,
+                'member_groups': member_groups,
+                'group_count': len(member_groups)
+            }
+            mapped_indices.append(mapping_entry)
+
+    # Convert to DataFrame
+    if mapped_indices:
+        mapped_df = pd.DataFrame(mapped_indices)
+        print(f"Created mapped index with {len(mapped_df)} forecast hours")
+        return mapped_df
+    else:
+        print(f"Warning: No data found for member {member_number}")
+        return pd.DataFrame()
+
+
+def process_ecmwf_member_to_zarr(
+    date_str: str,
+    member_number: int,
+    gcs_bucket: str,
+    credentials_path: str,
+    output_path: str
+) -> str:
+    """
+    Process ECMWF member to create zarr store parquet file.
+
+    Parameters:
+    - date_str: Date string (YYYYMMDD)
+    - member_number: Ensemble member (-1 for control, 1-50)
+    - gcs_bucket: GCS bucket name
+    - credentials_path: GCS credentials JSON path
+    - output_path: Output directory for parquet files
+
+    Returns:
+    - Path to created parquet file
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing ECMWF Member {member_number} for {date_str}")
+    print(f"{'='*60}")
+
+    start_time = time.time()
+
+    # Step 2: Generate axes and time dimensions
+    print("\n📅 Step 2: Creating time dimensions...")
+    axes = generate_axes(date_str)
+    time_dims, time_coords, times, valid_times, steps = create_ecmwf_time_dimensions(date_str)
+    print(f"  ✅ Time dimensions created: {len(times)} timesteps")
+
+    # Step 3: Create index-based mapped index
+    print("\n🗺️ Step 3: Creating mapped index...")
+    mapped_index = cs_create_mapped_index_ecmwf(
+        axes,
+        gcs_bucket,
+        date_str,
+        member_number,
+        credentials_path
+    )
+
+    if mapped_index.empty:
+        raise ValueError(f"No data found for member {member_number}")
+
+    print(f"  ✅ Mapped index created with {len(mapped_index)} forecast hours")
+
+    # Build zarr store structure
+    print("\n🔨 Building zarr store...")
+    zstore = {}
+
+    # Add basic metadata
+    zstore['.zattrs'] = json.dumps({
+        'date': date_str,
+        'ensemble_member': member_number,
+        'forecast_hours': len(mapped_index),
+        'created': pd.Timestamp.now().isoformat()
+    })
+
+    # Process each forecast hour
+    for _, row in mapped_index.iterrows():
+        forecast_hour = row['forecast_hour']
+        groups = row['member_groups']
+
+        # Add groups to store
+        for group in groups:
+            # Create zarr key from group metadata
+            varname = group.get('varname', 'unknown')
+            level = group.get('level', 'surface')
+
+            key = f"{varname}/{level}/{forecast_hour}"
+            zstore[key] = json.dumps(group)
+
+    # Save as parquet file
+    member_name = "control" if member_number == -1 else f"ens{member_number:02d}"
+    output_file = f"{output_path}/ecmwf_{date_str}_{member_name}.par"
+
+    # Create output directory if needed
+    os.makedirs(output_path, exist_ok=True)
+
+    # Save zarr store as parquet
+    print("\n💾 Saving parquet file...")
+    store_df = pd.DataFrame([
+        {'key': k, 'value': v.encode('utf-8') if isinstance(v, str) else v}
+        for k, v in zstore.items()
+    ])
+    store_df.to_parquet(output_file)
+
+    elapsed = time.time() - start_time
+    print(f"\n✅ Created: {output_file}")
+    print(f"⏱️ Processing time: {elapsed:.1f} seconds")
+
+    return output_file
+
+
 def save_analysis_results(df: pd.DataFrame, output_dir: str = "./index_analysis"):
     """
     Save analysis results to files for inspection.
@@ -328,13 +644,92 @@ def save_analysis_results(df: pd.DataFrame, output_dir: str = "./index_analysis"
     print(f"✅ Analysis results saved to {output_path}")
 
 
+def test_step2_step3_processing():
+    """
+    Test Step 2 and Step 3 processing for ECMWF ensemble.
+    """
+    print("="*80)
+    print("ECMWF Step 2 & Step 3 Processing Test")
+    print("="*80)
+
+    # Configuration
+    date_str = "20240529"
+    gcs_bucket = "gik-ecmwf-aws-tf"
+    credentials_path = "coiled-data.json"
+    target_members = [-1, 1, 2]  # Test with control + 2 members
+    output_dir = f"./ecmwf_{date_str}_test"
+
+    print(f"📅 Date: {date_str}")
+    print(f"🪣 GCS Bucket: {gcs_bucket}")
+    print(f"👥 Target members: {target_members}")
+    print(f"📁 Output directory: {output_dir}")
+
+    successful = []
+    failed = []
+
+    # Process each member
+    for member in target_members:
+        try:
+            print(f"\n{'='*60}")
+            output_file = process_ecmwf_member_to_zarr(
+                date_str,
+                member,
+                gcs_bucket,
+                credentials_path,
+                output_dir
+            )
+            successful.append(member)
+            print(f"✅ Success: Member {member}")
+        except Exception as e:
+            failed.append(member)
+            print(f"❌ Failed: Member {member}: {e}")
+
+    # Summary
+    print(f"\n{'='*80}")
+    print("PROCESSING SUMMARY")
+    print("="*80)
+    print(f"✅ Successful: {len(successful)}/{len(target_members)}")
+    if successful:
+        print(f"   Members: {successful}")
+
+    if failed:
+        print(f"❌ Failed: {len(failed)}")
+        print(f"   Members: {failed}")
+
+    # List output files
+    if os.path.exists(output_dir):
+        files = sorted(Path(output_dir).glob("*.par"))
+        print(f"\n📁 Output files:")
+        for f in files:
+            size = os.path.getsize(f) / 1024  # KB
+            print(f"   {f.name}: {size:.1f} KB")
+
+    return len(successful) == len(target_members)
+
+
 def main():
     """
-    Main test routine for ECMWF index file analysis.
+    Main routine with options for different test modes.
     """
     print("="*80)
-    print("ECMWF Index File Test & Analysis")
+    print("ECMWF Index-Based Processing Test Suite")
     print("="*80)
+
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--step2-3":
+        # Test Step 2 and Step 3 processing
+        success = test_step2_step3_processing()
+        if success:
+            print("\n🎉 Step 2-3 processing test completed successfully!")
+            exit(0)
+        else:
+            print("\n❌ Step 2-3 processing test failed.")
+            exit(1)
+
+    # Default: Original index analysis
+    print("\nRunning index file analysis...")
+    print("(Use --step2-3 flag to test Step 2 and Step 3 processing)\n")
 
     # Test configuration
     ecmwf_url = "s3://ecmwf-forecasts/20250628/18z/ifs/0p25/enfo/20250628180000-0h-enfo-ef.grib2"

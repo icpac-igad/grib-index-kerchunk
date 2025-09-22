@@ -844,172 +844,172 @@ def save_datatree_structure(dt, output_file: str):
     print(f"DataTree structure saved to {output_file}")
 
 
-# ===== Final execution starts here =====
+# # ===== Final execution starts here =====
 
-script_start = log_checkpoint("Starting ECMWF ensemble processing script")
+# script_start = log_checkpoint("Starting ECMWF ensemble processing script")
 
-date_str = '20250628'
-run='18'
-ecmwf_files = [
-    f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-0h-enfo-ef.grib2",
-    f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-3h-enfo-ef.grib2"
-]
+# date_str = '20250628'
+# run='18'
+# ecmwf_files = [
+#     f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-0h-enfo-ef.grib2",
+#     f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-3h-enfo-ef.grib2"
+# ]
 
-log_checkpoint(
-    f"Processing {len(ecmwf_files)} ECMWF files for date {date_str}")
+# log_checkpoint(
+#     f"Processing {len(ecmwf_files)} ECMWF files for date {date_str}")
 
-# Process files and collect groups
-file_processing_start = log_checkpoint("Starting file processing")
-all_groups = []
-for i, eurl in enumerate(ecmwf_files, 1):
-    try:
-        file_start = log_checkpoint(
-            f"Processing file {i}/{len(ecmwf_files)}: {eurl.split('/')[-1]}")
-        groups, idx_mapping = ecmwf_filter_scan_grib(eurl)
-        all_groups.extend(groups)
-        log_checkpoint(f"File {i} completed, found {len(groups)} groups",
-                       file_start)
-    except Exception as e:
-        print(f"Error processing {eurl}: {e}")
-        import traceback
-        traceback.print_exc()
+# # Process files and collect groups
+# file_processing_start = log_checkpoint("Starting file processing")
+# all_groups = []
+# for i, eurl in enumerate(ecmwf_files, 1):
+#     try:
+#         file_start = log_checkpoint(
+#             f"Processing file {i}/{len(ecmwf_files)}: {eurl.split('/')[-1]}")
+#         groups, idx_mapping = ecmwf_filter_scan_grib(eurl)
+#         all_groups.extend(groups)
+#         log_checkpoint(f"File {i} completed, found {len(groups)} groups",
+#                        file_start)
+#     except Exception as e:
+#         print(f"Error processing {eurl}: {e}")
+#         import traceback
+#         traceback.print_exc()
 
-log_checkpoint(f"File processing completed. Total groups: {len(all_groups)}",
-               file_processing_start)
+# log_checkpoint(f"File processing completed. Total groups: {len(all_groups)}",
+#                file_processing_start)
 
-if not all_groups:
-    raise ValueError("No valid groups were found")
+# if not all_groups:
+#     raise ValueError("No valid groups were found")
 
-# Skip the problematic grib_tree call for now - focus on fixed_ensemble_grib_tree
-log_checkpoint(
-    "Skipping standard grib_tree (credentials issue) - proceeding with fixed_ensemble_grib_tree"
-)
+# # Skip the problematic grib_tree call for now - focus on fixed_ensemble_grib_tree
+# log_checkpoint(
+#     "Skipping standard grib_tree (credentials issue) - proceeding with fixed_ensemble_grib_tree"
+# )
 
-# Create output directory for results
-#output_dir = f"ecmwf_test_results_{date_str}"
-output_dir = f"e_{date_str}_{run}"
-os.makedirs(output_dir, exist_ok=True)
-log_checkpoint(f"Created output directory: {output_dir}")
+# # Create output directory for results
+# #output_dir = f"ecmwf_test_results_{date_str}"
+# output_dir = f"e_{date_str}_{run}"
+# os.makedirs(output_dir, exist_ok=True)
+# log_checkpoint(f"Created output directory: {output_dir}")
 
-# Build ensemble tree with proper remote options
-ensemble_start = log_checkpoint("Starting fixed_ensemble_grib_tree processing")
-remote_options = {"anon": True}  # Anonymous S3 access
-ensemble_tree = fixed_ensemble_grib_tree(all_groups,
-                                         remote_options=remote_options,
-                                         debug_output=True)
-log_checkpoint(
-    f"Ensemble tree built with {len(ensemble_tree['refs'])} references",
-    ensemble_start)
+# # Build ensemble tree with proper remote options
+# ensemble_start = log_checkpoint("Starting fixed_ensemble_grib_tree processing")
+# remote_options = {"anon": True}  # Anonymous S3 access
+# ensemble_tree = fixed_ensemble_grib_tree(all_groups,
+#                                          remote_options=remote_options,
+#                                          debug_output=True)
+# log_checkpoint(
+#     f"Ensemble tree built with {len(ensemble_tree['refs'])} references",
+#     ensemble_start)
 
-# Save the raw ensemble tree
-save_start = log_checkpoint("Saving raw ensemble tree to JSON")
-with open(f"{output_dir}/ensemble_tree_raw.json", 'w') as f:
-    # Convert to serializable format
-    serializable_tree = copy.deepcopy(ensemble_tree)
-    json.dump(serializable_tree, f, indent=2)
-log_checkpoint(
-    f"Saved raw ensemble tree to {output_dir}/ensemble_tree_raw.json",
-    save_start)
+# # Save the raw ensemble tree
+# save_start = log_checkpoint("Saving raw ensemble tree to JSON")
+# with open(f"{output_dir}/ensemble_tree_raw.json", 'w') as f:
+#     # Convert to serializable format
+#     serializable_tree = copy.deepcopy(ensemble_tree)
+#     json.dump(serializable_tree, f, indent=2)
+# log_checkpoint(
+#     f"Saved raw ensemble tree to {output_dir}/ensemble_tree_raw.json",
+#     save_start)
 
-# Create deflated store for parquet (following ECMWF pattern)
-deflate_start = log_checkpoint("Creating deflated store for parquet")
-deflated_ecmwf_grib_tree_store = copy.deepcopy(ensemble_tree)
-strip_datavar_chunks(deflated_ecmwf_grib_tree_store)
-log_checkpoint("Deflated store created", deflate_start)
+# # Create deflated store for parquet (following ECMWF pattern)
+# deflate_start = log_checkpoint("Creating deflated store for parquet")
+# deflated_ecmwf_grib_tree_store = copy.deepcopy(ensemble_tree)
+# strip_datavar_chunks(deflated_ecmwf_grib_tree_store)
+# log_checkpoint("Deflated store created", deflate_start)
 
-# Save deflated store as parquet
-parquet_start = log_checkpoint("Saving deflated store as parquet file")
-parquet_file = f"{output_dir}/ecmwf_{date_str}_00z_ensemble.parquet"
-create_parquet_file(deflated_ecmwf_grib_tree_store['refs'], parquet_file)
-log_checkpoint(f"Parquet file saved: {parquet_file}", parquet_start)
+# # Save deflated store as parquet
+# parquet_start = log_checkpoint("Saving deflated store as parquet file")
+# parquet_file = f"{output_dir}/ecmwf_{date_str}_00z_ensemble.parquet"
+# create_parquet_file(deflated_ecmwf_grib_tree_store['refs'], parquet_file)
+# log_checkpoint(f"Parquet file saved: {parquet_file}", parquet_start)
 
-# Check the references directly
-print(f"\nTotal refs in ensemble tree: {len(ensemble_tree['refs'])}")
-print(
-    f"Total refs in deflated store: {len(deflated_ecmwf_grib_tree_store['refs'])}"
-)
+# # Check the references directly
+# print(f"\nTotal refs in ensemble tree: {len(ensemble_tree['refs'])}")
+# print(
+#     f"Total refs in deflated store: {len(deflated_ecmwf_grib_tree_store['refs'])}"
+# )
 
-# Look at structure - should have proper hierarchy
-print("\nSample keys from ensemble tree:")
-print([key for key in ensemble_tree['refs'].keys()
-       if key.count('/') <= 1][:10])
+# # Look at structure - should have proper hierarchy
+# print("\nSample keys from ensemble tree:")
+# print([key for key in ensemble_tree['refs'].keys()
+#        if key.count('/') <= 1][:10])
 
-# Open with datatree
-datatree_start = log_checkpoint("Opening with xarray datatree")
-try:
-    egfs_dt = xr.open_datatree(fsspec.filesystem(
-        "reference", fo=ensemble_tree).get_mapper(""),
-                               engine="zarr",
-                               consolidated=False)
+# # Open with datatree
+# datatree_start = log_checkpoint("Opening with xarray datatree")
+# try:
+#     egfs_dt = xr.open_datatree(fsspec.filesystem(
+#         "reference", fo=ensemble_tree).get_mapper(""),
+#                                engine="zarr",
+#                                consolidated=False)
 
-    log_checkpoint("DataTree opened successfully", datatree_start)
+#     log_checkpoint("DataTree opened successfully", datatree_start)
 
-    # Save datatree structure
-    structure_start = log_checkpoint("Saving DataTree structure analysis")
-    save_datatree_structure(egfs_dt, f"{output_dir}/datatree_structure.json")
-    log_checkpoint("DataTree structure saved", structure_start)
+#     # Save datatree structure
+#     structure_start = log_checkpoint("Saving DataTree structure analysis")
+#     save_datatree_structure(egfs_dt, f"{output_dir}/datatree_structure.json")
+#     log_checkpoint("DataTree structure saved", structure_start)
 
-    # Check for variables
-    print(f"\nDataTree keys: {list(egfs_dt.keys())}")
+#     # Check for variables
+#     print(f"\nDataTree keys: {list(egfs_dt.keys())}")
 
-    # Try accessing a variable
-    if 't2m' in egfs_dt.keys():
-        var_start = log_checkpoint("Analyzing t2m variable")
-        var_node = egfs_dt['t2m']
-        print(f"\nt2m dimensions: {var_node.dims}")
+#     # Try accessing a variable
+#     if 't2m' in egfs_dt.keys():
+#         var_start = log_checkpoint("Analyzing t2m variable")
+#         var_node = egfs_dt['t2m']
+#         print(f"\nt2m dimensions: {var_node.dims}")
 
-        # Save sample data info
-        var_info = {
-            "variable": "t2m",
-            "dims": dict(var_node.dims),
-            "coords": list(var_node.coords.keys()),
-            "attrs": dict(var_node.attrs)
-        }
-        with open(f"{output_dir}/sample_variable_info.json", 'w') as f:
-            json.dump(var_info, f, indent=2)
-        log_checkpoint("Variable analysis completed", var_start)
+#         # Save sample data info
+#         var_info = {
+#             "variable": "t2m",
+#             "dims": dict(var_node.dims),
+#             "coords": list(var_node.coords.keys()),
+#             "attrs": dict(var_node.attrs)
+#         }
+#         with open(f"{output_dir}/sample_variable_info.json", 'w') as f:
+#             json.dump(var_info, f, indent=2)
+#         log_checkpoint("Variable analysis completed", var_start)
 
-    # Save the egfs_dt object using pickle for later analysis
-    pickle_start = log_checkpoint("Saving DataTree object as pickle")
-    with open(f"{output_dir}/egfs_dt.pkl", 'wb') as f:
-        pickle.dump(egfs_dt, f)
-    log_checkpoint(f"DataTree object saved to {output_dir}/egfs_dt.pkl",
-                   pickle_start)
+#     # Save the egfs_dt object using pickle for later analysis
+#     pickle_start = log_checkpoint("Saving DataTree object as pickle")
+#     with open(f"{output_dir}/egfs_dt.pkl", 'wb') as f:
+#         pickle.dump(egfs_dt, f)
+#     log_checkpoint(f"DataTree object saved to {output_dir}/egfs_dt.pkl",
+#                    pickle_start)
 
-except Exception as e:
-    log_checkpoint(f"Error opening with datatree: {e}")
-    import traceback
-    traceback.print_exc()
+# except Exception as e:
+#     log_checkpoint(f"Error opening with datatree: {e}")
+#     import traceback
+#     traceback.print_exc()
 
-# Also save intermediate results for debugging
-summary_start = log_checkpoint("Creating processing summary")
-intermediate_results = {
-    "date_str":
-    date_str,
-    "ecmwf_files":
-    ecmwf_files,
-    "num_groups":
-    len(all_groups),
-    "ensemble_tree_keys_count":
-    len(ensemble_tree['refs']),
-    "deflated_store_keys_count":
-    len(deflated_ecmwf_grib_tree_store['refs']),
-    "sample_keys":
-    [key for key in ensemble_tree['refs'].keys() if key.count('/') <= 1][:20]
-}
+# # Also save intermediate results for debugging
+# summary_start = log_checkpoint("Creating processing summary")
+# intermediate_results = {
+#     "date_str":
+#     date_str,
+#     "ecmwf_files":
+#     ecmwf_files,
+#     "num_groups":
+#     len(all_groups),
+#     "ensemble_tree_keys_count":
+#     len(ensemble_tree['refs']),
+#     "deflated_store_keys_count":
+#     len(deflated_ecmwf_grib_tree_store['refs']),
+#     "sample_keys":
+#     [key for key in ensemble_tree['refs'].keys() if key.count('/') <= 1][:20]
+# }
 
-with open(f"{output_dir}/processing_summary.json", 'w') as f:
-    json.dump(intermediate_results, f, indent=2)
-log_checkpoint("Processing summary saved", summary_start)
+# with open(f"{output_dir}/processing_summary.json", 'w') as f:
+#     json.dump(intermediate_results, f, indent=2)
+# log_checkpoint("Processing summary saved", summary_start)
 
-# Final timing
-total_time = time.time() - script_start
-log_checkpoint(f"=== Processing complete === (Total time: {total_time:.2f}s)")
-print(f"All results saved to: {output_dir}/")
-print(f"\nKey files created:")
-print(f"  - {parquet_file} (main output for further processing)")
-print(f"  - {output_dir}/ensemble_tree_raw.json (raw tree structure)")
-print(f"  - {output_dir}/datatree_structure.json (DataTree structure)")
-print(f"  - {output_dir}/egfs_dt.pkl (pickled DataTree object)")
-print(f"  - {output_dir}/processing_summary.json (processing summary)")
-print(f"\nTotal processing time: {total_time:.2f} seconds")
+# # Final timing
+# total_time = time.time() - script_start
+# log_checkpoint(f"=== Processing complete === (Total time: {total_time:.2f}s)")
+# print(f"All results saved to: {output_dir}/")
+# print(f"\nKey files created:")
+# print(f"  - {parquet_file} (main output for further processing)")
+# print(f"  - {output_dir}/ensemble_tree_raw.json (raw tree structure)")
+# print(f"  - {output_dir}/datatree_structure.json (DataTree structure)")
+# print(f"  - {output_dir}/egfs_dt.pkl (pickled DataTree object)")
+# print(f"  - {output_dir}/processing_summary.json (processing summary)")
+# print(f"\nTotal processing time: {total_time:.2f} seconds")
