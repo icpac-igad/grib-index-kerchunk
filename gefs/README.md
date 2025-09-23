@@ -10,6 +10,10 @@ Complete pipeline for processing GEFS (Global Ensemble Forecast System) ensemble
 
 This pipeline uses a **two-step process** that separates expensive one-time preprocessing from fast daily processing:
 
+```bash
+coiled notebook start --name dask-thresholds --vm-type n2-standard-2 --software gik-zarr2 --workspace=gcp-sewaa-nka
+```
+
 #### **Step 0: One-Time Expensive Preprocessing** (ONLY ONCE PER ENSEMBLE MEMBER)
 ```bash
 # Step 1: Run ONCE to create reusable parquet mapping templates in GCS

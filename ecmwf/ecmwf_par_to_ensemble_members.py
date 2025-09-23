@@ -28,6 +28,10 @@ from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from kerchunk.grib2 import grib_tree
 from kerchunk._grib_idx import strip_datavar_chunks
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 warnings.filterwarnings('ignore')
 
@@ -59,12 +63,12 @@ class ECMWFParquetProcessor:
         """
         Parse parquet filename to extract metadata.
 
-        Example: fmrc_scan_grib20240529_e_sg_mdt_20240529_0h.parquet
+        Example: e_sg_mdt_20240529_0h.parquet
 
         Returns:
             Dict with date and forecast_hour, or None if parse fails
         """
-        pattern = r'fmrc_scan_grib(\d{8})_e_sg_mdt_\d{8}_(\d+)h\.parquet'
+        pattern = r'e_sg_mdt_(\d{8})_(\d+)h\.parquet'
         match = re.search(pattern, filename)
 
         if match:
@@ -486,25 +490,27 @@ def main():
     parser.add_argument(
         "--input-dir",
         type=str,
-        default="/home/roller/Documents/data/ecmwf_fmrc",
+        default=os.getenv("ECMWF_INPUT_DIR", "./downloaded_parquet"),
         help="Directory containing scan_grib parquet files"
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/home/roller/Documents/data/ecmwf_fmrc/ensemble_members",
+        default=os.getenv("ECMWF_OUTPUT_DIR", "./ensemble_members"),
         help="Base directory for output ensemble member files"
     )
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
+        default=int(os.getenv("ECMWF_MAX_WORKERS", "4")),
         help="Number of parallel workers"
     )
     parser.add_argument(
-        "--forecast-hour",
+        "--forecast-hours",
         type=int,
-        help="Process only specific forecast hour (e.g., 0, 3, 6)"
+        nargs='+',
+        default=None,
+        help="Process specific forecast hours (e.g., --forecast-hours 0 3 6 9)"
     )
 
     args = parser.parse_args()
@@ -512,19 +518,33 @@ def main():
     # Initialize processor
     processor = ECMWFParquetProcessor(args.input_dir, args.output_dir)
 
-    if args.forecast_hour is not None:
-        # Process single forecast hour
-        pattern = f"*_{args.forecast_hour}h.parquet"
-        files = list(Path(args.input_dir).glob(pattern))
+    if args.forecast_hours is not None:
+        # Process specific forecast hours
+        all_results = {}
+        total_failed = 0
 
-        if not files:
-            processor.log(f"No file found for {args.forecast_hour}h", "ERROR")
-            return 1
+        for forecast_hour in args.forecast_hours:
+            pattern = f"*_{forecast_hour}h.parquet"
+            files = list(Path(args.input_dir).glob(pattern))
 
-        result = processor.process_forecast_hour(files[0], args.max_workers)
+            if not files:
+                processor.log(f"No file found for {forecast_hour}h", "ERROR")
+                continue
 
-        if result['failed']:
-            processor.log(f"Some members failed for {args.forecast_hour}h", "WARNING")
+            try:
+                result = processor.process_forecast_hour(files[0], args.max_workers)
+                all_results[forecast_hour] = result
+
+                if result['failed']:
+                    processor.log(f"Some members failed for {forecast_hour}h", "WARNING")
+                    total_failed += len(result['failed'])
+
+            except Exception as e:
+                processor.log(f"Failed to process {forecast_hour}h: {e}", "ERROR")
+                total_failed += 51  # All members failed for this hour
+
+        if total_failed > 0:
+            processor.log(f"\n⚠️ {total_failed} members failed overall", "WARNING")
             return 1
     else:
         # Process all files
