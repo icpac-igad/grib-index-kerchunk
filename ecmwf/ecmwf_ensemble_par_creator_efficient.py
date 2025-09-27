@@ -132,7 +132,10 @@ def process_ecmwf_files_efficiently(
 
     # Step 4: Save comprehensive parquet file
     parquet_start = log_checkpoint("Saving comprehensive ensemble parquet file")
-    comprehensive_parquet = output_dir / f"ecmwf_{date_str}_{run}z_ensemble_all.parquet"
+    # Comprehensive file in 'comprehensive' subdirectory
+    comprehensive_dir = output_dir / "comprehensive"
+    comprehensive_dir.mkdir(exist_ok=True)
+    comprehensive_parquet = comprehensive_dir / f"ecmwf_{date_str}_{run}z_ensemble_all.parquet"
     create_parquet_file_fixed(deflated_ensemble_tree['refs'], str(comprehensive_parquet))
     log_checkpoint(f"Comprehensive parquet saved: {comprehensive_parquet}", parquet_start)
 
@@ -199,7 +202,10 @@ def extract_individual_member_parquets(
                 continue
 
             # Create member-specific parquet file
-            member_parquet = output_dir / f"{member_name}.par"
+            # Member-specific subdirectory
+            member_dir = output_dir / "members" / member_name
+            member_dir.mkdir(parents=True, exist_ok=True)
+            member_parquet = member_dir / f"{member_name}.parquet"
             create_parquet_file_fixed(member_refs, str(member_parquet))
 
             # Validate member file
