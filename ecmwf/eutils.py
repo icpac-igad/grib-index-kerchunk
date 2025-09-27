@@ -39,7 +39,7 @@ import zarr
 import gcsfs
 import pathlib
 import pandas as pd
-import datatree
+#import datatree
 
 from enum import Enum, auto
 from dynamic_zarr_store import (
