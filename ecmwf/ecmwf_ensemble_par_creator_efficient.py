@@ -189,7 +189,7 @@ def extract_individual_member_parquets(
     extraction_results = {}
 
     for member in target_members:
-        member_name = "control" if member == -1 else f"ens{member:02d}"
+        member_name = "control" if member == -1 else f"ens_{member:02d}"  # Changed to ens_01 format
 
         try:
             extract_start = log_checkpoint(f"Extracting {member_name}")
