@@ -288,7 +288,8 @@ def compute_statistics_for_variable(variable_name: str, variable_file: str,
     try:
         # Open the variable ensemble file with simple loading
         logger.info(f"   Loading NetCDF file: {os.path.basename(variable_file)}")
-        ds_original = xr.open_dataset(variable_file)
+        # Use decode_cf=False to avoid dtype attribute conflicts in coordinates
+        ds_original = xr.open_dataset(variable_file, decode_cf=False)
 
         # Extract only the main data variable and essential coordinates
         main_var = variable_name
