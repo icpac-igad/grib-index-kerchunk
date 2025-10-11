@@ -219,10 +219,10 @@ def check_stage0_templates(test_members):
         for member in test_members:
             # Map member name to GCS path format
             # Directory: ens_01, control -> ens_control
-            # Filename: ens01, control -> enscontrol (no underscore in filename)
+            # Filename: ens01, control -> control (no change for control, remove underscore for others)
             if member == 'control':
                 gcs_member = 'ens_control'
-                gcsmember = 'enscontrol'
+                gcsmember = 'control'  # Filename stays as 'control'
             else:
                 # Keep the underscore format for directory (ens_01 stays ens_01)
                 gcs_member = member
@@ -427,10 +427,10 @@ def test_stage2_with_templates(test_date, test_run, test_members):
 
             # Map member name to GCS path format
             # Directory: ens_01, control -> ens_control
-            # Filename: ens01, control -> enscontrol (no underscore in filename)
+            # Filename: ens01, control -> control (no change for control, remove underscore for others)
             if member == 'control':
                 gcs_member = 'ens_control'
-                gcsmember = 'enscontrol'
+                gcsmember = 'control'  # Filename stays as 'control'
             else:
                 # Keep the underscore format for directory (ens_01 stays ens_01)
                 gcs_member = member
@@ -449,7 +449,7 @@ def test_stage2_with_templates(test_date, test_run, test_members):
                     try:
                         # Step 2.1: Read fresh GRIB index file for TARGET date
                         fname = (f"s3://ecmwf-forecasts/{test_date}/{test_run}z/ifs/0p25/enfo/"
-                                f"{test_date}{test_run}0000-{hour}h-enfo-ef.grib2")
+                                f"{test_date}{test_run}0000-{hour}h-enfo-ef.index")
 
                         idxdf = parse_grib_idx(basename=fname, storage_options={"anon": True})
 
