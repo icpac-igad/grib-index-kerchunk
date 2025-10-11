@@ -51,7 +51,7 @@ REFERENCE_DATE = '20240529'
 # GCS configuration (needed for Stage 2)
 GCS_BUCKET = 'gik-fmrc'
 GCS_BASE_PATH = 'v2ecmwf_fmrc'  # Base path within the bucket
-GCP_SERVICE_ACCOUNT = 'coiled-data-e4drr_202505.json'
+GCP_SERVICE_ACCOUNT = '/home/roller/Documents/08-2023/impact_weather_icpac/lab/icpac_gcp/e4drr/gcp-coiled-sa-20250310/coiled-data-e4drr_202505.json'
 
 # Variables to extract (subset of ECMWF variables)
 FORECAST_DICT = {
@@ -385,131 +385,257 @@ def test_stage1_scan_grib_fallback(test_date, test_run, test_member='ens_01'):
 
 
 # ==============================================================================
-# STAGE 2: IDX + GCS TEMPLATES → MAPPED INDEX (All 85 hours)
+# HELPER FUNCTIONS FROM ecmwf_index_processor.py
 # ==============================================================================
 
-def test_stage2_with_templates(test_date, test_run, test_members):
-    """Test Stage 2: Use GCS templates + fresh index files for ALL 85 hours."""
-    log_stage(2, "IDX + GCS TEMPLATES → MAPPED INDEX (All 85 hours)")
+def parse_grib_index(idx_url, member_filter=None):
+    """
+    Parse ECMWF GRIB index file (JSON format) to extract byte ranges and metadata.
+    Imported from ecmwf_index_processor.py
+
+    Args:
+        idx_url: URL to the .index file
+        member_filter: Filter for specific member name (e.g., 'control', 'ens01')
+
+    Returns:
+        List of index entries with byte ranges and metadata
+    """
+    import fsspec
+    import json
+
+    try:
+        fs = fsspec.filesystem("s3", anon=True)
+
+        entries = []
+        with fs.open(idx_url, 'r') as f:
+            for line_num, line in enumerate(f):
+                if not line.strip():
+                    continue
+
+                # Parse JSON entry
+                entry_data = json.loads(line.strip())
+
+                # Parse ensemble member number
+                member_num = int(entry_data.get('number', 0))
+                if member_num == 0:
+                    member = 'control'
+                else:
+                    member = f'ens{member_num:02d}'
+
+                # Filter by member if specified
+                if member_filter and member != member_filter:
+                    continue
+
+                # Extract metadata
+                entry = {
+                    'byte_offset': entry_data['_offset'],
+                    'byte_length': entry_data['_length'],
+                    'variable': entry_data.get('param', ''),
+                    'level': entry_data.get('levtype', ''),
+                    'step': entry_data.get('step', '0'),
+                    'member': member,
+                    'date': entry_data.get('date', ''),
+                    'time': entry_data.get('time', ''),
+                    'line_num': line_num
+                }
+
+                entries.append(entry)
+
+        return entries
+
+    except Exception as e:
+        log_checkpoint(f"Error parsing index {idx_url}: {e}")
+        return []
+
+
+def create_references_from_index(grib_url, idx_entries, file_size=None):
+    """
+    Create kerchunk references using index byte ranges.
+    Imported from ecmwf_index_processor.py
+
+    Args:
+        grib_url: URL to the GRIB file
+        idx_entries: Parsed index entries (list of dicts)
+        file_size: Total file size (for last entry)
+
+    Returns:
+        Dictionary of kerchunk references
+    """
+    import fsspec
+
+    references = {}
+
+    # Get file size if needed and not provided
+    if file_size is None and any(e['byte_length'] == -1 for e in idx_entries):
+        try:
+            fs = fsspec.filesystem("s3", anon=True)
+            info = fs.info(grib_url)
+            file_size = info['size']
+        except:
+            log_checkpoint(f"Could not get file size for {grib_url}")
+
+    # Create references for each entry
+    for entry in idx_entries:
+        # Determine byte range
+        start = entry['byte_offset']
+        length = entry['byte_length']
+
+        if length == -1:
+            if file_size:
+                length = file_size - start
+            else:
+                continue  # Skip if we can't determine length
+
+        # Create reference key
+        var_name = entry['variable'].lower().replace(' ', '_')
+        level_name = entry['level'].replace(' ', '_')
+        member_name = entry['member']
+
+        # Build zarr-style key
+        key = f"{var_name}/{level_name}/{member_name}/0.0.0"
+
+        # Store reference [url, offset, length]
+        references[key] = [grib_url, start, length]
+
+    # Add zarr metadata
+    references['.zgroup'] = json.dumps({"zarr_format": 2})
+
+    return references
+
+
+# ==============================================================================
+# STAGE 2: INDEX-BASED PROCESSING (All 85 hours)
+# ==============================================================================
+
+def build_complete_parquet_from_indices(test_date, test_run, member_name, hours=None):
+    """
+    Build complete parquet with all time steps using index files.
+    Adapted from ecmwf_index_processor.py - does NOT use map_from_index.
+
+    Args:
+        test_date: Date in YYYYMMDD format
+        test_run: Run hour (00 or 12)
+        member_name: Ensemble member name (e.g., 'control', 'ens_01')
+        hours: Specific hours to process (default: all 85)
+
+    Returns:
+        Complete references dictionary
+    """
+    if hours is None:
+        hours = ECMWF_FORECAST_HOURS
+
+    all_refs = {}
+    metadata = {
+        'date': test_date,
+        'run': test_run,
+        'member': member_name,
+        'hours_processed': [],
+        'total_refs': 0
+    }
+
+    log_checkpoint(f"Building parquet for {member_name} using index files")
+    log_checkpoint(f"Processing {len(hours)} forecast hours")
+
+    # Convert member name format for filtering (ens_01 -> ens01)
+    if member_name == 'control':
+        member_filter = 'control'
+    else:
+        member_filter = member_name.replace('_', '')  # ens_01 -> ens01
+
+    for hour in hours:
+        try:
+            # Build URLs
+            idx_url = f"s3://ecmwf-forecasts/{test_date}/{test_run}z/ifs/0p25/enfo/{test_date}{test_run}0000-{hour}h-enfo-ef.index"
+            grib_url = idx_url.replace('.index', '.grib2')
+
+            # Parse index for this member
+            idx_entries = parse_grib_index(idx_url, member_filter=member_filter)
+
+            if not idx_entries:
+                log_checkpoint(f"  ⚠️ No entries found for {member_name} at {hour}h")
+                continue
+
+            # Create references
+            hour_refs = create_references_from_index(grib_url, idx_entries)
+
+            # Add to combined references with timestep prefix
+            for key, ref in hour_refs.items():
+                if not key.startswith('.'):  # Skip metadata keys
+                    timestep_key = f"step_{hour:03d}/{key}"
+                else:
+                    timestep_key = key
+                all_refs[timestep_key] = ref
+
+            metadata['hours_processed'].append(hour)
+            metadata['total_refs'] += len(hour_refs)
+
+            if hour % 10 == 0:  # Log every 10 hours
+                log_checkpoint(f"  Processed hour {hour:3d}h: {len(metadata['hours_processed'])} hours complete")
+
+        except Exception as e:
+            log_checkpoint(f"  ⚠️ Error processing hour {hour}: {e}")
+
+    # Add metadata to references
+    all_refs['_kerchunk_metadata'] = json.dumps(metadata)
+
+    log_checkpoint(f"Created {len(all_refs)} total references for {member_name}")
+    log_checkpoint(f"Processed {len(metadata['hours_processed'])}/{len(hours)} hours successfully")
+
+    return all_refs
+
+
+def test_stage2_index_based(test_date, test_run, test_members):
+    """Test Stage 2: Use index-based processing for ALL 85 hours (no map_from_index)."""
+    log_stage(2, "INDEX-BASED PROCESSING (All 85 hours)")
 
     start_time = time.time()
 
     try:
-        from kerchunk._grib_idx import parse_grib_idx, map_from_index
-        import gcsfs
-
-        # Set up GCS filesystem
-        gcs_fs = gcsfs.GCSFileSystem(token=GCP_SERVICE_ACCOUNT)
-
-        # Generate axes
-        log_checkpoint("Generating ECMWF axes...")
-        axes = generate_ecmwf_axes(test_date)
-
-        log_checkpoint(f"Running mapped index creation for ALL 85 forecast hours...")
+        log_checkpoint(f"Running index-based processing for ALL 85 forecast hours...")
         log_checkpoint(f"   Target date: {test_date}")
-        log_checkpoint(f"   Reference date: {REFERENCE_DATE}")
         log_checkpoint(f"   Processing {len(test_members)} members")
+        log_checkpoint(f"   Method: Direct index parsing (NO map_from_index)")
 
         # Get all ECMWF forecast hours (0, 3, 6, ..., 360)
-        all_forecast_hours = ECMWF_FORECAST_HOURS  # This should be all 85 hours
+        all_forecast_hours = ECMWF_FORECAST_HOURS  # All 85 hours
         log_checkpoint(f"   Forecast hours: {len(all_forecast_hours)} total")
 
         member_results = {}
 
         for member in test_members:
-            log_checkpoint(f"\nProcessing member: {member}")
+            log_checkpoint(f"\n{'='*60}")
+            log_checkpoint(f"Processing member: {member}")
+            log_checkpoint(f"{'='*60}")
 
-            # Extract member number
-            if member == 'control':
-                member_num = 0
+            # Build complete parquet from indices
+            all_refs = build_complete_parquet_from_indices(
+                test_date, test_run, member, hours=all_forecast_hours
+            )
+
+            if all_refs:
+                # Save as parquet
+                stage2_output = OUTPUT_DIR / f"stage2_{member}_complete.parquet"
+                create_parquet_simple(all_refs, stage2_output)
+
+                member_results[member] = all_refs
+
+                log_checkpoint(f"✅ {member}: {len(all_refs)} total references")
             else:
-                member_num = int(member.replace('ens_', ''))
-
-            # Map member name to GCS path format
-            # Directory: ens_01, control -> ens_control
-            # Filename: ens01, control -> control (no change for control, remove underscore for others)
-            if member == 'control':
-                gcs_member = 'ens_control'
-                gcsmember = 'control'  # Filename stays as 'control'
-            else:
-                # Keep the underscore format for directory (ens_01 stays ens_01)
-                gcs_member = member
-                # Remove underscore for filename (ens_01 -> ens01)
-                gcsmember = member.replace("_", "")
-
-            all_mapped_indices = []
-
-            # Process in batches for efficiency
-            batch_size = 10
-            for i in range(0, len(all_forecast_hours), batch_size):
-                batch_hours = all_forecast_hours[i:i+batch_size]
-                log_checkpoint(f"  Processing hours {batch_hours[0]}-{batch_hours[-1]}...")
-
-                for hour in batch_hours:
-                    try:
-                        # Step 2.1: Read fresh GRIB index file for TARGET date
-                        # For ECMWF, index files are .index (not .grib2.index)
-                        # So we use the base filename without .grib2 extension
-                        fname = (f"s3://ecmwf-forecasts/{test_date}/{test_run}z/ifs/0p25/enfo/"
-                                f"{test_date}{test_run}0000-{hour}h-enfo-ef")
-
-                        # ECMWF uses .index extension (fname will become fname.index)
-                        idxdf = parse_grib_idx(basename=fname, suffix="index", storage_options={"anon": True})
-
-                        # Filter for our test member
-                        idxdf_filtered = idxdf[idxdf['attrs'].str.contains(f"number={member_num}")]
-
-                        # Step 2.2: Read pre-built parquet mapping from GCS (REFERENCE date)
-                        # Path structure: gs://gik-fmrc/v2ecmwf_fmrc/ens_01/ecmwf-{REFERENCE_DATE}00-ens01-rt000.par
-                        gcs_path = f"gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{gcs_member}/ecmwf-{REFERENCE_DATE}00-{gcsmember}-rt{hour:03d}.par"
-                        
-                        if not gcs_fs.exists(gcs_path):
-                            log_checkpoint(f"    ⚠️ GCS template missing for hour {hour} at {gcs_path}, skipping...")
-                            continue
-
-                        deduped_mapping = pd.read_parquet(gcs_path, filesystem=gcs_fs)
-
-                        # Step 2.3: Merge fresh binary positions + template structure
-                        mapped_index = map_from_index(
-                            run_time=pd.Timestamp(test_date),
-                            mapping=deduped_mapping,
-                            idxdf=idxdf_filtered
-                        )
-
-                        all_mapped_indices.append(mapped_index)
-
-                    except Exception as e:
-                        log_checkpoint(f"    ⚠️ Error processing hour {hour}: {e}")
-                        continue
-
-            if all_mapped_indices:
-                # Combine all hours
-                ecmwf_kind = pd.concat(all_mapped_indices, ignore_index=True)
-
-                # Save mapped index
-                stage2_output = OUTPUT_DIR / f"stage2_{member}_mapped_index.parquet"
-                ecmwf_kind.to_parquet(stage2_output)
-
-                member_results[member] = ecmwf_kind
-
-                log_checkpoint(f"  ✅ {member}: {len(ecmwf_kind)} entries, {len(all_mapped_indices)} hours processed")
+                log_checkpoint(f"⚠️ {member}: No references created")
 
         elapsed = time.time() - start_time
 
-        log_checkpoint(f"\n✅ Stage 2 Complete!")
-        log_checkpoint(f"   Time: {elapsed:.1f} seconds")
-        log_checkpoint(f"   Members processed: {len(member_results)}")
-
-        for member, kind_df in member_results.items():
-            if 'varname' in kind_df:
-                log_checkpoint(f"   {member}: {len(kind_df)} entries, {kind_df['varname'].nunique()} variables")
+        log_checkpoint(f"\n{'='*60}")
+        log_checkpoint(f"✅ Stage 2 Complete!")
+        log_checkpoint(f"{'='*60}")
+        log_checkpoint(f"   Time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
+        log_checkpoint(f"   Members processed: {len(member_results)}/{len(test_members)}")
+        log_checkpoint(f"   Average time per member: {elapsed/len(member_results):.1f}s")
 
         return member_results
 
     except Exception as e:
         log_checkpoint(f"❌ Stage 2 Failed: {e}")
-        log_checkpoint(f"   This is expected if GCS templates don't exist")
-        log_checkpoint(f"   You need to run Stage 0 preprocessing first!")
         import traceback
         traceback.print_exc()
         return None
@@ -519,24 +645,17 @@ def test_stage2_with_templates(test_date, test_run, test_members):
 # STAGE 3: CREATE FINAL ZARR STORE (All 85 timesteps)
 # ==============================================================================
 
-def test_stage3(deflated_stores, mapped_indices, test_date):
-    """Test Stage 3: Merge stores and create final zarr parquet for each member."""
+def test_stage3(deflated_stores, stage2_refs, test_date):
+    """Test Stage 3: Merge Stage 1 (structure) + Stage 2 (all data) to create final zarr."""
     log_stage(3, "CREATE FINAL ZARR STORE (All 85 timesteps)")
 
-    if not deflated_stores or not mapped_indices:
+    if not deflated_stores or not stage2_refs:
         log_checkpoint("⚠️ Skipping Stage 3: Missing required inputs from previous stages")
         return None
 
     start_time = time.time()
 
     try:
-        from kerchunk._grib_idx import (
-            store_coord_var,
-            store_data_var,
-            AggregationType
-        )
-        import zarr
-
         # Generate time dimensions for ALL 85 hours
         log_checkpoint("Calculating time dimensions for all 85 forecast hours...")
         axes = generate_ecmwf_axes(test_date)
@@ -547,101 +666,55 @@ def test_stage3(deflated_stores, mapped_indices, test_date):
         valid_times = axes[0][:len(all_hours)]
         steps = pd.TimedeltaIndex([pd.Timedelta(hours=h) for h in all_hours])
 
-        time_dims = {'valid_time': len(all_hours)}
-        time_coords = {'valid_time': 'valid_time', 'time': 'time', 'step': 'step'}
-
-        log_checkpoint(f"   Time dimensions: {time_dims}")
-        log_checkpoint(f"   Total timesteps: {len(all_hours)}")
+        log_checkpoint(f"   Time dimensions: {len(all_hours)} timesteps")
 
         results = {}
 
         # Process each member
         for member in deflated_stores.keys():
-            if member not in mapped_indices:
-                log_checkpoint(f"⚠️ Skipping {member}: No mapped index available")
+            if member not in stage2_refs:
+                log_checkpoint(f"⚠️ Skipping {member}: No Stage 2 references available")
                 continue
 
-            log_checkpoint(f"\nProcessing {member}...")
+            log_checkpoint(f"\n{'='*60}")
+            log_checkpoint(f"Processing {member}...")
+            log_checkpoint(f"{'='*60}")
 
             deflated_store = deflated_stores[member]
-            ecmwf_kind = mapped_indices[member]
+            complete_refs = stage2_refs[member]
 
-            # Prepare zarr store structure
-            log_checkpoint(f"   Preparing zarr store for {member}...")
+            # Merge deflated store (structure from hours 0,3) with complete refs (all 85 hours)
+            log_checkpoint(f"   Merging Stage 1 structure with Stage 2 complete references...")
 
-            # Initialize zarr store from deflated store
+            # Start with deflated store structure
             if isinstance(deflated_store, dict) and 'refs' in deflated_store:
-                zstore = deflated_store.get('refs', {}).copy()
+                final_store = deflated_store.get('refs', {}).copy()
             else:
-                zstore = deflated_store.copy()
+                final_store = deflated_store.copy()
 
-            # Process chunk index from mapped index
-            if isinstance(ecmwf_kind, pd.DataFrame):
-                chunk_index = ecmwf_kind.copy()
-            else:
-                log_checkpoint("   Converting index to DataFrame...")
-                chunk_index = pd.DataFrame(ecmwf_kind)
+            # Update with all timestep references from Stage 2
+            for key, ref in complete_refs.items():
+                if not key.startswith('_'):  # Skip metadata
+                    final_store[key] = ref
 
-            log_checkpoint(f"   Zarr store entries: {len(zstore)}")
-            log_checkpoint(f"   Chunk index rows: {len(chunk_index)}")
+            log_checkpoint(f"   Stage 1 entries: {len(deflated_store)}")
+            log_checkpoint(f"   Stage 2 entries: {len(complete_refs)}")
+            log_checkpoint(f"   Final store entries: {len(final_store)}")
 
-            # Add required columns if missing
-            if 'varname' not in chunk_index.columns:
-                # Try to extract varname from attrs
-                chunk_index['varname'] = chunk_index['attrs'].str.split(':').str[0]
-
-            if 'stepType' not in chunk_index.columns:
-                chunk_index['stepType'] = 'instant'  # Default
-
-            if 'typeOfLevel' not in chunk_index.columns:
-                chunk_index['typeOfLevel'] = 'surface'  # Default
-
-            # Process unique variable groups
-            log_checkpoint(f"   Processing unique variable groups for {member}...")
-
-            unique_groups = chunk_index.groupby(['varname', 'stepType', 'typeOfLevel']).groups
-
-            for group_key, group_indices in unique_groups.items():
-                varname, step_type, level_type = group_key
-                base_path = f"/{varname}/{step_type}/{level_type}"
-
-                log_checkpoint(f"      Processing {base_path}")
-
-                # Store coordinate variables
-                store_coord_var(f"{base_path}/time", zstore, times)
-                store_coord_var(f"{base_path}/valid_time", zstore, valid_times)
-                store_coord_var(f"{base_path}/step", zstore, steps)
-
-                # Store data variable
-                group_data = chunk_index.iloc[group_indices]
-
-                # Create data array reference
-                data_key = f"{base_path}/{varname}"
-                zstore[f"{data_key}/.zarray"] = json.dumps({
-                    "chunks": [1, 721, 1440],  # time, lat, lon for ECMWF 0.25 degree
-                    "compressor": None,
-                    "dtype": "<f4",
-                    "fill_value": None,
-                    "filters": [],
-                    "order": "C",
-                    "shape": [len(all_hours), 721, 1440],
-                    "zarr_format": 2
-                })
-
-            log_checkpoint(f"   Updated zarr store entries: {len(zstore)}")
-
-            # Save as parquet
+            # Save final zarr store as parquet
             stage3_output = OUTPUT_DIR / f"stage3_{member}_final.parquet"
-            create_parquet_simple(zstore, stage3_output)
+            create_parquet_simple(final_store, stage3_output)
 
-            results[member] = (zstore, stage3_output)
+            results[member] = (final_store, stage3_output)
 
-            log_checkpoint(f"   ✅ {member} complete: {len(zstore)} entries")
+            log_checkpoint(f"   ✅ {member} complete: {len(final_store)} entries")
 
         elapsed = time.time() - start_time
 
-        log_checkpoint(f"\n✅ Stage 3 Complete!")
-        log_checkpoint(f"   Time: {elapsed:.1f} seconds")
+        log_checkpoint(f"\n{'='*60}")
+        log_checkpoint(f"✅ Stage 3 Complete!")
+        log_checkpoint(f"{'='*60}")
+        log_checkpoint(f"   Time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
         log_checkpoint(f"   Members processed: {len(results)}")
 
         return results
@@ -775,13 +848,6 @@ def main():
     print(f"Members: {', '.join(test_members[:5])}" +
           (f"... and {len(test_members)-5} more" if len(test_members) > 5 else ""))
 
-    # Stage 0: Check GCS templates (optional)
-    if not args.skip_gcs_check:
-        has_templates = check_stage0_templates(test_members)
-    else:
-        has_templates = False
-        log_checkpoint("Skipping GCS template check")
-
     # Stage 1: Use prebuilt parquet files
     deflated_stores = test_stage1_prebuilt(member_parquets, test_date, test_run)
 
@@ -790,19 +856,20 @@ def main():
         # Use first member as example
         deflated_stores = test_stage1_scan_grib_fallback(test_date, test_run, test_members[0])
 
-    # Stage 2: IDX + GCS templates for ALL 85 hours
-    mapped_indices = None
-    if has_templates:
-        mapped_indices = test_stage2_with_templates(test_date, test_run, test_members)
-    else:
-        log_checkpoint("\n⚠️ GCS templates not available")
-        log_checkpoint("   Stage 2 requires GCS templates from Stage 0 preprocessing")
-        log_checkpoint("   Skipping Stage 2 and Stage 3")
+    # Stage 2: Index-based processing for ALL 85 hours (NO map_from_index or GCS templates)
+    stage2_refs = None
+    if deflated_stores:
+        # Limit to first 3 members for testing (processing all 51 members takes time)
+        test_subset = test_members[:3] if len(test_members) > 3 else test_members
+        log_checkpoint(f"\n⚠️ Testing with {len(test_subset)} members: {test_subset}")
+        log_checkpoint(f"   (To process all {len(test_members)} members, modify the code)")
+
+        stage2_refs = test_stage2_index_based(test_date, test_run, test_subset)
 
     # Stage 3: Create final zarr store with all 85 timesteps
     stage3_results = None
-    if deflated_stores and mapped_indices:
-        stage3_results = test_stage3(deflated_stores, mapped_indices, test_date)
+    if deflated_stores and stage2_refs:
+        stage3_results = test_stage3(deflated_stores, stage2_refs, test_date)
 
         # Validation: Test with xarray
         if stage3_results:
@@ -827,23 +894,29 @@ def main():
     print(f"   Members tested: {len(test_members)}")
     print(f"   Stage 1: ✅ Used prebuilt parquet files (hours 0, 3)")
 
-    if has_templates and mapped_indices:
-        print(f"   Stage 2: ✅ Processed all 85 forecast hours")
-        print(f"   Stage 3: ✅ Created final zarr stores")
+    if stage2_refs:
+        print(f"   Stage 2: ✅ Index-based processing (all 85 forecast hours)")
+        print(f"            Method: Direct index parsing (NO map_from_index)")
+        print(f"            Members: {len(stage2_refs)}")
     else:
-        print(f"   Stage 2: ⚠️ Skipped (GCS templates not available)")
+        print(f"   Stage 2: ⚠️ Skipped or failed")
+
+    if stage3_results:
+        print(f"   Stage 3: ✅ Created final zarr stores")
+        print(f"            Members: {len(stage3_results)}")
+    else:
         print(f"   Stage 3: ⚠️ Skipped (requires Stage 2)")
 
     print("\n📝 Next Steps:")
-    if not has_templates:
-        print("   1. Run Stage 0 preprocessing to create GCS templates:")
-        print(f"      python ecmwf_index_preprocessing.py \\")
-        print(f"        --date {REFERENCE_DATE} --all-members --bucket {GCS_BUCKET}")
-        print("   2. Re-run this test to use GCS templates in Stage 2")
+    if stage3_results:
+        print("   1. ✅ All three stages working successfully!")
+        print("   2. To process all 51 members, modify test_subset in main()")
+        print("   3. Process different dates by providing different zip files")
+        print("   4. Use ecmwf_index_processor.py for production processing")
     else:
-        print("   1. ✅ All stages working with prebuilt files and GCS templates!")
-        print("   2. Process different dates by providing different zip files")
-        print("   3. Use run_day_ecmwf_ensemble_full.py for production")
+        print("   1. Check error messages above to diagnose issues")
+        print("   2. Verify S3 access to ecmwf-forecasts bucket")
+        print("   3. Ensure index files exist for the test date")
 
     print("="*80)
 
