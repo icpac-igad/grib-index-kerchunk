@@ -51,7 +51,7 @@ REFERENCE_DATE = '20240529'
 # GCS configuration (needed for Stage 2)
 GCS_BUCKET = 'gik-fmrc'
 GCS_BASE_PATH = 'v2ecmwf_fmrc'  # Base path within the bucket
-GCP_SERVICE_ACCOUNT = '/home/roller/Documents/08-2023/impact_weather_icpac/lab/icpac_gcp/e4drr/gcp-coiled-sa-20250310/coiled-data-e4drr_202505.json'
+GCP_SERVICE_ACCOUNT = 'coiled-data-e4drr_202505.json'
 
 # Variables to extract (subset of ECMWF variables)
 FORECAST_DICT = {
@@ -218,12 +218,15 @@ def check_stage0_templates(test_members):
 
         for member in test_members:
             # Map member name to GCS path format
-            # ens_01 stays as ens_01, control -> ens_control
+            # Directory: ens_01, control -> ens_control
+            # Filename: ens01, control -> enscontrol (no underscore in filename)
             if member == 'control':
                 gcs_member = 'ens_control'
+                gcsmember = 'enscontrol'
             else:
-                # Keep the underscore format as is (ens_01 stays ens_01)
+                # Keep the underscore format for directory (ens_01 stays ens_01)
                 gcs_member = member
+                # Remove underscore for filename (ens_01 -> ens01)
                 gcsmember = member.replace("_", "")
 
             # Check for reference date templates
@@ -423,11 +426,15 @@ def test_stage2_with_templates(test_date, test_run, test_members):
                 member_num = int(member.replace('ens_', ''))
 
             # Map member name to GCS path format
+            # Directory: ens_01, control -> ens_control
+            # Filename: ens01, control -> enscontrol (no underscore in filename)
             if member == 'control':
                 gcs_member = 'ens_control'
+                gcsmember = 'enscontrol'
             else:
-                # Keep the underscore format as is (ens_01 stays ens_01)
+                # Keep the underscore format for directory (ens_01 stays ens_01)
                 gcs_member = member
+                # Remove underscore for filename (ens_01 -> ens01)
                 gcsmember = member.replace("_", "")
 
             all_mapped_indices = []
