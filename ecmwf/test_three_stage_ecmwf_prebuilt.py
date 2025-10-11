@@ -51,7 +51,7 @@ REFERENCE_DATE = '20240529'
 # GCS configuration (needed for Stage 2)
 GCS_BUCKET = 'gik-fmrc'
 GCS_BASE_PATH = 'v2ecmwf_fmrc'  # Base path within the bucket
-GCP_SERVICE_ACCOUNT = 'coiled-data-e4drr_202505.json'
+GCP_SERVICE_ACCOUNT = '/home/roller/Documents/08-2023/impact_weather_icpac/lab/icpac_gcp/e4drr/gcp-coiled-sa-20250310/coiled-data-e4drr_202505.json'
 
 # Variables to extract (subset of ECMWF variables)
 FORECAST_DICT = {
@@ -218,16 +218,17 @@ def check_stage0_templates(test_members):
 
         for member in test_members:
             # Map member name to GCS path format
-            # ens_01 -> ens01, control -> ens_control
+            # ens_01 stays as ens_01, control -> ens_control
             if member == 'control':
                 gcs_member = 'ens_control'
             else:
-                # Remove underscore from ens_01 -> ens01
-                gcs_member = member.replace('_', '')
+                # Keep the underscore format as is (ens_01 stays ens_01)
+                gcs_member = member
+                gcsmember = member.replace("_", "")
 
             # Check for reference date templates
-            # Path structure: gs://gik-fmrc/v2ecmwf_fmrc/ens01/ecmwf-time-{REFERENCE_DATE}-ens01-rt000.parquet
-            sample_path = f"gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{gcs_member}/ecmwf-time-{REFERENCE_DATE}00-{gcs_member}-rt000.par"
+            # Path structure: gs://gik-fmrc/v2ecmwf_fmrc/ens_01/ecmwf-{REFERENCE_DATE}00-ens01-rt000.par
+            sample_path = f"gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{gcs_member}/ecmwf-{REFERENCE_DATE}00-{gcsmember}-rt000.par"
 
             if gcs_fs.exists(sample_path):
                 templates_found[member] = True
@@ -425,8 +426,9 @@ def test_stage2_with_templates(test_date, test_run, test_members):
             if member == 'control':
                 gcs_member = 'ens_control'
             else:
-                # Remove underscore from ens_01 -> ens01
-                gcs_member = member.replace('_', '')
+                # Keep the underscore format as is (ens_01 stays ens_01)
+                gcs_member = member
+                gcsmember = member.replace("_", "")
 
             all_mapped_indices = []
 
@@ -448,9 +450,9 @@ def test_stage2_with_templates(test_date, test_run, test_members):
                         idxdf_filtered = idxdf[idxdf['attrs'].str.contains(f"number={member_num}")]
 
                         # Step 2.2: Read pre-built parquet mapping from GCS (REFERENCE date)
-                        # Path structure: gs://gik-fmrc/v2ecmwf_fmrc/ens01/ecmwf-time-{REFERENCE_DATE}-ens01-rt{hour:03d}.parquet
-                        gcs_path = f"gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{gcs_member}/ecmwf-time-{REFERENCE_DATE}00-{gcs_member}-rt{hour:03d}.par"
-
+                        # Path structure: gs://gik-fmrc/v2ecmwf_fmrc/ens_01/ecmwf-{REFERENCE_DATE}00-ens01-rt000.par
+                        gcs_path = f"gs://{GCS_BUCKET}/{GCS_BASE_PATH}/{gcs_member}/ecmwf-{REFERENCE_DATE}00-{gcsmember}-rt{hour:03d}.par"
+                        
                         if not gcs_fs.exists(gcs_path):
                             log_checkpoint(f"    ⚠️ GCS template missing for hour {hour} at {gcs_path}, skipping...")
                             continue
