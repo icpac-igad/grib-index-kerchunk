@@ -449,9 +449,10 @@ def test_stage2_with_templates(test_date, test_run, test_members):
                     try:
                         # Step 2.1: Read fresh GRIB index file for TARGET date
                         fname = (f"s3://ecmwf-forecasts/{test_date}/{test_run}z/ifs/0p25/enfo/"
-                                f"{test_date}{test_run}0000-{hour}h-enfo-ef.index")
+                                f"{test_date}{test_run}0000-{hour}h-enfo-ef.grib2")
 
-                        idxdf = parse_grib_idx(basename=fname, storage_options={"anon": True})
+                        # ECMWF uses .index extension, not .idx
+                        idxdf = parse_grib_idx(basename=fname, suffix="index", storage_options={"anon": True})
 
                         # Filter for our test member
                         idxdf_filtered = idxdf[idxdf['attrs'].str.contains(f"number={member_num}")]
