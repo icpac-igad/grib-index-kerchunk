@@ -631,9 +631,12 @@ def build_complete_stage2_improved(test_date, test_run, member_name, hours=None)
     return all_refs
 
 
-def test_stage2_improved(test_date, test_run, test_members):
-    """Test Stage 2: Use improved index-based processing for ALL 85 hours."""
-    log_stage(2, "IMPROVED INDEX-BASED PROCESSING (All 85 hours)")
+def test_stage2_improved(test_date, test_run, test_members, hours=None):
+    """Test Stage 2: Use improved index-based processing for specified hours."""
+    if hours is None:
+        hours = ECMWF_FORECAST_HOURS
+
+    log_stage(2, f"IMPROVED INDEX-BASED PROCESSING ({len(hours)} hours)")
 
     start_time = time.time()
 
@@ -642,10 +645,7 @@ def test_stage2_improved(test_date, test_run, test_members):
         log_checkpoint(f"   Target date: {test_date}")
         log_checkpoint(f"   Processing {len(test_members)} members")
         log_checkpoint(f"   Method: Direct index parsing with parameter mapping")
-
-        # Get all ECMWF forecast hours (0, 3, 6, ..., 360)
-        all_forecast_hours = ECMWF_FORECAST_HOURS  # All 85 hours
-        log_checkpoint(f"   Forecast hours: {len(all_forecast_hours)} total")
+        log_checkpoint(f"   Forecast hours: {len(hours)} total")
 
         member_results = {}
 
@@ -656,7 +656,7 @@ def test_stage2_improved(test_date, test_run, test_members):
 
             # Build complete parquet from indices with improved parsing
             all_refs = build_complete_stage2_improved(
-                test_date, test_run, member, hours=all_forecast_hours
+                test_date, test_run, member, hours=hours
             )
 
             if all_refs:
@@ -693,9 +693,9 @@ def test_stage2_improved(test_date, test_run, test_members):
 # STAGE 3: CREATE FINAL ZARR STORE (from original)
 # ==============================================================================
 
-def test_stage3(deflated_stores, stage2_refs, test_date):
+def test_stage3(deflated_stores, stage2_refs, test_date, requested_hours=None):
     """Test Stage 3: Merge Stage 1 (structure) + Stage 2 (all data) to create final zarr."""
-    log_stage(3, "CREATE FINAL ZARR STORE (All 85 timesteps)")
+    log_stage(3, "CREATE FINAL ZARR STORE")
 
     if not deflated_stores or not stage2_refs:
         log_checkpoint("⚠️ Skipping Stage 3: Missing required inputs from previous stages")
@@ -704,18 +704,6 @@ def test_stage3(deflated_stores, stage2_refs, test_date):
     start_time = time.time()
 
     try:
-        # Generate time dimensions for ALL 85 hours
-        log_checkpoint("Calculating time dimensions for all 85 forecast hours...")
-        axes = generate_ecmwf_axes(test_date)
-
-        # Get all forecast hours
-        all_hours = ECMWF_FORECAST_HOURS
-        times = axes[1][:len(all_hours)]
-        valid_times = axes[0][:len(all_hours)]
-        steps = pd.TimedeltaIndex([pd.Timedelta(hours=h) for h in all_hours])
-
-        log_checkpoint(f"   Time dimensions: {len(all_hours)} timesteps")
-
         results = {}
 
         # Process each member
@@ -731,22 +719,39 @@ def test_stage3(deflated_stores, stage2_refs, test_date):
             deflated_store = deflated_stores[member]
             complete_refs = stage2_refs[member]
 
-            # Merge deflated store (structure from hours 0,3) with complete refs (all 85 hours)
-            log_checkpoint(f"   Merging Stage 1 structure with Stage 2 complete references...")
+            # Check how many hours were processed in Stage 2
+            step_keys = [k for k in complete_refs.keys() if k.startswith('step_')]
+            unique_steps = set(k.split('/')[0] for k in step_keys)
+            num_stage2_hours = len(unique_steps)
 
-            # Start with deflated store structure
-            if isinstance(deflated_store, dict) and 'refs' in deflated_store:
-                final_store = deflated_store.get('refs', {}).copy()
+            log_checkpoint(f"   Stage 1 has structure for 2 hours (0, 3)")
+            log_checkpoint(f"   Stage 2 has data for {num_stage2_hours} hours")
+
+            # DECISION: If Stage 2 has more than 2 hours, use ONLY Stage 2 (skip Stage 1 merge)
+            # This avoids the dimension mismatch issue
+            if num_stage2_hours > 2:
+                log_checkpoint(f"   ⚠️ Using Stage 2 data ONLY (skipping Stage 1 structure)")
+                log_checkpoint(f"   Reason: Stage 1 structure only supports 2 timesteps")
+                log_checkpoint(f"   This ensures all {num_stage2_hours} timesteps are accessible")
+
+                # Use only Stage 2 references
+                final_store = complete_refs.copy()
+
             else:
-                final_store = deflated_store.copy()
+                # Original merge logic for <= 2 hours
+                log_checkpoint(f"   Merging Stage 1 structure with Stage 2 data...")
 
-            # Update with all timestep references from Stage 2
-            for key, ref in complete_refs.items():
-                if not key.startswith('_'):  # Skip metadata
-                    final_store[key] = ref
+                # Start with deflated store structure
+                if isinstance(deflated_store, dict) and 'refs' in deflated_store:
+                    final_store = deflated_store.get('refs', {}).copy()
+                else:
+                    final_store = deflated_store.copy()
 
-            log_checkpoint(f"   Stage 1 entries: {len(deflated_store)}")
-            log_checkpoint(f"   Stage 2 entries: {len(complete_refs)}")
+                # Update with Stage 2 references
+                for key, ref in complete_refs.items():
+                    if not key.startswith('_'):  # Skip metadata
+                        final_store[key] = ref
+
             log_checkpoint(f"   Final store entries: {len(final_store)}")
 
             # Save final zarr store as parquet
@@ -934,15 +939,8 @@ def main():
 
         log_checkpoint(f"   Estimated time: ~{len(test_members) * 0.75:.0f} seconds")
 
-        # Override hours for Stage 2 if specified
-        original_hours = ECMWF_FORECAST_HOURS
-        if args.hours:
-            ECMWF_FORECAST_HOURS = args.hours
-
-        stage2_refs = test_stage2_improved(test_date, test_run, test_members)
-
-        # Restore original hours
-        ECMWF_FORECAST_HOURS = original_hours
+        # Call Stage 2 with the appropriate hours
+        stage2_refs = test_stage2_improved(test_date, test_run, test_members, hours)
 
     # Stage 3: Create final zarr store with all 85 timesteps
     stage3_results = None
