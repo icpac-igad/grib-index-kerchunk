@@ -127,9 +127,20 @@ def fetch_s3_byte_range_obstore(url, offset, length):
         else:
             raise ValueError(f"Invalid S3 URL: {url}")
 
+        # Determine region based on bucket name
+        # ECMWF buckets are in EU regions
+        bucket_regions = {
+            'ecmwf-forecasts': 'eu-central-1',
+            'noaa-cdr-precip-cmorph-pds': 'us-east-1',
+            'noaa-cdr-precip-persiann-pds': 'us-east-1',
+        }
+        region = bucket_regions.get(bucket, 'eu-central-1')  # Default to EU for ECMWF
+
+        print(f"      Using region: {region} for bucket: {bucket}")
+
         # Create S3 store using from_url (following working pattern)
         bucket_url = f"s3://{bucket}"
-        store = from_url(bucket_url, region="us-east-1", skip_signature=True)
+        store = from_url(bucket_url, region=region, skip_signature=True)
 
         # Fetch byte range using obstore.get_range
         # API: get_range(store, path, start=offset, end=offset+length)
@@ -138,6 +149,7 @@ def fetch_s3_byte_range_obstore(url, offset, length):
         # Convert to bytes
         data = bytes(result)
 
+        print(f"      ✅ Fetched {len(data):,} bytes via obstore")
         return data
 
     except ImportError:
@@ -412,7 +424,7 @@ def main():
 
     # Find parquet file
     possible_paths = [
-        "ecmwf_20251015_18_efficient/members/ens_01/ens_01.parquet",
+        "ecmwf_20250628_18_efficient/members/ens_01/ens_01.parquet",
         "/home/roller/Downloads/ecmwf_20251015_18_efficient/members/ens_01/ens_01.parquet",
     ]
 
