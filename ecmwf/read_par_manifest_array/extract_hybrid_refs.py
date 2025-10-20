@@ -129,10 +129,9 @@ def fetch_s3_byte_range_obstore(url, offset, length):
         # Create S3 store (anonymous access)
         store = S3Store.from_url(f"s3://{bucket}", config={"aws_skip_signature": "true"})
 
-        # Fetch byte range - correct obstore API
-        # obstore.get_range(store, path, range)
-        byte_range = range(offset, offset + length)
-        result = obs.get_range(store, key, byte_range)
+        # Fetch byte range - obstore API uses get_range with (path, range) tuple
+        # The range is a Python range object or tuple (start, end)
+        result = obs.get_range(store, (key, range(offset, offset + length)))
 
         # Convert to bytes
         data = bytes(result)
@@ -240,10 +239,11 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
                             var_names = list(ds.data_vars)
                             if var_names:
                                 var_data = ds[var_names[0]].values
-                                print(f"      Decoded shape: {var_data.shape}")
+                                print(f"      Decoded shape: {var_data.shape}, dtype: {var_data.dtype}")
 
-                                # Convert to bytes for storage
-                                chunks_data[key] = var_data.tobytes()
+                                # Store the actual numpy array, not bytes
+                                # This preserves the dtype (usually float32 from GRIB2)
+                                chunks_data[key] = var_data
                             else:
                                 print(f"      ⚠️ No variables found in GRIB2")
 
@@ -266,8 +266,9 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
                                 # Release the message
                                 eccodes.codes_release(gid)
 
-                                print(f"      Decoded {len(values)} values")
-                                chunks_data[key] = values.tobytes()
+                                print(f"      Decoded {len(values)} values, dtype: {values.dtype}")
+                                # Store as numpy array
+                                chunks_data[key] = values
 
                             except ImportError:
                                 print(f"      ❌ Neither cfgrib nor eccodes available")
@@ -310,7 +311,12 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
         if len(chunks_data) == 1:
             # Single chunk
             chunk_data = list(chunks_data.values())[0]
-            array = np.frombuffer(chunk_data, dtype=dtype)
+
+            # Check if it's already a numpy array (from GRIB2)
+            if isinstance(chunk_data, np.ndarray):
+                array = chunk_data
+            else:
+                array = np.frombuffer(chunk_data, dtype=dtype)
 
             if array.size == np.prod(shape):
                 array = array.reshape(shape)
@@ -328,34 +334,57 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
             # Multiple chunks - reassemble
             print(f"  Reassembling {len(chunks_data)} chunks...")
 
-            array = np.zeros(shape, dtype=dtype)
+            # Determine actual dtype from first chunk
+            first_chunk = list(chunks_data.values())[0]
+            if isinstance(first_chunk, np.ndarray):
+                actual_dtype = first_chunk.dtype
+                print(f"    Using dtype from GRIB2 data: {actual_dtype}")
+            else:
+                actual_dtype = dtype
+
+            array = np.zeros(shape, dtype=actual_dtype)
 
             for chunk_key, chunk_data in chunks_data.items():
                 # Parse chunk indices
                 chunk_idx_str = chunk_key.replace(variable_path + "/", "")
                 chunk_indices = tuple(int(x) for x in chunk_idx_str.split('.'))
 
-                # Convert to numpy
-                chunk_array = np.frombuffer(chunk_data, dtype=dtype)
+                # Convert to numpy if needed
+                if isinstance(chunk_data, np.ndarray):
+                    chunk_array = chunk_data
+                else:
+                    chunk_array = np.frombuffer(chunk_data, dtype=actual_dtype)
 
-                # Calculate chunk shape
-                chunk_shape = []
-                for i, (idx, chunk_size, dim_size) in enumerate(zip(chunk_indices, chunks, shape)):
-                    if (idx + 1) * chunk_size <= dim_size:
-                        chunk_shape.append(chunk_size)
-                    else:
-                        chunk_shape.append(dim_size - idx * chunk_size)
+                print(f"    Chunk {chunk_indices}: shape={chunk_array.shape}, dtype={chunk_array.dtype}")
 
-                chunk_array = chunk_array.reshape(tuple(chunk_shape))
+                # GRIB2 data comes as 2D (721, 1440), but metadata expects 4D (1, 1, 721, 1440)
+                # The chunk indices tell us which (time, step) position to fill
+                if chunk_array.ndim == 2 and len(shape) == 4:
+                    # Insert the 2D GRIB2 data at the right (time, step) position
+                    time_idx = chunk_indices[0] if len(chunk_indices) > 0 else 0
+                    step_idx = chunk_indices[1] if len(chunk_indices) > 1 else 0
+                    array[time_idx, step_idx, :, :] = chunk_array
+                    print(f"      Inserted at position [{time_idx}, {step_idx}, :, :]")
+                else:
+                    # Standard zarr chunk reassembly
+                    chunk_shape = []
+                    for i, (idx, chunk_size, dim_size) in enumerate(zip(chunk_indices, chunks, shape)):
+                        if (idx + 1) * chunk_size <= dim_size:
+                            chunk_shape.append(chunk_size)
+                        else:
+                            chunk_shape.append(dim_size - idx * chunk_size)
 
-                # Insert into array
-                slices = []
-                for idx, chunk_size, dim_size in zip(chunk_indices, chunks, shape):
-                    start = idx * chunk_size
-                    end = min(start + chunk_size, dim_size)
-                    slices.append(slice(start, end))
+                    if chunk_array.size == np.prod(chunk_shape):
+                        chunk_array = chunk_array.reshape(tuple(chunk_shape))
 
-                array[tuple(slices)] = chunk_array
+                    # Insert into array
+                    slices = []
+                    for idx, chunk_size, dim_size in zip(chunk_indices, chunks, shape):
+                        start = idx * chunk_size
+                        end = min(start + chunk_size, dim_size)
+                        slices.append(slice(start, end))
+
+                    array[tuple(slices)] = chunk_array
 
             print(f"\n✅ Successfully reassembled array")
             print(f"  Shape: {array.shape}")
