@@ -111,10 +111,11 @@ def fetch_s3_byte_range_fsspec(url, offset, length):
 def fetch_s3_byte_range_obstore(url, offset, length):
     """
     Fetch a byte range from S3 using obstore (if available).
+    Based on obstore API from working_virtualizarr_processor.py
     """
     try:
         import obstore as obs
-        from obstore.store import S3Store
+        from obstore.store import from_url
 
         print(f"    📦 Using obstore for S3 fetch (faster)")
 
@@ -126,12 +127,13 @@ def fetch_s3_byte_range_obstore(url, offset, length):
         else:
             raise ValueError(f"Invalid S3 URL: {url}")
 
-        # Create S3 store (anonymous access)
-        store = S3Store.from_url(f"s3://{bucket}", config={"aws_skip_signature": "true"})
+        # Create S3 store using from_url (following working pattern)
+        bucket_url = f"s3://{bucket}"
+        store = from_url(bucket_url, region="us-east-1", skip_signature=True)
 
-        # Fetch byte range - obstore API uses get_range with (path, range) tuple
-        # The range is a Python range object or tuple (start, end)
-        result = obs.get_range(store, (key, range(offset, offset + length)))
+        # Fetch byte range using obstore.get_range
+        # API: get_range(store, path, start=offset, end=offset+length)
+        result = obs.get_range(store, key, start=offset, end=offset + length)
 
         # Convert to bytes
         data = bytes(result)
