@@ -16,6 +16,8 @@ import base64
 import pickle
 from pathlib import Path
 import io
+import tempfile
+import os
 
 
 def read_parquet_to_refs(parquet_path):
@@ -109,8 +111,6 @@ def fetch_s3_byte_range_fsspec(url, offset, length):
 def fetch_s3_byte_range_obstore(url, offset, length):
     """
     Fetch a byte range from S3 using obstore (if available).
-
-    This is a placeholder showing how obstore would be used.
     """
     try:
         import obstore as obs
@@ -127,13 +127,17 @@ def fetch_s3_byte_range_obstore(url, offset, length):
             raise ValueError(f"Invalid S3 URL: {url}")
 
         # Create S3 store (anonymous access)
-        store = S3Store.from_url(f"s3://{bucket}")
+        store = S3Store.from_url(f"s3://{bucket}", config={"aws_skip_signature": "true"})
 
-        # Fetch byte range
-        # obstore uses get_range(path, offset, length)
-        data = obs.get_range(store, key, offset, length)
+        # Fetch byte range - correct obstore API
+        # obstore.get_range(store, path, range)
+        byte_range = range(offset, offset + length)
+        result = obs.get_range(store, key, byte_range)
 
-        return bytes(data)
+        # Convert to bytes
+        data = bytes(result)
+
+        return data
 
     except ImportError:
         print(f"    ⚠️ obstore not available, falling back to fsspec")
@@ -213,16 +217,82 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
                     data = fetch_s3_byte_range_fsspec(url, offset, length)
 
                 if data is not None:
-                    # Decompress if needed
-                    if compressor is not None:
-                        try:
-                            import numcodecs
-                            codec = numcodecs.get_codec(compressor)
-                            data = codec.decode(data)
-                        except Exception as e:
-                            print(f"      ⚠️ Decompression failed: {e}")
+                    # The data is in GRIB2 format, need to decode it
+                    print(f"      Fetched {len(data):,} bytes")
 
-                    chunks_data[key] = data
+                    # Check if it's GRIB2 data
+                    if data[:4] == b'GRIB':
+                        print(f"      ✅ GRIB2 data detected")
+                        # Decode GRIB2 message
+                        try:
+                            import cfgrib
+                            import xarray as xr
+
+                            # Write to temporary file for cfgrib
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.grib2') as tmp:
+                                tmp.write(data)
+                                tmp_path = tmp.name
+
+                            # Open with cfgrib
+                            ds = xr.open_dataset(tmp_path, engine='cfgrib')
+
+                            # Extract the data array
+                            var_names = list(ds.data_vars)
+                            if var_names:
+                                var_data = ds[var_names[0]].values
+                                print(f"      Decoded shape: {var_data.shape}")
+
+                                # Convert to bytes for storage
+                                chunks_data[key] = var_data.tobytes()
+                            else:
+                                print(f"      ⚠️ No variables found in GRIB2")
+
+                            # Clean up
+                            os.unlink(tmp_path)
+                            ds.close()
+
+                        except ImportError:
+                            print(f"      ⚠️ cfgrib not available, trying eccodes")
+                            try:
+                                import eccodes
+
+                                # Decode using eccodes
+                                # Create a message from the data
+                                gid = eccodes.codes_new_from_message(data)
+
+                                # Get the values
+                                values = eccodes.codes_get_array(gid, 'values')
+
+                                # Release the message
+                                eccodes.codes_release(gid)
+
+                                print(f"      Decoded {len(values)} values")
+                                chunks_data[key] = values.tobytes()
+
+                            except ImportError:
+                                print(f"      ❌ Neither cfgrib nor eccodes available")
+                                print(f"      Cannot decode GRIB2 data")
+                            except Exception as e:
+                                print(f"      ❌ Error decoding with eccodes: {e}")
+
+                        except Exception as e:
+                            print(f"      ❌ Error decoding GRIB2: {e}")
+
+                    else:
+                        # Not GRIB2, maybe compressed zarr chunk
+                        print(f"      Data format: {data[:4]}")
+
+                        # Try decompression if needed
+                        if compressor is not None:
+                            try:
+                                import numcodecs
+                                codec = numcodecs.get_codec(compressor)
+                                data = codec.decode(data)
+                                chunks_data[key] = data
+                            except Exception as e:
+                                print(f"      ⚠️ Decompression failed: {e}")
+                        else:
+                            chunks_data[key] = data
                 else:
                     print(f"      ❌ Failed to fetch chunk")
 
