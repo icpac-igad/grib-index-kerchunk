@@ -459,7 +459,7 @@ def main():
     start_time = time.time()
 
     # Configuration
-    date_str = '20250628'
+    date_str = '20250728'
     run = '18'
     target_members = [-1, 1, 2, 3, 4, 5]  + list(range(6, 51))
 
@@ -470,10 +470,9 @@ def main():
 
     # Define ECMWF files - just the first few timesteps for efficiency
     ecmwf_files = [
-        f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-0h-enfo-ef.grib2"
-        
+        f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-0h-enfo-ef.grib2",
+        f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-3h-enfo-ef.grib2"
     ]
-    #f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-3h-enfo-ef.grib2"
 
     # Check file availability
     fs = fsspec.filesystem("s3", anon=True)
