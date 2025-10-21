@@ -27,11 +27,11 @@ import pandas as pd
 
 # Configuration
 PARAM_SFC = ["10u", "10v", "2d", "2t", "msl", "skt", "sp", "tcw"]
-PARAM_SFC_FC = ["lsm", "z", "slor", "sdor"]
-PARAM_SOIL = ["sot"]
+PARAM_SFC_FC = ["lsm"]  # UPDATED: removed z, slor, sdor (not in parquet)
+PARAM_SOIL = []  # UPDATED: removed sot (not in parquet)
 PARAM_PL = ["gh", "t", "u", "v", "w", "q"]
 LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-SOIL_LEVELS = [1, 2]
+SOIL_LEVELS = [1, 2]  # Not used since PARAM_SOIL is empty
 
 # Output configuration
 OUTPUT_DIR = "ecmwf_pkl_from_parquet"
@@ -326,26 +326,29 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
 def get_variable_path_mapping():
     """
     Map parameter names to their paths in the zarr store.
-    Based on ECMWF data structure.
+    Based on actual ECMWF parquet structure (verified with list_all_variables.py).
+
+    NOTE: Some variables (z, slor, sdor, stl) are NOT available in the parquet file.
+    These may need to be obtained from a different source or marked as optional.
     """
     return {
-        # Surface parameters
-        '10u': 'u10m/instant/heightAboveGround/u10m',
-        '10v': 'v10m/instant/heightAboveGround/v10m',
+        # Surface parameters (CORRECTED PATHS)
+        '10u': 'u10/instant/heightAboveGround/u10',       # FIXED: was u10m
+        '10v': 'v10/instant/heightAboveGround/v10',       # FIXED: was v10m
         '2t': 't2m/instant/heightAboveGround/t2m',
         '2d': 'd2m/instant/heightAboveGround/d2m',
         'msl': 'msl/instant/meanSea/msl',
         'sp': 'sp/instant/surface/sp',
         'skt': 'skt/instant/surface/skt',
-        'tcw': 'tcw/instant/atmosphere/tcw',
-        # Fixed fields
+        'tcw': 'tcw/instant/entireAtmosphere/tcw',        # FIXED: was atmosphere
+        # Fixed fields - NOT AVAILABLE IN THIS PARQUET FILE
         'lsm': 'lsm/instant/surface/lsm',
-        'z': 'z/instant/surface/z',
-        'slor': 'slor/instant/surface/slor',
-        'sdor': 'sdor/instant/surface/sdor',
-        # Soil parameters
-        'sot': 'stl/instant/depthBelowLandLayer/stl',
-        # Pressure level parameters
+        # 'z': NOT AVAILABLE - geopotential at surface
+        # 'slor': NOT AVAILABLE - slope of sub-gridscale orography
+        # 'sdor': NOT AVAILABLE - standard deviation of orography
+        # Soil parameters - NOT AVAILABLE IN THIS PARQUET FILE
+        # 'sot': NOT AVAILABLE - soil temperature
+        # Pressure level parameters (VERIFIED CORRECT)
         'gh': 'gh/instant/isobaricInhPa/gh',
         't': 't/instant/isobaricInhPa/t',
         'u': 'u/instant/isobaricInhPa/u',
@@ -355,22 +358,44 @@ def get_variable_path_mapping():
     }
 
 
+def extract_pressure_level_from_coordinate(zstore, base_path):
+    """
+    Extract the actual pressure level value from the coordinate.
+    Returns the pressure level in hPa.
+    """
+    import struct
+
+    coord_path = f"{base_path}/isobaricInhPa/0"
+    if coord_path in zstore:
+        val = zstore[coord_path]
+        if isinstance(val, str) and len(val) == 8:
+            try:
+                level_value = struct.unpack('<d', val.encode('latin1'))[0]
+                return level_value
+            except:
+                pass
+    return None
+
+
 def get_data_from_parquet_obstore(parquet_path, param, levelist=[], use_obstore=True):
     """
     Retrieve data from parquet files using obstore method (Phase 1).
     NO interpolation or rolling - just raw data collection.
 
+    ⚠️ WARNING: This parquet file appears to contain only ONE pressure level (50 hPa).
+    Multiple levels would require multiple parquet files or a different data structure.
+
     Args:
         parquet_path: Parquet file path
         param: List of parameters to extract
-        levelist: List of pressure/soil levels (optional)
+        levelist: List of pressure/soil levels (optional, but may not all be available)
         use_obstore: Use obstore for S3 fetching (faster)
 
     Returns:
         Dictionary of {param_name: numpy_array}
     """
     fields = {}
-    print(f"    Retrieving {param} data" + (f" at levels {levelist}" if levelist else ""))
+    print(f"    Retrieving {param} data" + (f" (requested levels: {levelist})" if levelist else ""))
 
     # Read parquet to get references
     zstore = read_parquet_to_refs(parquet_path)
@@ -391,45 +416,46 @@ def get_data_from_parquet_obstore(parquet_path, param, levelist=[], use_obstore=
         array = extract_variable_hybrid(zstore, base_path, use_obstore=use_obstore)
 
         if array is not None:
-            # Handle multi-dimensional data (time, step, level, lat, lon)
-            # For now, take the first time/step if multiple
+            # Handle multi-dimensional data (time, step, lat, lon)
+            # This parquet has shape [1, 1, 721, 1440] for each variable
             if array.ndim > 2:
-                # Typically shape is (1, 1, lat, lon) or (levels, lat, lon)
-                if levelist and array.ndim >= 3:
-                    # Has level dimension
-                    for i, level in enumerate(levelist):
-                        if i < array.shape[0]:
-                            if array.ndim == 4:
-                                # Shape: (1, 1, lat, lon)
-                                level_data = array[0, 0, :, :]
-                            elif array.ndim == 3:
-                                # Shape: (level, lat, lon)
-                                level_data = array[i, :, :]
-                            else:
-                                level_data = array
-
-                            name = f"{p}_{level}"
-                            fields[name] = level_data
-                            print(f"      ✅ {name}: shape={level_data.shape}")
+                # Extract 2D slice (remove time/step dimensions)
+                if array.ndim == 4:
+                    data_2d = array[0, 0, :, :]
+                elif array.ndim == 3:
+                    data_2d = array[0, :, :]
                 else:
-                    # No level dimension, take first time/step
-                    if array.ndim == 4:
-                        data = array[0, 0, :, :]
-                    elif array.ndim == 3:
-                        data = array[0, :, :]
-                    else:
-                        data = array
+                    data_2d = array
 
-                    fields[p] = data
-                    print(f"      ✅ {p}: shape={data.shape}")
+                if levelist:
+                    # This is a pressure level variable
+                    # Try to determine which level this actually is
+                    actual_level = extract_pressure_level_from_coordinate(zstore, base_path.rsplit('/', 1)[0])
+
+                    if actual_level is not None:
+                        # Use the ACTUAL level from the file
+                        name = f"{p}_{int(actual_level)}"
+                        fields[name] = data_2d
+                        print(f"      ✅ {name}: shape={data_2d.shape} (actual level from file)")
+
+                        if int(actual_level) not in levelist:
+                            print(f"      ⚠️  Level {int(actual_level)} not in requested levels {levelist}")
+                    else:
+                        # Fallback: assume it's the first requested level
+                        name = f"{p}_{levelist[0] if levelist else 1000}"
+                        fields[name] = data_2d
+                        print(f"      ✅ {name}: shape={data_2d.shape} (WARNING: level unknown, using {levelist[0]})")
+                else:
+                    # Surface variable
+                    fields[p] = data_2d
+                    print(f"      ✅ {p}: shape={data_2d.shape}")
             else:
                 # Already 2D
                 if levelist:
-                    # This shouldn't happen, but handle it
-                    for level in levelist:
-                        name = f"{p}_{level}"
-                        fields[name] = array
-                        print(f"      ✅ {name}: shape={array.shape}")
+                    actual_level = extract_pressure_level_from_coordinate(zstore, base_path.rsplit('/', 1)[0])
+                    name = f"{p}_{int(actual_level) if actual_level else levelist[0]}"
+                    fields[name] = array
+                    print(f"      ✅ {name}: shape={array.shape}")
                 else:
                     fields[p] = array
                     print(f"      ✅ {p}: shape={array.shape}")
@@ -532,37 +558,67 @@ def create_input_state_from_parquet(parquet_path, member, use_obstore=True):
 
 
 def verify_input_state(input_state, member):
-    """Verify the input state has all required fields."""
+    """
+    Verify the input state has all required fields.
+
+    NOTE: Due to parquet file limitations, many fields will be missing:
+    - Fixed fields (z, slor, sdor) not in parquet
+    - Soil fields (stl1, stl2) not in parquet
+    - Only ONE pressure level (50 hPa) available, not all 13 levels
+    """
     fields = input_state['fields']
 
-    # Expected fields
-    expected_surface = PARAM_SFC + PARAM_SFC_FC + ['stl1', 'stl2']
+    # Expected fields (if we had complete data)
+    expected_surface = PARAM_SFC + PARAM_SFC_FC
+    if PARAM_SOIL:
+        expected_surface += ['stl1', 'stl2']
+
     expected_pressure = []
     for param in PARAM_PL:
-        if param == 'gh':
-            param = 'z'  # Converted to geopotential
+        param_name = 'z' if param == 'gh' else param  # Converted to geopotential
         for level in LEVELS:
-            expected_pressure.append(f"{param}_{level}")
+            expected_pressure.append(f"{param_name}_{level}")
 
     expected_total = expected_surface + expected_pressure
 
-    # Check if all fields are present
+    # Check what we actually have
+    available = [f for f in expected_total if f in fields]
     missing = [f for f in expected_total if f not in fields]
     extra = [f for f in fields if f not in expected_total]
 
     print(f"\n  Verification for member {member}:")
-    print(f"    Expected fields: {len(expected_total)}")
-    print(f"    Actual fields: {len(fields)}")
+    print(f"    Expected (full dataset): {len(expected_total)} fields")
+    print(f"    Actually extracted: {len(fields)} fields")
+    print(f"    Available from expected: {len(available)} fields")
 
     if missing:
-        print(f"    ⚠️  Missing fields: {missing}")
-    if extra:
-        print(f"    ⚠️  Extra fields: {extra}")
+        # Group missing by type for clearer reporting
+        missing_surface = [f for f in missing if '_' not in f]
+        missing_pressure = [f for f in missing if '_' in f]
 
-    if not missing and not extra:
-        print(f"    ✅ All fields present and correct!")
+        if missing_surface:
+            print(f"    ⚠️  Missing surface fields ({len(missing_surface)}): {missing_surface}")
+        if missing_pressure:
+            print(f"    ⚠️  Missing pressure level fields ({len(missing_pressure)})")
+            # Show sample of missing
+            print(f"         Sample: {missing_pressure[:10]}")
+
+    if extra:
+        print(f"    ℹ️  Extra fields (not expected): {extra}")
+
+    # Check if we have at least some data
+    has_some_surface = any(f in fields for f in expected_surface)
+    has_some_pressure = any(f in fields for f in expected_pressure)
+
+    if has_some_surface and has_some_pressure:
+        print(f"    ✅ Partial data available (surface + at least one pressure level)")
         return True
-    return False
+    elif has_some_surface or has_some_pressure:
+        print(f"    ⚠️  Incomplete: only {'surface' if has_some_surface else 'pressure'} data available")
+        return False
+    else:
+        print(f"    ❌ No expected fields found!")
+        return False
 
 
 def main():
@@ -572,7 +628,7 @@ def main():
     """
 
     # Define the parquet file to process
-    parquet_file = "ecmwf_20251020_00_efficient/members/ens_01/ens_01.parquet"
+    parquet_file = "ecmwf_20250728_18_efficient/members/ens_01/ens_01.parquet"
 
     print("="*80)
     print("🌳 ECMWF PARQUET TO PKL PROCESSOR (PHASE 1)")
@@ -641,9 +697,25 @@ def main():
         return
 
     print("\n" + "="*80)
-    print("✅ PHASE 1 COMPLETE!")
+    print("✅ PHASE 1 COMPLETE (WITH LIMITATIONS)!")
     print("="*80)
+
+    print("\n⚠️  DATA LIMITATIONS:")
+    print("  This parquet file contains:")
+    print("    ✅ Surface fields (8 variables)")
+    print("    ✅ Land-sea mask (1 variable)")
+    print("    ✅ Pressure level data for 6 variables")
+    print("    ❌ BUT: Only ONE pressure level (50 hPa), not all 13 levels")
+    print("    ❌ Missing: z, slor, sdor (orography fields)")
+    print("    ❌ Missing: stl1, stl2 (soil temperature)")
+    print()
+    print("  To get ALL required data for AI-FS, you need:")
+    print("    - Parquet files with ALL 13 pressure levels, OR")
+    print("    - Multiple parquet files (one per level), OR")
+    print("    - A different data source for missing fields")
+
     print("\n💡 Next steps (Phase 2):")
+    print("  - Obtain complete multi-level data")
     print("  - Apply coordinate rolling (longitude shift)")
     print("  - Apply interpolation (ekr.interpolate)")
     print("  - Create final PKL for AI-FS input")
