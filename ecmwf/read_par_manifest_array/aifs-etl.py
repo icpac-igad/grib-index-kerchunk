@@ -100,27 +100,38 @@ def decode_chunk_reference(chunk_ref):
     return 'unknown', chunk_ref
 
 
-def fetch_s3_byte_range_fsspec(url, offset, length):
-    """Fetch a byte range from S3 using fsspec."""
-    try:
-        import fsspec
+def fetch_s3_byte_range_fsspec(url, offset, length, max_retries=3, retry_delay=2):
+    """Fetch a byte range from S3 using fsspec with retry logic."""
+    import time
 
-        if url.startswith('s3://'):
-            s3_path = url[5:]
-        else:
-            s3_path = url
+    for attempt in range(max_retries):
+        try:
+            import fsspec
 
-        fs = fsspec.filesystem('s3', anon=True)
+            if url.startswith('s3://'):
+                s3_path = url[5:]
+            else:
+                s3_path = url
 
-        with fs.open(s3_path, 'rb') as f:
-            f.seek(offset)
-            data = f.read(length)
+            fs = fsspec.filesystem('s3', anon=True)
 
-        return data
+            with fs.open(s3_path, 'rb') as f:
+                f.seek(offset)
+                data = f.read(length)
 
-    except Exception as e:
-        print(f"    ❌ Error fetching from S3 with fsspec: {e}")
-        return None
+            return data
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"    ⚠️  fsspec attempt {attempt + 1}/{max_retries} failed: {e}")
+                print(f"    🔄 Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print(f"    ❌ Error fetching from S3 with fsspec after {max_retries} attempts: {e}")
+                return None
+
+    return None
 
 
 def fetch_s3_byte_range_obstore(url, offset, length):
@@ -206,6 +217,10 @@ def extract_variable_hybrid(zstore, variable_path, use_obstore=False):
                     data = fetch_s3_byte_range_obstore(url, offset, length)
                 else:
                     data = fetch_s3_byte_range_fsspec(url, offset, length)
+
+                if data is None:
+                    print(f"      ⚠️  Skipping chunk {key} - could not fetch from S3")
+                    continue
 
                 if data is not None:
                     # Check if it's GRIB2 data
