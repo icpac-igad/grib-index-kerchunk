@@ -37,8 +37,12 @@ PARAM_PL = ["gh", "t", "u", "v", "w", "q"]
 LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
 SOIL_LEVELS = [1, 2]
 
+# Configuration
+date_str = '20251101'
+run = '18'
+
 # Output configuration
-OUTPUT_DIR = "ecmwf_pkl_from_parquet_v2"
+OUTPUT_DIR = f"{date_str}_{run}_ecmwf_pkl_par"
 SAVE_STATES = True
 
 
@@ -679,7 +683,7 @@ def main():
     """Main function to process ECMWF parquet files to PKL (V2)."""
 
     # Define the parquet file to process
-    parquet_file = "ecmwf_20250728_18_efficient/members/ens_01/ens_01.parquet"
+    parquet_file = f"ecmwf_{date_str}_{run}_efficient/members/ens_01/ens_01.parquet"
 
     print("="*80)
     print("🌳 ECMWF PARQUET TO PKL PROCESSOR V2")
