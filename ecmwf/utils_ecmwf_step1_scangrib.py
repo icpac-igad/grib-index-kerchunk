@@ -129,26 +129,46 @@ def s3_parse_ecmwf_grib_idx(
 
 
 def ecmwf_idx_unique_dict(edf):
+    """
+    Extract unique parameter combinations from ECMWF index dataframe.
+
+    FIXED: Now includes ALL pressure levels (50, 100, 150, 200, 250, 300, 400, 500,
+    600, 700, 850, 925, 1000) and ALL soil levels (1, 2, 4), not just level 50.
+    """
     # Fill empty rows or missing values in 'levelist' with 'null'
     edf['levelist'] = edf['levelist'].fillna('null')
-    # Filter for both pl (level 50) and sfc parameters
-    combined_params = edf[((edf['levtype'] == 'pl') &
-                           (edf['levelist'] == '50')) |
-                          (edf['levtype'] == 'sfc')].groupby(
-                              ['param', 'levtype', 'levelist']).agg({
-                                  'ens_number':
-                                  lambda x: -1
-                                  if (-1 in x.values) else x.iloc[0]
-                              }).reset_index()
+
+    # FIXED: Include ALL pressure levels and soil levels, not just 50!
+    # Define the levels we want to extract
+    pressure_levels = ['50', '100', '150', '200', '250', '300', '400', '500',
+                      '600', '700', '850', '925', '1000']
+    soil_levels = ['1', '2', '4']
+
+    # Filter for:
+    # 1. ALL pressure levels (pl)
+    # 2. ALL soil levels (sol)
+    # 3. Surface parameters (sfc)
+    combined_params = edf[
+        ((edf['levtype'] == 'pl') & (edf['levelist'].isin(pressure_levels))) |
+        ((edf['levtype'] == 'sol') & (edf['levelist'].isin(soil_levels))) |
+        (edf['levtype'] == 'sfc')
+    ].groupby(['param', 'levtype', 'levelist']).agg({
+        'ens_number': lambda x: -1 if (-1 in x.values) else x.iloc[0]
+    }).reset_index()
 
     combined_dict = {}
     for _, row in combined_params.iterrows():
-        key = f"{row['param']}_{row['levtype']}"
+        # Include level in the key for pressure/soil levels to keep them separate
+        if row['levtype'] in ['pl', 'sol']:
+            key = f"{row['param']}_{row['levtype']}_{row['levelist']}"
+        else:
+            key = f"{row['param']}_{row['levtype']}"
+
         combined_dict[key] = {
             'param': row['param'],
             'levtype': row['levtype'],
             'ens_number': row['ens_number'],
-            'levelist': 'null' if row['levtype'] == 'sfc' else '50'
+            'levelist': row['levelist']
         }
     return combined_dict
 
