@@ -468,8 +468,8 @@ def main():
     start_time = time.time()
 
     # Configuration
-    date_str = '20251101'
-    run = '18'
+    date_str = '20251103'
+    run = '00'
     target_members = [-1, 1, 2, 3, 4, 5]  + list(range(6, 51))
 
     # Create output directory

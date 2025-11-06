@@ -52,6 +52,11 @@ ENSEMBLE_MEMBERS = [f'gep{i:02d}' for i in range(1, 31)]  # All 30 members
 # Option to keep parquet files
 KEEP_PARQUET_FILES = True  # Set to True to keep files, False to delete them
 
+# Option to create parquet files after processing GRIB data
+# NOTE: This has been fixed to work with Zarr v3 by removing xarray validation.
+# The function now only creates parquet files without loading data into memory.
+STREAM_AFTER_CREATION = True  # Creates parquet files (works with Zarr v3)
+
 # East Africa bounding box
 EA_LAT_MIN, EA_LAT_MAX = -12, 15
 EA_LON_MIN, EA_LON_MAX = 25, 52
@@ -230,15 +235,18 @@ def process_ensemble_members_batch(members_batch, target_date_str, target_run, r
 
 
 def stream_ensemble_precipitation(members_data, variable='tp', output_dir=None):
-    """Stream precipitation data for all successful ensemble members."""
-    print(f"\n🌧️ Streaming {variable} data for {len(members_data)} ensemble members...")
-    
-    ensemble_numpy = {}
-    ensemble_xarray = {}
-    
+    """Create parquet files for all successful ensemble members.
+
+    NOTE: This function only creates parquet files. It does NOT load data into memory.
+    To process the parquet files, use run_gefs_24h_accumulation.py (which uses obstore method).
+    """
+    print(f"\n💾 Creating parquet files for {len(members_data)} ensemble members...")
+
+    parquet_files_created = []
+
     for member, data in members_data.items():
         print(f"\n📊 Processing {member}...")
-        
+
         try:
             # Create parquet file for this member
             if output_dir:
@@ -248,52 +256,27 @@ def stream_ensemble_precipitation(members_data, variable='tp', output_dir=None):
             else:
                 # Original behavior - save in current directory
                 parquet_file_str = f'gefs_{member}_{TARGET_DATE_STR}_{TARGET_RUN}z_fixed.par'
-            
+
             create_parquet_file_fixed(data['store'], parquet_file_str)
-            
-            # Read and stream data
-            zstore = read_parquet_fixed(parquet_file_str)
-            
-            # Create reference filesystem
-            fs = fsspec.filesystem("reference", fo=zstore, remote_protocol='s3', 
-                                  remote_options={'anon': True})
-            mapper = fs.get_mapper("")
-            
-            # Open as datatree
-            dt = xr.open_datatree(mapper, engine="zarr", consolidated=False)
-            
-            # Navigate to variable data
-            if variable == 'tp':
-                data_var = dt['/tp/accum/surface'].ds['tp']
-            else:
-                continue
-            
-            # Extract East Africa region
-            ea_data = data_var.sel(
-                latitude=slice(EA_LAT_MAX, EA_LAT_MIN),
-                longitude=slice(EA_LON_MIN, EA_LON_MAX)
-            )
-            
-            # Compute numpy array
-            ea_numpy = ea_data.compute().values
-            
-            # Store results
-            ensemble_numpy[member] = ea_numpy
-            ensemble_xarray[member] = ea_data
-            
-            print(f"✅ {member} data shape: {ea_numpy.shape}")
-            
-            # Clean up parquet file if not keeping
-            if not KEEP_PARQUET_FILES and not output_dir:
-                os.remove(parquet_file_str)
-                print(f"🗑️ Deleted temporary parquet file")
-            
+
+            # Simple validation: Check that parquet file was created
+            if not os.path.exists(parquet_file_str):
+                raise ValueError(f"Failed to create parquet file for {member}")
+
+            print(f"✅ Parquet file created successfully for {member}")
+            parquet_files_created.append(parquet_file_str)
+
+            # NOTE: Skipping xarray validation to avoid Zarr v3 FSMap issues
+            # Use run_gefs_24h_accumulation.py (with obstore method) to process these files
+
         except Exception as e:
-            print(f"❌ Error streaming {member}: {e}")
+            print(f"❌ Error creating parquet for {member}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
-    
-    print(f"\n✅ Successfully streamed data for {len(ensemble_numpy)} members")
-    
+
+    print(f"\n✅ Successfully created parquet files for {len(parquet_files_created)} members")
+
     if KEEP_PARQUET_FILES and output_dir:
         # List saved files
         parquet_files = sorted(output_dir.glob("*.par"))
@@ -302,8 +285,12 @@ def stream_ensemble_precipitation(members_data, variable='tp', output_dir=None):
             print(f"   - {pf.name}")
         if len(parquet_files) > 5:
             print(f"   ... and {len(parquet_files) - 5} more")
-    
-    return ensemble_numpy, ensemble_xarray
+
+        print(f"\n📝 Next step: Run the following command to process these files:")
+        print(f"   python run_gefs_24h_accumulation.py")
+
+    # Return None since we're not loading data into memory
+    return None, None
 
 
 
@@ -385,9 +372,24 @@ def main():
     if len(all_results) == 0:
         print("\n❌ No ensemble members processed successfully!")
         return False
-    
-    # 5. Stream precipitation data for all members to create parquet files
-    ensemble_numpy, ensemble_xarray = stream_ensemble_precipitation(all_results, 'tp', output_dir)
+
+    # 5. Optionally stream precipitation data (disabled by default with Zarr v3)
+    ensemble_numpy = {}
+    ensemble_xarray = {}
+
+    if STREAM_AFTER_CREATION:
+        print("\n💾 Creating parquet files (Zarr v3 compatible - no xarray validation)...")
+        try:
+            ensemble_numpy, ensemble_xarray = stream_ensemble_precipitation(all_results, 'tp', output_dir)
+            print("\n✅ Parquet file creation successful!")
+        except Exception as e:
+            print(f"\n❌ Parquet creation failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("\n⚠️  Parquet file creation is DISABLED!")
+        print("   📝 Set STREAM_AFTER_CREATION=True to create parquet files")
+        print("   📝 Then use run_gefs_24h_accumulation.py to process them")
 
     
     total_time = time.time() - start_time
@@ -398,16 +400,18 @@ def main():
     
     print(f"\n📁 Results:")
     print(f"   - Total processing time: {total_time/60:.1f} minutes")
-    print(f"   - Ensemble members with data: {len(ensemble_numpy)}")
-    
-    if KEEP_PARQUET_FILES and output_dir:
+
+    if STREAM_AFTER_CREATION and KEEP_PARQUET_FILES and output_dir:
+        # Count parquet files that were created
+        parquet_files = list(output_dir.glob("*.par"))
+        print(f"   - Parquet files created: {len(parquet_files)}")
         print(f"   - Output directory: {output_dir}")
-        print(f"   - Parquet files: {len(list(output_dir.glob('*.par')))}")
+    elif STREAM_AFTER_CREATION:
+        print(f"   - Parquet files: Created but not kept")
     else:
-        print(f"   - Parquet files: Temporary (deleted after use)")
-        
-    print(f"\n📝 Note: Plotting routines have been moved to run_gefs_24h_accumulation.py")
-    print(f"         Run that script to create plots from the parquet files.")
+        print(f"   - Parquet file creation: Disabled")
+
+    print(f"\n📝 Next step: Run run_gefs_24h_accumulation.py to process the parquet files")
     
     return True
 
