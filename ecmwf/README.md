@@ -1,251 +1,215 @@
-## To run the step1 of ecmwf gik 
+# ECMWF Ensemble Processing Pipeline
 
-```
-coiled notebook start --name dask-thresholds --vm-type n2-standard-2 --software itt-jupyter-env-v20250318 --workspace=geosfm
+## Overview
+
+Complete pipeline for processing ECMWF (European Centre for Medium-Range Weather Forecasts) ensemble forecast data using the **grib-index-kerchunk method** for efficient GRIB data access without full file scanning.
+
+## Key Features
+
+- **51 ensemble members**: 1 control + 50 perturbed members
+- **85 forecast timesteps**: 0-144h at 3h intervals (49 steps) + 150-360h at 6h intervals (36 steps)
+- **High resolution**: 0.25° (~25 km)
+- **Fast daily processing**: Reuses mapping templates from one-time preprocessing
+
+## The Two-Step Architecture
+
+This pipeline uses a **two-step process** that separates expensive one-time preprocessing from fast daily processing:
+
+### Step 1: One-Time Expensive Preprocessing
+**Purpose**: Create reusable parquet mapping files that describe the GRIB data structure
+
+**Scripts**:
+- `ecmwf_index_preprocessing.py` - Creates GCS parquet templates from scanning GRIB files
+- `ecmwf_ensemble_par_creator_v2.py` - Downloads and processes GCS parquet files (alternative approach)
+
+**When to run**: ONCE per ensemble member to create mapping templates
+
+**What it creates**: Parquet files in GCS at `gs://bucket/ecmwf/{member}/ecmwf-time-{date}-{member}-rt{hour}.parquet`
+
+**Why expensive**: Scans actual GRIB files using `scan_grib` and `build_idx_grib_mapping` to build complete index mappings for all 85 forecast hours
+
+**Key benefit**: These parquet files can be reused across different dates with the same ECMWF structure
+
+#### Usage:
+```bash
+# Process single member
+python ecmwf_index_preprocessing.py --date 20240529 --member ens01 --bucket gik-ecmwf-aws-tf
+
+# Process all 51 members
+python ecmwf_index_preprocessing.py --date 20240529 --bucket gik-ecmwf-aws-tf --all-members
 ```
 
-In notebook bash 
+---
+
+### Step 2: Fast Daily Processing
+**Purpose**: Efficiently process new forecast dates by scanning each GRIB file once and extracting all ensemble members
+
+**Script**: `ecmwf_ensemble_par_creator_efficient.py`
+
+**When to run**: For each new forecast date you want to process
+
+**Processing approach**:
+1. Scans each GRIB file ONCE using `ecmwf_filter_scan_grib`
+2. Extracts all 51 ensemble members simultaneously using `fixed_ensemble_grib_tree`
+3. Creates comprehensive parquet with all ensemble data
+4. Optionally extracts individual member-specific parquet files
+
+**Efficiency gain**: Instead of scanning files 51 times (once per member), scans each file just ONCE
+
+#### Usage:
+```bash
+# Configure in the script:
+# - date_str: Date to process (e.g., '20251103')
+# - run: Run hour (e.g., '00', '12')
+# - target_members: List of ensemble members to extract
+
+python ecmwf_ensemble_par_creator_efficient.py
 ```
+
+**Output structure**:
+```
+ecmwf_{date}_{run}_efficient/
+├── comprehensive/
+│   └── ecmwf_{date}_{run}z_ensemble_all.parquet  # All members
+└── members/
+    ├── control/
+    │   └── control.parquet
+    ├── ens_01/
+    │   └── ens_01.parquet
+    ├── ens_02/
+    │   └── ens_02.parquet
+    └── ...
+```
+
+---
+
+### Step 3: Generate PKL Files for AIFS
+**Purpose**: Convert ensemble member parquet files to PKL format for AI weather model input
+
+**Script**: `read_par_manifest_array/test_levels/aifs-etl.py`
+
+**When to run**: After Step 2 completes to prepare data for AI-FS (Artificial Intelligence Forecasting System)
+
+**What it does**:
+- Reads parquet files with hybrid references (base64 + S3 byte ranges)
+- Extracts meteorological variables at multiple pressure levels
+- Handles GRIB2 decoding using cfgrib/eccodes
+- Uses obstore for fast S3 data fetching
+- Converts geopotential height (gh) to geopotential (z)
+- Saves as PKL file ready for AI model input
+
+**Variables extracted**:
+- **Surface**: 10u, 10v, 2t, 2d, msl, sp, skt, tcw
+- **Fixed fields**: lsm
+- **Pressure levels**: gh, t, u, v, w, q at 13 levels (1000-50 hPa)
+
+#### Usage:
+```bash
+# Edit parquet file path in script:
+# parquet_file = "ecmwf_20250728_18_efficient/members/ens_01/ens_01.parquet"
+
+python read_par_manifest_array/test_levels/aifs-etl.py
+```
+
+**Output**:
+- `ecmwf_pkl_from_parquet/input_state_member_001_phase1.pkl`
+
+---
+
+## Complete Workflow Example
+
+```bash
+# 1. One-time preprocessing (run once)
+python ecmwf_index_preprocessing.py \
+    --date 20240529 \
+    --member ens01 \
+    --bucket gik-ecmwf-aws-tf
+
+# 2. Fast daily processing (run for each new date)
+# Edit date_str in script to target date
+python ecmwf_ensemble_par_creator_efficient.py
+
+# 3. Generate PKL for AIFS (optional)
+# Edit parquet_file path in script
+python read_par_manifest_array/test_levels/aifs-etl.py
+```
+
+---
+
+## How Fast Daily Processing Works
+
+1. **Efficient single-pass scanning**: Uses `ecmwf_filter_scan_grib` to scan each GRIB file once
+2. **Simultaneous member extraction**: `fixed_ensemble_grib_tree` processes all 51 members together
+3. **Avoids redundant scanning**: Old approach required 51 × 85 = 4,335 file scans; new approach requires only 85 scans
+4. **Result**: **51× faster** processing for daily runs!
+
+---
+
+## Data Source
+
+ECMWF forecast data is accessed from AWS S3:
+- **Bucket**: `s3://ecmwf-forecasts/`
+- **Format**: `{date}/{run}z/ifs/0p25/enfo/{date}{run}0000-{hour}h-enfo-ef.grib2`
+- **Access**: Anonymous (no credentials required)
+
+Example URL:
+```
+s3://ecmwf-forecasts/20240529/00z/ifs/0p25/enfo/20240529000000-0h-enfo-ef.grib2
+```
+
+---
+
+## Technical Details
+
+### ECMWF Ensemble Configuration
+- **Control member**: 1 (number = -1 in code)
+- **Perturbed members**: 50 (number = 1-50)
+- **Total members**: 51
+
+### Forecast Hours
+- **0-144h**: 3-hourly intervals (49 timesteps)
+- **150-360h**: 6-hourly intervals (36 timesteps)
+- **Total**: 85 forecast hours
+
+### Variables in Parquet
+- Surface fields: u10, v10, t2m, d2m, msl, sp, skt, tcw, lsm
+- Pressure levels: gh, t, u, v, w, q
+- Levels: 1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50 hPa
+
+---
+
+## Environment Setup
+
+### Coiled Environment (Recommended for large-scale processing)
+
+```bash
+# Start Coiled notebook
+coiled notebook start --name dask-thresholds --vm-type n2-standard-2 \
+    --software itt-jupyter-env-v20250318 --workspace=geosfm
+
+# Install dependencies in notebook
 pip install "kerchunk<=0.2.7"
 pip install "zarr<=3.0"
 ```
-upload the coiled data service account, and the file
 
-```ecmwf/test_run_ecmwf_step1_scangrib.py```
+Upload the coiled data service account and run the processing scripts.
 
-The output of the run is 
+---
 
-```
-python test_run_ecmwf_step1_scangrib.py 
-[2025-07-01 10:03:21] Starting ECMWF ensemble processing script
-[2025-07-01 10:03:21] Processing 2 ECMWF files for date 20250701
-[2025-07-01 10:03:21] Starting file processing
-[2025-07-01 10:03:21] Processing file 1/2: 20250701000000-0h-enfo-ef.grib2
-Completed scan_grib for s3://ecmwf-forecasts/20250701/00z/ifs/0p25/enfo/20250701000000-0h-enfo-ef.grib2, found 8007 messages
-Completed index files and found 8007 entries in it
-Found 2091 matching indices
-[2025-07-01 10:10:11] File 1 completed, found 2091 groups (Elapsed: 409.71s)
-[2025-07-01 10:10:11] Processing file 2/2: 20250701000000-3h-enfo-ef.grib2
-Completed scan_grib for s3://ecmwf-forecasts/20250701/00z/ifs/0p25/enfo/20250701000000-3h-enfo-ef.grib2, found 8007 messages
-Completed index files and found 8007 entries in it
-Found 2091 matching indices
-[2025-07-01 10:17:27] File 2 completed, found 2091 groups (Elapsed: 436.43s)
-[2025-07-01 10:17:27] File processing completed. Total groups: 4182 (Elapsed: 846.14s)
-[2025-07-01 10:17:27] Skipping standard grib_tree (credentials issue) - proceeding with fixed_ensemble_grib_tree
-[2025-07-01 10:17:27] Created output directory: e_20250701_00
-[2025-07-01 10:17:27] Starting fixed_ensemble_grib_tree processing
-Found 41 unique paths from 4182 messages
-  str/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  ro/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  u100/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  q/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  tprate/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  u10/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  tp/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  ttr/accum/nominalTop: 102 groups, 51 ensemble members, 1 levels
-  fg10/max/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  lsm/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  v100/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  asn/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  mx2t3/max/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  ewss/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  v10/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  sp/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  mn2t3/min/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  msl/instant/meanSea: 102 groups, 51 ensemble members, 1 levels
-  nsss/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  vo/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  skt/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  sithick/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  sve/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  gh/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  tcw/instant/entireAtmosphere: 102 groups, 51 ensemble members, 0 levels
-  t2m/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  strd/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  v/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  mucape/instant/mostUnstableParcel: 102 groups, 51 ensemble members, 1 levels
-  u/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  svn/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  ssr/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  w/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  d/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  d2m/instant/heightAboveGround: 102 groups, 51 ensemble members, 1 levels
-  tcwv/instant/entireAtmosphere: 102 groups, 51 ensemble members, 0 levels
-  t/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-  ptype/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  zos/instant/surface: 102 groups, 51 ensemble members, 1 levels
-  ssrd/accum/surface: 102 groups, 51 ensemble members, 1 levels
-  r/instant/isobaricInhPa: 102 groups, 51 ensemble members, 1 levels
-Processing str/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-/opt/conda/envs/itt/lib/python3.11/site-packages/kerchunk/combine.py:376: UserWarning: Concatenated coordinate 'time' contains less than expectednumber of values across the datasets: [1751328000]
-  warnings.warn(
-Processing ro/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing u100/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing q/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing tprate/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing u10/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing tp/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing ttr/accum/nominalTop with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'nominalTop']
-Processing fg10/max/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing lsm/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing v100/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing asn/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing mx2t3/max/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-/opt/conda/envs/itt/lib/python3.11/site-packages/kerchunk/combine.py:376: UserWarning: Concatenated coordinate 'step' contains less than expectednumber of values across the datasets: [3]
-  warnings.warn(
-Processing ewss/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing v10/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing sp/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing mn2t3/min/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing msl/instant/meanSea with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'meanSea']
-Processing nsss/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing vo/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing skt/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing sithick/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing sve/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing gh/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing tcw/instant/entireAtmosphere with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude']
-Processing t2m/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing strd/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing v/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing mucape/instant/mostUnstableParcel with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'mostUnstableParcel']
-Processing u/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing svn/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing ssr/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing w/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing d/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing d2m/instant/heightAboveGround with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'heightAboveGround']
-Processing tcwv/instant/entireAtmosphere with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude']
-Processing t/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-Processing ptype/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing zos/instant/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing ssrd/accum/surface with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'surface']
-Processing r/instant/isobaricInhPa with concat_dims=['time', 'step', 'number'], identical_dims=['longitude', 'latitude', 'isobaricInhPa']
-[2025-07-01 10:19:30] Ensemble tree built with 9303 references (Elapsed: 123.17s)
-[2025-07-01 10:19:30] Saving raw ensemble tree to JSON
-[2025-07-01 10:19:30] Saved raw ensemble tree to e_20250701_00/ensemble_tree_raw.json (Elapsed: 0.03s)
-[2025-07-01 10:19:30] Creating deflated store for parquet
-[2025-07-01 10:19:30] Deflated store created (Elapsed: 0.02s)
-[2025-07-01 10:19:30] Saving deflated store as parquet file
-Parquet file saved to e_20250701_00/ecmwf_20250701_00z_ensemble.parquet
-[2025-07-01 10:19:30] Parquet file saved: e_20250701_00/ecmwf_20250701_00z_ensemble.parquet (Elapsed: 0.02s)
+## References
 
-Total refs in ensemble tree: 9303
-Total refs in deflated store: 981
+- [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
+- [ECMWF on AWS](https://registry.opendata.aws/ecmwf-forecasts/)
+- [Kerchunk Documentation](https://fsspec.github.io/kerchunk/)
+- [Zarr v3 Specification](https://zarr.readthedocs.io/)
 
-Sample keys from ensemble tree:
-['.zgroup', 'str/.zgroup', 'str/.zattrs', 'ro/.zgroup', 'ro/.zattrs', 'u100/.zgroup', 'u100/.zattrs', 'q/.zgroup', 'q/.zattrs', 'tprate/.zgroup']
-[2025-07-01 10:19:30] Opening with xarray datatree
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-/tmp/test_run_ecmwf_step1_scangrib.py:940: FutureWarning: In a future version of xarray decode_timedelta will default to False rather than None. To silence this warning, set decode_timedelta to True, False, or a 'CFTimedeltaCoder' instance.
-  egfs_dt = xr.open_datatree(fsspec.filesystem(
-[2025-07-01 10:19:32] DataTree opened successfully (Elapsed: 1.17s)
-[2025-07-01 10:19:32] Saving DataTree structure analysis
-DataTree structure saved to e_20250701_00/datatree_structure.json
-[2025-07-01 10:19:32] DataTree structure saved (Elapsed: 0.00s)
+## Acknowledgements
 
-DataTree keys: ['asn', 'd', 'd2m', 'ewss', 'fg10', 'gh', 'lsm', 'mn2t3', 'msl', 'mucape', 'mx2t3', 'nsss', 'ptype', 'q', 'r', 'ro', 'sithick', 'skt', 'sp', 'ssr', 'ssrd', 'str', 'strd', 'sve', 'svn', 't', 't2m', 'tcw', 'tcwv', 'tp', 'tprate', 'ttr', 'u', 'u10', 'u100', 'v', 'v10', 'v100', 'vo', 'w', 'zos']
-[2025-07-01 10:19:32] Analyzing t2m variable
+This work was funded in part by:
 
-t2m dimensions: Frozen(ChainMap({}, {}))
-[2025-07-01 10:19:32] Variable analysis completed (Elapsed: 0.00s)
-[2025-07-01 10:19:32] Saving DataTree object as pickle
-[2025-07-01 10:19:32] DataTree object saved to e_20250701_00/egfs_dt.pkl (Elapsed: 0.03s)
-[2025-07-01 10:19:32] Creating processing summary
-[2025-07-01 10:19:32] Processing summary saved (Elapsed: 0.00s)
-[2025-07-01 10:19:32] === Processing complete === (Total time: 970.58s)
-All results saved to: e_20250701_00/
-
-Key files created:
-  - e_20250701_00/ecmwf_20250701_00z_ensemble.parquet (main output for further processing)
-  - e_20250701_00/ensemble_tree_raw.json (raw tree structure)
-  - e_20250701_00/datatree_structure.json (DataTree structure)
-  - e_20250701_00/egfs_dt.pkl (pickled DataTree object)
-  - e_20250701_00/processing_summary.json (processing summary)
-
-Total processing time: 970.58 seconds
-```
-
-
-
-
-
+1. Hazard modeling, impact estimation, climate storylines for event catalogue
+   on drought and flood disasters in the Eastern Africa (E4DRR) project.
+   https://icpac-igad.github.io/e4drr/ United Nations | Complex Risk Analytics
+   Fund (CRAF'd)
+2. The Strengthening Early Warning Systems for Anticipatory Action (SEWAA)
+   Project. https://cgan.icpac.net/
