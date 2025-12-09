@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 import fsspec
 
-PARQUET_FILE = Path("ecmwf_three_stage_20251126_00z/stage3_ens_01_final.parquet")
+PARQUET_FILE = Path("test_ecmwf_three_stage_prebuilt_output/stage3_ens_50_final.parquet")
 
 
 def read_parquet_refs(parquet_path):
