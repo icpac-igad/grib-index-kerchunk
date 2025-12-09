@@ -124,6 +124,18 @@ def discover_variables(zstore):
                         'path_prefix': '/'.join(parts[:-1])
                     }
 
+    # Special handling for tp (precipitation) which has different structure:
+    # tp/accum/surface/tp/X.0.0 (starts from 1, not 0)
+    if 'tp' not in variables:
+        tp_prefix = 'tp/accum/surface/tp'
+        # Check if this path exists by looking for 1.0.0 (tp doesn't have 0.0.0)
+        if f'{tp_prefix}/1.0.0' in zstore:
+            variables['tp'] = {
+                'chunks': [],
+                'path_prefix': tp_prefix
+            }
+            print(f"  Found tp with special path: {tp_prefix}")
+
     # Find all chunks for each variable
     for var_name, var_info in variables.items():
         prefix = var_info['path_prefix']
@@ -308,16 +320,54 @@ def subset_to_region(data_3d, steps, region='global'):
     return data_subset, lats_subset, lons_subset
 
 
-def create_zarr_dataset(variables_data, steps, lats, lons, member_name, region):
-    """Create xarray Dataset from processed variables."""
-    data_vars = {}
+def create_zarr_dataset(variables_data, steps_dict, lats, lons, member_name, region):
+    """Create xarray Dataset from processed variables.
 
+    Args:
+        variables_data: dict of {var_name: data_3d}
+        steps_dict: dict of {var_name: steps} or list of steps (for backward compatibility)
+        lats, lons: coordinate arrays
+        member_name: ensemble member name
+        region: region name
+    """
+    # Handle backward compatibility - if steps_dict is a list, use it for all vars
+    if isinstance(steps_dict, list):
+        steps_dict = {var_name: steps_dict for var_name in variables_data.keys()}
+
+    # Find common steps across all variables
+    all_step_sets = [set(steps_dict[var]) for var in variables_data.keys()]
+    common_steps = sorted(set.intersection(*all_step_sets)) if all_step_sets else []
+
+    # If no common steps, use union and pad with NaN
+    if not common_steps:
+        all_steps_union = sorted(set.union(*all_step_sets))
+        common_steps = all_steps_union
+
+    print(f"    Creating dataset with {len(common_steps)} common steps")
+
+    data_vars = {}
     for var_name, data_3d in variables_data.items():
+        var_steps = steps_dict[var_name]
+
         # Get metadata
         meta = VARIABLE_METADATA.get(var_name, {'long_name': var_name, 'units': 'unknown'})
 
+        # Check if we need to align steps
+        if set(var_steps) == set(common_steps):
+            # Steps match, use data as-is
+            aligned_data = data_3d
+        else:
+            # Need to align - create array with NaN for missing steps
+            aligned_data = np.full((len(common_steps), data_3d.shape[1], data_3d.shape[2]),
+                                   np.nan, dtype=np.float32)
+            step_to_idx = {s: i for i, s in enumerate(common_steps)}
+            for orig_idx, step in enumerate(var_steps):
+                if step in step_to_idx:
+                    aligned_data[step_to_idx[step]] = data_3d[orig_idx]
+            print(f"    Aligned {var_name}: {len(var_steps)} steps -> {len(common_steps)} steps")
+
         data_vars[var_name] = xr.DataArray(
-            data=data_3d,
+            data=aligned_data,
             dims=['step', 'latitude', 'longitude'],
             attrs=meta
         )
@@ -325,7 +375,7 @@ def create_zarr_dataset(variables_data, steps, lats, lons, member_name, region):
     ds = xr.Dataset(
         data_vars=data_vars,
         coords={
-            'step': steps,
+            'step': common_steps,
             'latitude': lats,
             'longitude': lons
         }
@@ -431,7 +481,7 @@ def main(date_str: str, run_str: str, member: str, region: str = 'global',
 
     print(f"\n3. Processing {len(all_variables)} variables...")
     variables_data = {}
-    all_steps = None
+    steps_dict = {}
     total_decode_stats = {'gribberish': 0, 'cfgrib': 0, 'failed': 0}
 
     for var_name, var_info in all_variables.items():
@@ -441,8 +491,7 @@ def main(date_str: str, run_str: str, member: str, region: str = 'global',
         data_subset, lats, lons = subset_to_region(data_3d, steps, region)
 
         variables_data[var_name] = data_subset
-        if all_steps is None:
-            all_steps = steps
+        steps_dict[var_name] = steps
 
         # Accumulate stats
         for key in total_decode_stats:
@@ -453,7 +502,7 @@ def main(date_str: str, run_str: str, member: str, region: str = 'global',
         gc.collect()
 
     print(f"\n4. Creating xarray Dataset...")
-    ds = create_zarr_dataset(variables_data, all_steps, lats, lons, member, region)
+    ds = create_zarr_dataset(variables_data, steps_dict, lats, lons, member, region)
     print(f"  Dataset: {dict(ds.sizes)}")
     print(f"  Variables: {list(ds.data_vars)}")
 
