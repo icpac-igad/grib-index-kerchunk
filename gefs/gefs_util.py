@@ -12,11 +12,12 @@ import pathlib
 import re
 import sys
 import tempfile
+import tarfile
 import time
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable, Union
 import shutil
 import os
 import warnings
@@ -53,6 +54,155 @@ from kerchunk._grib_idx import (
 )
 
 logger = logging.getLogger("gefs-utils-logs")
+
+
+class LocalTarGzMappingManager:
+    """
+    Manages reading parquet mapping files from a local tar.gz archive.
+    This provides an alternative to GCS bucket access for environments without service account credentials.
+    """
+
+    def __init__(self, tar_gz_path: str, extract_dir: Optional[str] = None):
+        """
+        Initialize the local tar.gz mapping manager.
+
+        Args:
+            tar_gz_path: Path to the tar.gz file containing parquet mappings
+            extract_dir: Directory to extract files to (default: temp directory)
+        """
+        self.tar_gz_path = tar_gz_path
+        self._extracted = False
+        self._extract_dir = extract_dir
+        self._temp_dir = None
+        self._file_index = {}
+
+        if not os.path.exists(tar_gz_path):
+            raise FileNotFoundError(f"Tar.gz file not found: {tar_gz_path}")
+
+        # Build index of files in the archive
+        self._build_file_index()
+
+    def _build_file_index(self):
+        """Build an index of parquet files in the archive."""
+        with tarfile.open(self.tar_gz_path, 'r:gz') as tar:
+            for member in tar.getmembers():
+                if member.name.endswith('.parquet'):
+                    # Extract ensemble member and forecast hour from filename
+                    # Pattern: gik-fmrc/gefs/{member}/gefs-time-{date}-{member}-rt{hour}.parquet
+                    basename = os.path.basename(member.name)
+                    parts = basename.replace('.parquet', '').split('-')
+                    if len(parts) >= 4:
+                        # Extract member (e.g., gep01) and hour (e.g., rt003 -> 003)
+                        ensemble_member = parts[3]  # gep01, gep02, etc.
+                        forecast_hour_str = parts[-1]  # rt000, rt003, etc.
+                        if forecast_hour_str.startswith('rt'):
+                            forecast_hour = int(forecast_hour_str[2:])
+                            key = (ensemble_member, forecast_hour)
+                            self._file_index[key] = member.name
+
+        print(f"Indexed {len(self._file_index)} parquet files from {self.tar_gz_path}")
+
+    def extract_all(self, extract_dir: Optional[str] = None) -> str:
+        """
+        Extract all files from the archive.
+
+        Args:
+            extract_dir: Directory to extract to (default: creates temp directory)
+
+        Returns:
+            Path to the extraction directory
+        """
+        if self._extracted and self._extract_dir:
+            return self._extract_dir
+
+        if extract_dir:
+            self._extract_dir = extract_dir
+        elif not self._extract_dir:
+            self._temp_dir = tempfile.mkdtemp(prefix='gefs_mappings_')
+            self._extract_dir = self._temp_dir
+
+        os.makedirs(self._extract_dir, exist_ok=True)
+
+        print(f"Extracting tar.gz to {self._extract_dir}...")
+        with tarfile.open(self.tar_gz_path, 'r:gz') as tar:
+            tar.extractall(self._extract_dir)
+
+        self._extracted = True
+        print(f"Extraction complete.")
+        return self._extract_dir
+
+    def get_mapping_path(self, ensemble_member: str, forecast_hour: int) -> Optional[str]:
+        """
+        Get the path to a specific mapping parquet file.
+
+        Args:
+            ensemble_member: Ensemble member identifier (e.g., 'gep01')
+            forecast_hour: Forecast hour (e.g., 0, 3, 6, ...)
+
+        Returns:
+            Full path to the extracted parquet file, or None if not found
+        """
+        key = (ensemble_member, forecast_hour)
+        if key not in self._file_index:
+            return None
+
+        # Ensure files are extracted
+        if not self._extracted:
+            self.extract_all()
+
+        relative_path = self._file_index[key]
+        full_path = os.path.join(self._extract_dir, relative_path)
+
+        if os.path.exists(full_path):
+            return full_path
+        return None
+
+    def read_mapping(self, ensemble_member: str, forecast_hour: int) -> Optional[pd.DataFrame]:
+        """
+        Read a mapping parquet file directly from the archive without extracting.
+
+        Args:
+            ensemble_member: Ensemble member identifier (e.g., 'gep01')
+            forecast_hour: Forecast hour (e.g., 0, 3, 6, ...)
+
+        Returns:
+            DataFrame with the mapping data, or None if not found
+        """
+        key = (ensemble_member, forecast_hour)
+        if key not in self._file_index:
+            print(f"Warning: No mapping found for {ensemble_member} at forecast hour {forecast_hour}")
+            return None
+
+        member_path = self._file_index[key]
+
+        with tarfile.open(self.tar_gz_path, 'r:gz') as tar:
+            member = tar.getmember(member_path)
+            f = tar.extractfile(member)
+            if f is not None:
+                return pd.read_parquet(io.BytesIO(f.read()))
+
+        return None
+
+    def list_ensemble_members(self) -> List[str]:
+        """List all ensemble members available in the archive."""
+        return sorted(list(set(key[0] for key in self._file_index.keys())))
+
+    def list_forecast_hours(self, ensemble_member: str) -> List[int]:
+        """List all forecast hours available for a specific ensemble member."""
+        return sorted([key[1] for key in self._file_index.keys() if key[0] == ensemble_member])
+
+    def cleanup(self):
+        """Clean up temporary extraction directory."""
+        if self._temp_dir and os.path.exists(self._temp_dir):
+            shutil.rmtree(self._temp_dir)
+            self._temp_dir = None
+            self._extracted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
 
 
 class JSONFormatter(logging.Formatter):
@@ -746,7 +896,7 @@ def cs_create_mapped_index(
 ) -> pd.DataFrame:
     """
     Async wrapper for creating GEFS mapped index with memory management.
-    
+
     Parameters:
     - date_str: Target date for GRIB index reading
     - reference_date_str: Reference date for parquet mapping templates
@@ -763,6 +913,176 @@ def cs_create_mapped_index(
             gcp_service_account_json,
             reference_date_str
         )
+    )
+
+
+def process_single_gefs_file_local(
+    date_str: str,
+    idx: int,
+    datestr: pd.Timestamp,
+    ensemble_member: str,
+    mapping_manager: 'LocalTarGzMappingManager'
+) -> Optional[pd.DataFrame]:
+    """
+    Process a single GEFS file using local tar.gz mappings.
+
+    Parameters:
+    - date_str: Target date for GRIB index reading (where fresh data comes from)
+    - idx: Index for the forecast timestep
+    - datestr: Timestamp for this forecast step
+    - ensemble_member: Ensemble member identifier (e.g., 'gep01')
+    - mapping_manager: LocalTarGzMappingManager instance for reading mappings
+
+    Returns:
+    - DataFrame with mapped index, or None if processing fails
+    """
+    try:
+        # GEFS uses 3-hour intervals
+        forecast_hour = idx * 3
+
+        # Target date: where we get fresh GRIB data and index from
+        fname = f"s3://noaa-gefs-pds/gefs.{date_str}/00/atmos/pgrb2sp25/{ensemble_member}.t00z.pgrb2s.0p25.f{forecast_hour:03d}"
+
+        # Read idx file (fresh binary positions from target date)
+        storage_options = {"anon": True}
+        idxdf = parse_grib_idx(basename=fname, storage_options=storage_options)
+
+        # Read pre-built mapping from local tar.gz
+        deduped_mapping = mapping_manager.read_mapping(ensemble_member, forecast_hour)
+
+        if deduped_mapping is None:
+            print(f"Warning: No mapping found for {ensemble_member} at forecast hour {forecast_hour}")
+            return None
+
+        # Process the mapping
+        idxdf_filtered = idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+        mapped_index = map_from_index(datestr, deduped_mapping, idxdf_filtered)
+
+        return mapped_index
+
+    except Exception as e:
+        print(f'Error in GEFS local processing: {str(e)}')
+        return None
+
+
+def process_gefs_files_local(
+    axes: List[pd.Index],
+    date_str: str,
+    ensemble_member: str,
+    mapping_manager: 'LocalTarGzMappingManager',
+    max_timesteps: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Process GEFS files using local tar.gz mappings (non-async version).
+
+    Parameters:
+    - axes: List of pandas Index objects containing time information
+    - date_str: Target date for GRIB index reading
+    - ensemble_member: Ensemble member identifier (e.g., 'gep01')
+    - mapping_manager: LocalTarGzMappingManager instance for reading mappings
+    - max_timesteps: Optional limit on number of timesteps to process
+
+    Returns:
+    - DataFrame with combined mapped indices
+    """
+    dtaxes = axes[0]
+
+    # Limit timesteps if specified
+    if max_timesteps:
+        dtaxes = dtaxes[:max_timesteps]
+
+    all_results = []
+
+    for idx, datestr in enumerate(dtaxes):
+        result = process_single_gefs_file_local(
+            date_str,
+            idx,
+            datestr,
+            ensemble_member,
+            mapping_manager
+        )
+        if result is not None:
+            all_results.append(result)
+
+        if (idx + 1) % 10 == 0:
+            print(f"Processed {idx + 1}/{len(dtaxes)} timesteps for {ensemble_member}")
+
+    if not all_results:
+        raise ValueError(f"No valid GEFS mapped indices created for date {date_str}, member {ensemble_member}")
+
+    gefs_kind = pd.concat(all_results, ignore_index=True)
+
+    # Process variables similar to GFS workflow
+    gefs_kind_var = gefs_kind.drop_duplicates('varname')
+    var_list = gefs_kind_var['varname'].tolist()
+    var_to_remove = ['pres','dswrf','cape','uswrf','apcp','gust','tmp','rh','ugrd','vgrd','pwat','tcdc','hgt']
+    var1_list = list(filter(lambda x: x not in var_to_remove, var_list))
+
+    print(f"Variables found in gefs_kind: {var_list}")
+    print(f"Variables to be specially processed: {[v for v in var_to_remove if v in var_list]}")
+    print(f"Variables to be kept as-is: {var1_list}")
+
+    gefs_kind1 = gefs_kind.loc[gefs_kind.varname.isin(var1_list)]
+    to_process_df = gefs_kind[gefs_kind['varname'].isin(var_to_remove)]
+
+    # Debug pwat specifically
+    if 'pwat' in var_list:
+        pwat_df = gefs_kind[gefs_kind['varname'] == 'pwat']
+        print(f"PWAT entries before processing: {len(pwat_df)}")
+        print(f"PWAT typeOfLevel values: {pwat_df['typeOfLevel'].unique()}")
+
+    processed_df = process_gefs_dataframe(to_process_df, var_to_remove)
+
+    # Debug pwat after processing
+    if 'pwat' in var_to_remove:
+        pwat_processed = processed_df[processed_df['varname'] == 'pwat']
+        print(f"PWAT entries after processing: {len(pwat_processed)}")
+        if not pwat_processed.empty:
+            print(f"PWAT typeOfLevel after processing: {pwat_processed['typeOfLevel'].unique()}")
+        else:
+            print("WARNING: PWAT lost during processing!")
+
+    final_df = pd.concat([gefs_kind1, processed_df], ignore_index=True)
+    final_df = final_df.sort_values(by=['time', 'varname'])
+
+    return final_df
+
+
+def cs_create_mapped_index_local(
+    axes: List[pd.Index],
+    date_str: str,
+    ensemble_member: str,
+    tar_gz_path: str,
+    mapping_manager: Optional['LocalTarGzMappingManager'] = None,
+    max_timesteps: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Create GEFS mapped index using local tar.gz file instead of GCS bucket.
+
+    This is an alternative to cs_create_mapped_index() that doesn't require
+    GCS service account credentials.
+
+    Parameters:
+    - axes: List of pandas Index objects containing time information
+    - date_str: Target date for GRIB index reading
+    - ensemble_member: Ensemble member identifier (e.g., 'gep01')
+    - tar_gz_path: Path to the tar.gz file containing parquet mappings
+    - mapping_manager: Optional pre-initialized LocalTarGzMappingManager (reuse for efficiency)
+    - max_timesteps: Optional limit on number of timesteps to process
+
+    Returns:
+    - DataFrame with combined mapped indices
+    """
+    # Create or reuse mapping manager
+    if mapping_manager is None:
+        mapping_manager = LocalTarGzMappingManager(tar_gz_path)
+
+    return process_gefs_files_local(
+        axes,
+        date_str,
+        ensemble_member,
+        mapping_manager,
+        max_timesteps
     )
 
 
