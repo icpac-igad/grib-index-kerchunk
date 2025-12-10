@@ -4,17 +4,27 @@ ECMWF Three-Stage Multi-Date Processing
 
 Processes multiple dates through the three-stage pipeline:
 - Stage 1: Uses prebuilt parquet from zip files (from ecmwf_ensemble_par_creator_efficient.py)
-- Stage 2: GCS template + fresh index merge (GEFS pattern)
+- Stage 2: Template + fresh index merge (from GCS bucket or local tar.gz file)
 - Stage 3: Final zarr store creation
 
 Creates date-named output folders and zip archives for easy access.
 
 Usage:
+    # Default: uses GCS bucket for templates (requires service account)
     python ecmwf_three_stage_multidate.py
+
+    # Use local tar.gz template file instead of GCS bucket
+    python ecmwf_three_stage_multidate.py --use-local-template
+    python ecmwf_three_stage_multidate.py --use-local-template --local-template-path /path/to/templates.tar.gz
+
     # Or specify dates:
     python ecmwf_three_stage_multidate.py --dates 20251125 20251124 20251123 20251122
+
     # Limit members for testing:
     python ecmwf_three_stage_multidate.py --max-members 5
+
+    # Combine options:
+    python ecmwf_three_stage_multidate.py --dates 20251126 --use-local-template --max-members 5
 """
 
 import pandas as pd
@@ -54,6 +64,9 @@ REFERENCE_DATE = '20240529'
 GCS_BUCKET = 'gik-fmrc'
 GCS_BASE_PATH = 'v2ecmwf_fmrc'
 GCP_SERVICE_ACCOUNT = 'coiled-data-e4drr_202505.json'
+
+# Local template configuration (alternative to GCS)
+LOCAL_TEMPLATE_TAR = 'gik-fmrc-v2ecmwf_fmrc.tar.gz'
 
 # Variables to extract
 FORECAST_DICT = {
@@ -265,9 +278,20 @@ def run_stage1_prebuilt(member_parquets, test_date, test_run):
 # STAGE 2: INDEX + GCS TEMPLATES
 # ==============================================================================
 
-def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir):
-    """Stage 2: INDEX + GCS Templates merge."""
-    log_stage(2, "INDEX + GCS TEMPLATES MERGE (All 85 hours)")
+def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
+                                   use_local_template=False, local_template_path=None):
+    """Stage 2: INDEX + Templates merge (GCS or local).
+
+    Args:
+        test_date: Date string (YYYYMMDD)
+        test_run: Run hour (e.g., '00')
+        test_members: List of member names to process
+        output_dir: Output directory path
+        use_local_template: If True, use local tar.gz file instead of GCS bucket
+        local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
+    """
+    template_source = "LOCAL TAR.GZ" if use_local_template else "GCS BUCKET"
+    log_stage(2, f"INDEX + TEMPLATES MERGE ({template_source}, All 85 hours)")
 
     start_time = time.time()
 
@@ -296,8 +320,10 @@ def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir)
                     run=test_run,
                     member_name=member_normalized,
                     hours=ECMWF_FORECAST_HOURS,
-                    use_gcs_template=True,
-                    gcs_template_date=REFERENCE_DATE
+                    use_gcs_template=not use_local_template,
+                    gcs_template_date=REFERENCE_DATE,
+                    use_local_template=use_local_template,
+                    local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
                 )
 
                 if refs:
@@ -401,7 +427,8 @@ def run_stage3(deflated_stores, stage2_refs, test_date, output_dir):
 # SINGLE DATE PROCESSING
 # ==============================================================================
 
-def process_single_date(date_str: str, run: str, max_members: Optional[int] = None) -> Tuple[bool, Optional[Path]]:
+def process_single_date(date_str: str, run: str, max_members: Optional[int] = None,
+                        use_local_template: bool = False, local_template_path: Optional[str] = None) -> Tuple[bool, Optional[Path]]:
     """
     Process a single date through all three stages.
 
@@ -409,6 +436,8 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
     - date_str: Date string (e.g., '20251125')
     - run: Run hour (e.g., '00')
     - max_members: Maximum number of members to process (optional)
+    - use_local_template: If True, use local tar.gz file instead of GCS bucket
+    - local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
 
     Returns:
     - Tuple of (success, output_directory_path)
@@ -465,7 +494,11 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
             return False, None
 
         # Stage 2
-        stage2_refs = run_stage2_with_gcs_templates(date_str, run, test_members, output_dir)
+        stage2_refs = run_stage2_with_gcs_templates(
+            date_str, run, test_members, output_dir,
+            use_local_template=use_local_template,
+            local_template_path=local_template_path
+        )
 
         # Stage 3
         stage3_results = None
@@ -507,6 +540,10 @@ def main():
     parser.add_argument('--run', type=str, default='00', help='Run hour (default: 00)')
     parser.add_argument('--max-members', type=int, default=None, help='Maximum members per date')
     parser.add_argument('--no-zip', action='store_true', help='Skip creating zip archives')
+    parser.add_argument('--use-local-template', action='store_true',
+                        help='Use local tar.gz file instead of GCS bucket for templates')
+    parser.add_argument('--local-template-path', type=str, default=None,
+                        help=f'Path to local template tar.gz file (default: {LOCAL_TEMPLATE_TAR})')
     args = parser.parse_args()
 
     print("="*80)
@@ -522,6 +559,11 @@ def main():
     log_message(f"Run: {run}z")
     if args.max_members:
         log_message(f"Max members per date: {args.max_members}")
+    if args.use_local_template:
+        template_path = args.local_template_path or LOCAL_TEMPLATE_TAR
+        log_message(f"Using LOCAL template: {template_path}")
+    else:
+        log_message(f"Using GCS bucket template: gs://{GCS_BUCKET}/{GCS_BASE_PATH}")
 
     # Track results
     processing_results = {}
@@ -531,7 +573,11 @@ def main():
 
     for date_str in dates:
         # Process single date
-        success, output_dir = process_single_date(date_str, run, args.max_members)
+        success, output_dir = process_single_date(
+            date_str, run, args.max_members,
+            use_local_template=args.use_local_template,
+            local_template_path=args.local_template_path
+        )
 
         if success and output_dir is not None:
             # Create zip archive
