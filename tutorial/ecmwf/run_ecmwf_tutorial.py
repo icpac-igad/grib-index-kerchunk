@@ -1,96 +1,84 @@
 #!/usr/bin/env python3
 """
-ECMWF Grib-Index-Kerchunk (GIK) Tutorial
-=========================================
+ECMWF Grib-Index-Kerchunk (GIK) Tutorial - Full Three-Stage Pipeline
+=====================================================================
 
-This tutorial demonstrates how to use the GIK method to efficiently access
-ECMWF IFS (Integrated Forecasting System) ensemble forecast data from AWS S3
-without downloading full GRIB files.
+This tutorial demonstrates the complete GIK method for ECMWF data:
+- Stage 1: Scan GRIB files to create deflated parquet (OPTIONAL - ~30 min)
+- Stage 2: Merge fresh index with template metadata (fast)
+- Stage 3: Create final zarr-compatible parquet files
 
-The GIK method:
-1. Downloads small .index files from S3 to get byte offsets
-2. Merges with template metadata from tar.gz
-3. Creates parquet files with step_XXX format for data streaming
+The tutorial uses:
+- process_single_date from ecmwf_three_stage_multidate.py
+- Stage 1 processing from ecmwf_ensemble_par_creator_efficient.py
 
 Prerequisites:
     pip install kerchunk zarr xarray pandas numpy fsspec s3fs requests
 
 Usage:
+    # Full pipeline (includes Stage 1 - takes ~30 minutes)
+    python run_ecmwf_tutorial.py --run-stage1
+
+    # Skip Stage 1 if zip file already exists (fast)
     python run_ecmwf_tutorial.py
 
+    # Process specific date
+    python run_ecmwf_tutorial.py --date 20260106 --run-stage1
+
+    # Limit members for faster Stage 1 testing
+    python run_ecmwf_tutorial.py --run-stage1 --max-members 3
+
 Template Source:
-    Hugging Face: https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/blob/main/gik-fmrc-v2ecmwf_fmrc.tar.gz
+    Hugging Face: https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz
 
 Author: ICPAC GIK Team
 """
 
-import pandas as pd
-import numpy as np
-import json
 import os
 import sys
-import warnings
-import tarfile
-import tempfile
-import shutil
 import time
-import re
+import json
+import zipfile
+import argparse
+import warnings
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Any
 
-import fsspec
-
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # Set up anonymous S3 access for ECMWF data
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
+# Add parent ecmwf directory to path for imports
+SCRIPT_DIR = Path(__file__).resolve().parent
+ECMWF_DIR = SCRIPT_DIR.parent.parent / "ecmwf"
+sys.path.insert(0, str(ECMWF_DIR))
+
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
-# Hugging Face URL for pre-built ECMWF templates
+# Hugging Face URL for pre-built ECMWF templates (used in Stage 2)
 TEMPLATE_URL = "https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz"
 LOCAL_TEMPLATE_FILE = "gik-fmrc-v2ecmwf_fmrc.tar.gz"
 
-# Reference date (date the templates were built from)
-REFERENCE_DATE = '20240529'
+# Default target date and run
+DEFAULT_TARGET_DATE = '20260106'  # YYYYMMDD format
+DEFAULT_TARGET_RUN = '00'         # Model run time (00 or 12)
 
-# Target date to process (change this to process different dates)
-TARGET_DATE = '20241201'  # YYYYMMDD format - use a recent date with available data
-TARGET_RUN = '00'         # Model run time (00 or 12)
+# ECMWF forecast hours for Stage 1 (subset for tutorial speed)
+# Full: 85 timesteps (0-144h at 3h, 150-360h at 6h)
+# Tutorial: First 2 timesteps for fast demo
+TUTORIAL_HOURS = [0, 3]  # Just 2 hours for fast Stage 1 demo
 
-# Ensemble members to process
-# control = deterministic control run
-# ens01-ens50 = perturbed ensemble members
-ENSEMBLE_MEMBERS = ['control', 'ens01', 'ens02', 'ens03']  # Process 4 members for demo
-
-# Output directory for parquet files
+# Output directory
 OUTPUT_DIR = Path("output_parquet")
 
-# S3 configuration
-S3_BUCKET = "ecmwf-forecasts"
 
-# ECMWF forecast hours (85 total)
-# 3-hourly from 0-144h, then 6-hourly from 150-360h
-HOURS_3H = list(range(0, 145, 3))     # 0-144h at 3h intervals (49 steps)
-HOURS_6H = list(range(150, 361, 6))   # 150-360h at 6h intervals (36 steps)
-ECMWF_FORECAST_HOURS = HOURS_3H + HOURS_6H  # Total: 85 steps
-
-# For tutorial, limit to first 25 timesteps (0-72h) for faster processing
-TUTORIAL_FORECAST_HOURS = list(range(0, 73, 3))  # 0, 3, 6, ..., 72h (25 steps)
-
-print("="*70)
-print("ECMWF Grib-Index-Kerchunk Tutorial")
-print("="*70)
-print(f"Reference Date (template): {REFERENCE_DATE}")
-print(f"Target Date: {TARGET_DATE}")
-print(f"Model Run: {TARGET_RUN}Z")
-print(f"Ensemble Members: {', '.join(ENSEMBLE_MEMBERS)}")
-print(f"Forecast Hours: {len(TUTORIAL_FORECAST_HOURS)} timesteps (T+0 to T+{TUTORIAL_FORECAST_HOURS[-1]}h)")
-print("="*70)
+def log_message(msg: str, level: str = "INFO"):
+    """Print timestamped log message."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {level}: {msg}")
 
 
 # ==============================================================================
@@ -99,18 +87,20 @@ print("="*70)
 
 def download_template_file(url: str, local_path: str) -> bool:
     """Download the pre-built template tar.gz from Hugging Face."""
-    print(f"\n[Step 1] Downloading template file from Hugging Face...")
+    print(f"\n{'='*70}")
+    print("[Step 1] Downloading template file from Hugging Face")
+    print(f"{'='*70}")
 
     if os.path.exists(local_path):
         file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"  Template file already exists: {local_path} ({file_size_mb:.1f} MB)")
+        log_message(f"Template file already exists: {local_path} ({file_size_mb:.1f} MB)")
         return True
 
     try:
         import requests
 
-        print(f"  URL: {url}")
-        print(f"  Downloading... (this may take a few minutes)")
+        log_message(f"URL: {url}")
+        log_message("Downloading... (this may take a few minutes)")
 
         response = requests.get(url, stream=True)
         response.raise_for_status()
@@ -128,322 +118,215 @@ def download_template_file(url: str, local_path: str) -> bool:
 
         print()
         file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"  Downloaded: {local_path} ({file_size_mb:.1f} MB)")
+        log_message(f"Downloaded: {local_path} ({file_size_mb:.1f} MB)")
         return True
 
     except Exception as e:
-        print(f"  Error downloading template: {e}")
-        print(f"  Please download manually from: {url}")
+        log_message(f"Error downloading template: {e}", "ERROR")
+        log_message(f"Please download manually from: {url}", "ERROR")
         return False
 
 
 # ==============================================================================
-# STEP 2: Parse ECMWF Index Files
+# STEP 2: Run Stage 1 - GRIB Scanning (Optional, ~30 minutes)
 # ==============================================================================
 
-def parse_grib_index(idx_url: str, member_filter: str) -> List[Dict]:
-    """
-    Parse ECMWF GRIB index file (JSON format) to extract byte ranges and metadata.
-
-    The .index files on S3 contain JSON entries with:
-    - _offset: byte offset in GRIB file
-    - _length: byte length of message
-    - param: variable name (e.g., '2t', 'tp')
-    - levtype: level type (e.g., 'sfc', 'pl')
-    - number: ensemble member number (0=control, 1-50=perturbed)
-    """
-    try:
-        fs = fsspec.filesystem("s3", anon=True)
-
-        entries = []
-        with fs.open(idx_url, 'r') as f:
-            for line_num, line in enumerate(f):
-                if not line.strip():
-                    continue
-
-                # Parse JSON entry
-                entry_data = json.loads(line.strip())
-
-                # Parse ensemble member number
-                member_num = int(entry_data.get('number', 0))
-                if member_num == 0:
-                    member = 'control'
-                else:
-                    member = f'ens{member_num:02d}'
-
-                # Filter by member if specified
-                if member_filter and member != member_filter:
-                    continue
-
-                # Extract metadata
-                entry = {
-                    'byte_offset': entry_data['_offset'],
-                    'byte_length': entry_data['_length'],
-                    'variable': entry_data.get('param', ''),
-                    'level': entry_data.get('levtype', ''),
-                    'step': entry_data.get('step', '0'),
-                    'member': member,
-                    'date': entry_data.get('date', ''),
-                    'time': entry_data.get('time', ''),
-                }
-
-                entries.append(entry)
-
-        return entries
-
-    except Exception as e:
-        print(f"      Warning: Error parsing index {idx_url}: {e}")
-        return []
-
-
-def create_references_from_index(grib_url: str, idx_entries: List[Dict]) -> Dict[str, Any]:
-    """
-    Create kerchunk-style references using index byte ranges.
-
-    Creates references in the format: [url, offset, length]
-    """
-    references = {}
-
-    for entry in idx_entries:
-        start = entry['byte_offset']
-        length = entry['byte_length']
-        variable = entry['variable']
-        level = entry['level']
-        member = entry['member']
-
-        # Create reference key: varname/level/member/0.0.0
-        if level == 'sfc':
-            level_str = 'sfc'
-        elif level == 'pl':
-            level_str = 'pl'
-        else:
-            level_str = level
-
-        # Normalize member name
-        if member == 'control':
-            member_str = 'control'
-        else:
-            member_str = member.replace('ens', 'ens_')
-
-        key = f"{variable}/{level_str}/{member_str}/0.0.0"
-
-        # Create reference [url, offset, length]
-        references[key] = [grib_url, start, length]
-
-    return references
-
-
-# ==============================================================================
-# STEP 3: Build Complete Parquet from Index Files
-# ==============================================================================
-
-def build_parquet_from_indices(
+def run_stage1_processing(
     date_str: str,
     run: str,
-    member_name: str,
-    hours: List[int],
-    template_metadata: Dict
-) -> Dict[str, Any]:
+    max_members: int = None,
+    hours: list = None
+) -> Path:
     """
-    Build complete parquet with all time steps using S3 index files.
+    Run Stage 1 processing using ecmwf_ensemble_par_creator_efficient.py
 
-    For each forecast hour:
-    1. Download the .index file from S3
-    2. Parse it to get byte offsets for this member
-    3. Create references with step_XXX prefix
+    This scans GRIB files to create the deflated parquet files needed
+    for the three-stage pipeline.
 
-    Then merge with template metadata.
+    Returns the path to the created zip file, or None if failed.
     """
-    all_refs = {}
+    print(f"\n{'='*70}")
+    print("[Step 2] Running Stage 1 - GRIB Scanning")
+    print(f"{'='*70}")
+    log_message("This step takes ~30 minutes for full processing")
+    log_message(f"Date: {date_str}, Run: {run}z")
 
-    # Normalize member name for filtering
-    if member_name == 'control':
-        filter_member = 'control'
-    else:
-        filter_member = member_name.replace('ens', 'ens').replace('_', '')
-
-    print(f"    Processing {len(hours)} forecast hours...")
-
-    successful_hours = 0
-    for i, hour in enumerate(hours):
-        try:
-            # Build URLs
-            idx_url = f"s3://{S3_BUCKET}/{date_str}/{run}z/ifs/0p25/enfo/{date_str}000000-{hour}h-enfo-ef.index"
-            grib_url = f"s3://{S3_BUCKET}/{date_str}/{run}z/ifs/0p25/enfo/{date_str}000000-{hour}h-enfo-ef"
-
-            # Parse index for this member
-            idx_entries = parse_grib_index(idx_url, member_filter=filter_member)
-
-            if not idx_entries:
-                continue
-
-            # Create references
-            hour_refs = create_references_from_index(grib_url, idx_entries)
-
-            # Add to combined references with step_XXX prefix
-            for key, ref in hour_refs.items():
-                timestep_key = f"step_{hour:03d}/{key}"
-                all_refs[timestep_key] = ref
-
-            successful_hours += 1
-
-            # Progress logging
-            if i == 0 or (i + 1) % 10 == 0 or i == len(hours) - 1:
-                print(f"      T+{hour:03d}h: {len(hour_refs)} variables ({successful_hours}/{i+1} hours)")
-
-        except Exception as e:
-            print(f"      T+{hour:03d}h: Error - {str(e)[:50]}")
-
-    # Merge with template metadata
-    merged_refs = {**template_metadata, **all_refs}
-
-    print(f"    Completed: {successful_hours}/{len(hours)} hours, {len(all_refs)} data chunks")
-    return merged_refs
-
-
-# ==============================================================================
-# STEP 4: Load Template Metadata
-# ==============================================================================
-
-def load_template_metadata(tar_gz_path: str, member_name: str) -> Dict:
-    """
-    Load template metadata (.zarray, .zattrs) from tar.gz archive.
-
-    The templates contain zarr structure metadata that defines:
-    - Grid dimensions and data types
-    - Variable attributes and names
-    - Coordinate information
-    """
-    # Build member path pattern
-    if member_name == 'control':
-        member_dir = 'ens_control'
-    else:
-        member_num_str = member_name.replace('ens', '')
-        member_dir = f'ens_{int(member_num_str):02d}'
-
-    print(f"    Loading template metadata: {member_dir}")
-
-    metadata_refs = {}
-    temp_dir = tempfile.mkdtemp(prefix='ecmwf_template_')
+    if hours is None:
+        hours = TUTORIAL_HOURS
 
     try:
-        with tarfile.open(tar_gz_path, 'r:gz') as tar:
-            # Find first parquet file for this member (they all have same metadata)
-            member_files = [m for m in tar.getnames()
-                           if f'/{member_dir}/' in m and m.endswith('.par')]
+        # Import Stage 1 functions
+        from ecmwf_ensemble_par_creator_efficient import (
+            process_ecmwf_files_efficiently,
+            extract_individual_member_parquets,
+            save_processing_metadata
+        )
+        import fsspec
 
-            if not member_files:
-                print(f"      No template files found for {member_dir}")
-                return {}
+        log_message("Imported functions from ecmwf_ensemble_par_creator_efficient.py")
 
-            # Extract and read first template file
-            tar.extract(tar.getmember(member_files[0]), path=temp_dir)
-            extracted_path = Path(temp_dir) / member_files[0]
-            template_df = pd.read_parquet(extracted_path)
+        # Create output directory for Stage 1
+        stage1_output_dir = Path(f"ecmwf_{date_str}_{run}_efficient")
+        stage1_output_dir.mkdir(exist_ok=True)
+        log_message(f"Stage 1 output directory: {stage1_output_dir}")
 
-            # Extract only metadata keys (.zarray, .zattrs, etc.)
-            for _, row in template_df.iterrows():
-                key = row['key']
-                value = row['value']
+        # Build list of GRIB files to process
+        ecmwf_files = []
+        for hour in hours:
+            url = f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/{date_str}{run}0000-{hour}h-enfo-ef.grib2"
+            ecmwf_files.append(url)
 
-                # Only keep metadata (not data chunks)
-                if '.z' in key or key.startswith('zarr') or key == 'metadata':
-                    if isinstance(value, bytes):
-                        try:
-                            value = value.decode('utf-8')
-                        except:
-                            pass
-                    metadata_refs[key] = value
+        log_message(f"Processing {len(ecmwf_files)} GRIB files for hours: {hours}")
 
-            print(f"      Loaded {len(metadata_refs)} metadata entries")
+        # Check file availability
+        fs = fsspec.filesystem("s3", anon=True)
+        available_files = []
+        for f in ecmwf_files:
+            try:
+                if fs.exists(f):
+                    available_files.append(f)
+                    log_message(f"  Found: {f.split('/')[-1]}")
+                else:
+                    log_message(f"  Not found: {f.split('/')[-1]}", "WARNING")
+            except Exception as e:
+                log_message(f"  Error checking {f}: {e}", "WARNING")
 
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if not available_files:
+            log_message("No GRIB files found on S3!", "ERROR")
+            return None
 
-    return metadata_refs
-
-
-# ==============================================================================
-# STEP 5: Save Parquet File
-# ==============================================================================
-
-def save_parquet_file(refs: Dict, output_path: str):
-    """Save references as parquet file."""
-    data = []
-
-    for key, value in refs.items():
-        if isinstance(value, str):
-            encoded_value = value.encode('utf-8')
-        elif isinstance(value, (list, dict)):
-            encoded_value = json.dumps(value).encode('utf-8')
-        elif isinstance(value, bytes):
-            encoded_value = value
+        # Define target members
+        if max_members:
+            # Control (-1) + first N-1 ensemble members
+            target_members = [-1] + list(range(1, max_members))
         else:
-            encoded_value = str(value).encode('utf-8')
+            # All 51 members: control + ens01-ens50
+            target_members = [-1] + list(range(1, 51))
 
-        data.append((key, encoded_value))
+        log_message(f"Target members: {len(target_members)} (control + {len(target_members)-1} ensemble)")
 
-    df = pd.DataFrame(data, columns=['key', 'value'])
-    df.to_parquet(output_path)
+        # Run Stage 1 processing
+        stage1_start = time.time()
 
-    file_size_kb = os.path.getsize(output_path) / 1024
-    print(f"    Saved: {output_path} ({file_size_kb:.1f} KB, {len(df)} rows)")
+        results = process_ecmwf_files_efficiently(
+            available_files,
+            date_str,
+            run,
+            stage1_output_dir
+        )
+
+        # Extract individual member parquets
+        extraction_results = extract_individual_member_parquets(
+            results['ensemble_tree'],
+            stage1_output_dir,
+            target_members
+        )
+
+        # Save metadata
+        save_processing_metadata(
+            results,
+            extraction_results,
+            stage1_output_dir,
+            date_str,
+            run
+        )
+
+        stage1_time = time.time() - stage1_start
+        log_message(f"Stage 1 completed in {stage1_time/60:.1f} minutes")
+
+        # Create zip file for process_single_date
+        zip_path = create_stage1_zip(stage1_output_dir, date_str, run)
+
+        return zip_path
+
+    except ImportError as e:
+        log_message(f"Import error: {e}", "ERROR")
+        log_message(f"Make sure ecmwf_ensemble_par_creator_efficient.py is in: {ECMWF_DIR}", "ERROR")
+        return None
+    except Exception as e:
+        log_message(f"Stage 1 failed: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
-# ==============================================================================
-# STEP 6: Validate Output
-# ==============================================================================
+def create_stage1_zip(stage1_dir: Path, date_str: str, run: str) -> Path:
+    """Create zip file from Stage 1 output for process_single_date."""
+    zip_filename = f"ecmwf_{date_str}_{run}z_efficient.zip"
+    zip_path = Path(zip_filename)
 
-def validate_parquet(parquet_path: str) -> bool:
-    """Validate that the parquet file was created successfully."""
-    print(f"\n  Validating: {parquet_path}")
+    log_message(f"Creating Stage 1 zip file: {zip_path}")
 
     try:
-        df = pd.read_parquet(parquet_path)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in stage1_dir.rglob('*'):
+                if file_path.is_file():
+                    arcname = file_path.relative_to(stage1_dir.parent)
+                    zipf.write(file_path, arcname)
 
-        # Count entries
-        print(f"    Total entries: {len(df)}")
-
-        # Count data chunks (step_XXX format)
-        data_chunks = 0
-        step_hours = set()
-        variables = set()
-
-        for _, row in df.iterrows():
-            key = row['key']
-
-            # Check for step_XXX format
-            match = re.match(r'^step_(\d+)/([^/]+)/', key)
-            if match:
-                data_chunks += 1
-                step_hours.add(int(match.group(1)))
-                variables.add(match.group(2))
-
-        print(f"    Data chunks (step_XXX format): {data_chunks}")
-        print(f"    Forecast hours covered: {len(step_hours)}")
-        if step_hours:
-            print(f"      Range: T+{min(step_hours)}h to T+{max(step_hours)}h")
-        print(f"    Variables found: {len(variables)}")
-        if variables:
-            sample_vars = sorted(variables)[:10]
-            print(f"      Sample: {', '.join(sample_vars)}")
-
-        # Show sample data chunk keys
-        sample_keys = [k for k in df['key'].tolist() if k.startswith('step_')][:3]
-        if sample_keys:
-            print(f"    Sample data chunk keys:")
-            for key in sample_keys:
-                print(f"      - {key}")
-
-        if data_chunks > 0:
-            print(f"    Validation PASSED")
-            return True
-        else:
-            print(f"    Validation FAILED: No data chunks found")
-            return False
+        zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+        log_message(f"Created zip: {zip_path} ({zip_size_mb:.2f} MB)")
+        return zip_path
 
     except Exception as e:
-        print(f"    Validation failed: {e}")
+        log_message(f"Error creating zip: {e}", "ERROR")
+        return None
+
+
+# ==============================================================================
+# STEP 3: Run Three-Stage Pipeline using process_single_date
+# ==============================================================================
+
+def run_three_stage_pipeline(
+    date_str: str,
+    run: str,
+    template_path: str,
+    max_members: int = None
+) -> bool:
+    """
+    Run the complete three-stage pipeline using process_single_date
+    from ecmwf_three_stage_multidate.py.
+
+    This requires the Stage 1 zip file to exist.
+    """
+    print(f"\n{'='*70}")
+    print("[Step 3] Running Three-Stage Pipeline (process_single_date)")
+    print(f"{'='*70}")
+
+    try:
+        # Import the main processing function
+        from ecmwf_three_stage_multidate import process_single_date
+
+        log_message("Imported process_single_date from ecmwf_three_stage_multidate.py")
+        log_message(f"Date: {date_str}, Run: {run}z")
+        log_message(f"Template: {template_path}")
+        log_message(f"Max members: {max_members if max_members else 'all'}")
+
+        # Run the three-stage pipeline with local template
+        success, output_dir = process_single_date(
+            date_str=date_str,
+            run=run,
+            max_members=max_members,
+            use_local_template=True,
+            local_template_path=template_path
+        )
+
+        if success:
+            log_message(f"Three-stage pipeline completed successfully!")
+            log_message(f"Output directory: {output_dir}")
+            return True
+        else:
+            log_message("Three-stage pipeline failed!", "ERROR")
+            return False
+
+    except ImportError as e:
+        log_message(f"Import error: {e}", "ERROR")
+        log_message(f"Make sure ecmwf_three_stage_multidate.py is in: {ECMWF_DIR}", "ERROR")
+        return False
+    except Exception as e:
+        log_message(f"Pipeline failed: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -453,109 +336,117 @@ def validate_parquet(parquet_path: str) -> bool:
 
 def main():
     """Run the complete ECMWF GIK tutorial."""
-    print("\nStarting ECMWF Grib-Index-Kerchunk Tutorial\n")
+    parser = argparse.ArgumentParser(
+        description='ECMWF GIK Tutorial - Full Three-Stage Pipeline'
+    )
+    parser.add_argument('--date', type=str, default=DEFAULT_TARGET_DATE,
+                        help=f'Target date (YYYYMMDD, default: {DEFAULT_TARGET_DATE})')
+    parser.add_argument('--run', type=str, default=DEFAULT_TARGET_RUN,
+                        help=f'Model run hour (default: {DEFAULT_TARGET_RUN})')
+    parser.add_argument('--run-stage1', action='store_true',
+                        help='Run Stage 1 GRIB scanning (takes ~30 min, skip if zip exists)')
+    parser.add_argument('--max-members', type=int, default=None,
+                        help='Maximum number of members to process')
+    parser.add_argument('--hours', type=str, default=None,
+                        help='Forecast hours for Stage 1 (comma-separated, e.g., "0,3,6")')
+    args = parser.parse_args()
+
+    target_date = args.date
+    target_run = args.run
+
+    # Parse hours if provided
+    if args.hours:
+        stage1_hours = [int(h.strip()) for h in args.hours.split(',')]
+    else:
+        stage1_hours = TUTORIAL_HOURS
+
+    # Print configuration
+    print("="*70)
+    print("ECMWF Grib-Index-Kerchunk Tutorial")
+    print("="*70)
+    print(f"Target Date: {target_date}")
+    print(f"Model Run: {target_run}Z")
+    print(f"Run Stage 1: {'Yes' if args.run_stage1 else 'No (use existing zip)'}")
+    print(f"Max Members: {args.max_members if args.max_members else 'all'}")
+    print(f"Stage 1 Hours: {stage1_hours}")
+    print(f"ECMWF Module Path: {ECMWF_DIR}")
+    print("="*70)
 
     start_time = time.time()
 
-    # Step 1: Download template file
-    print("="*70)
+    # Step 1: Download template file (always needed for Stage 2)
     if not download_template_file(TEMPLATE_URL, LOCAL_TEMPLATE_FILE):
-        print("Failed to download template file. Exiting.")
+        log_message("Failed to download template file. Exiting.", "ERROR")
         return False
 
-    # Step 2: Create output directory
-    print("\n[Step 2] Creating output directory...")
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    print(f"  Output directory: {OUTPUT_DIR}")
+    # Step 2: Check for Stage 1 zip or run Stage 1
+    zip_patterns = [
+        f"ecmwf_{target_date}_{target_run}z_efficient.zip",
+        f"ecmwf_{target_date}_{target_run}_efficient.zip"
+    ]
 
-    # Step 3: Process ensemble members
-    print("\n[Step 3] Processing ensemble members...")
-    print("="*70)
+    zip_file = None
+    for pattern in zip_patterns:
+        if Path(pattern).exists():
+            zip_file = Path(pattern)
+            break
 
-    successful = []
-    failed = []
-
-    for member in ENSEMBLE_MEMBERS:
-        print(f"\n  Processing member: {member}")
-
-        try:
-            # Load template metadata
-            template_metadata = load_template_metadata(LOCAL_TEMPLATE_FILE, member)
-
-            if not template_metadata:
-                print(f"    Failed to load template for {member}")
-                failed.append(member)
-                continue
-
-            # Build parquet from index files
-            refs = build_parquet_from_indices(
-                date_str=TARGET_DATE,
-                run=TARGET_RUN,
-                member_name=member,
-                hours=TUTORIAL_FORECAST_HOURS,
-                template_metadata=template_metadata
+    if zip_file:
+        log_message(f"Found existing Stage 1 zip: {zip_file}")
+        if args.run_stage1:
+            log_message("--run-stage1 specified, but zip exists. Using existing zip.")
+    else:
+        if args.run_stage1:
+            # Run Stage 1 to create the zip
+            zip_file = run_stage1_processing(
+                target_date,
+                target_run,
+                max_members=args.max_members,
+                hours=stage1_hours
             )
-
-            if not refs:
-                print(f"    Failed to build parquet for {member}")
-                failed.append(member)
-                continue
-
-            # Save parquet file
-            if member == 'control':
-                output_filename = "stage3_control_final.parquet"
-            else:
-                member_num = member.replace('ens', '')
-                output_filename = f"stage3_ens_{int(member_num):02d}_final.parquet"
-
-            output_path = OUTPUT_DIR / output_filename
-            save_parquet_file(refs, str(output_path))
-            successful.append(member)
-
-        except Exception as e:
-            print(f"    Error processing {member}: {e}")
-            import traceback
-            traceback.print_exc()
-            failed.append(member)
-
-    # Step 4: Validate outputs
-    print("\n[Step 4] Validating output files...")
-    print("="*70)
-
-    if successful:
-        # Validate first successful member
-        if 'control' in successful:
-            sample_parquet = OUTPUT_DIR / "stage3_control_final.parquet"
+            if not zip_file:
+                log_message("Stage 1 failed. Cannot continue.", "ERROR")
+                return False
         else:
-            member_num = successful[0].replace('ens', '')
-            sample_parquet = OUTPUT_DIR / f"stage3_ens_{int(member_num):02d}_final.parquet"
-        validate_parquet(str(sample_parquet))
+            log_message(f"Stage 1 zip file not found: {zip_patterns[0]}", "ERROR")
+            log_message("Options:", "ERROR")
+            log_message("  1. Run with --run-stage1 to create it (~30 min)", "ERROR")
+            log_message("  2. Download pre-built zip if available", "ERROR")
+            return False
+
+    # Step 3: Run three-stage pipeline
+    success = run_three_stage_pipeline(
+        date_str=target_date,
+        run=target_run,
+        template_path=LOCAL_TEMPLATE_FILE,
+        max_members=args.max_members
+    )
 
     # Summary
     total_time = time.time() - start_time
 
-    print("\n" + "="*70)
+    print(f"\n{'='*70}")
     print("TUTORIAL COMPLETE!")
-    print("="*70)
+    print(f"{'='*70}")
     print(f"\nProcessing Summary:")
-    print(f"  Target Date: {TARGET_DATE} {TARGET_RUN}Z")
-    print(f"  Forecast Hours: T+{TUTORIAL_FORECAST_HOURS[0]}h to T+{TUTORIAL_FORECAST_HOURS[-1]}h")
-    print(f"  Members Processed: {len(successful)}")
-    print(f"  Members Failed: {len(failed)}")
+    print(f"  Target Date: {target_date} {target_run}Z")
+    print(f"  Pipeline Success: {'Yes' if success else 'No'}")
     print(f"  Total Time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
 
-    print(f"\nOutput Files:")
-    for pf in sorted(OUTPUT_DIR.glob("*.parquet")):
-        size_kb = pf.stat().st_size / 1024
-        print(f"  - {pf.name} ({size_kb:.1f} KB)")
+    # List output files
+    output_dir = Path(f"ecmwf_three_stage_{target_date}_{target_run}z")
+    if output_dir.exists():
+        print(f"\nOutput Files in {output_dir}:")
+        for pf in sorted(output_dir.glob("*.parquet")):
+            size_kb = pf.stat().st_size / 1024
+            print(f"  - {pf.name} ({size_kb:.1f} KB)")
 
     print(f"\nNext Steps:")
-    print(f"  1. Run run_ecmwf_data_streaming.py to stream data and create plots")
-    print(f"  2. Process more members by adding to ENSEMBLE_MEMBERS list")
-    print(f"  3. Change TARGET_DATE to process different forecast dates")
-    print(f"  4. Set TUTORIAL_FORECAST_HOURS = ECMWF_FORECAST_HOURS for all 85 timesteps")
+    print(f"  1. Run run_ecmwf_data_streaming_v1.py to stream data and create plots")
+    print(f"  2. Process different date: python run_ecmwf_tutorial.py --date YYYYMMDD --run-stage1")
+    print(f"  3. Process more members: python run_ecmwf_tutorial.py --max-members 10")
 
-    return len(successful) > 0
+    return success
 
 
 if __name__ == "__main__":
