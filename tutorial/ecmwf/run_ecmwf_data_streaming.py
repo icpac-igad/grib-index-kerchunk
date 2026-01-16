@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
 """
-ECMWF Data Streaming V2 - Memory-Efficient with Disk-Based Storage
+ECMWF Data Streaming V2 - For 20260106 Three-Stage Parquet Files
 ===================================================================
 
-This script demonstrates how to use the parquet reference files to stream ECMWF
-ensemble data and create precipitation exceedance probability plots.
-
-Key Features:
-- Uses gribberish for fast GRIB decoding (~80x faster than cfgrib)
-- Uses disk-based zarr storage to avoid memory issues with large ensembles
-- Processes members one at a time, writing to disk immediately
-- Creates elaborate 24-hour rainfall exceedance probability plots
-- Uses ea_ghcf_simple.geojson for East Africa boundary overlay
-- Follows plotting style from run_gefs_24h_accumulation.py
-
-Prerequisites:
-    pip install kerchunk zarr xarray pandas numpy fsspec s3fs gribberish
-    pip install matplotlib cartopy geopandas
-
-Usage:
-    python run_ecmwf_data_streaming_v2.py
+Modified version to process the full 51-member ensemble from:
+ecmwf_three_stage_20260106_00z/
 
 Author: ICPAC GIK Team
 """
@@ -38,10 +23,14 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fsspec
 import zarr
 from zarr.codecs import BloscCodec
+
+# Number of parallel S3 fetches (ECMWF S3 is slow, parallelism helps)
+MAX_PARALLEL_FETCHES = 8
 
 # Try to import gribberish for fast decoding
 try:
@@ -50,7 +39,6 @@ try:
 except ImportError:
     GRIBBERISH_AVAILABLE = False
     print("Warning: gribberish not available, will use cfgrib only")
-    print("Install with: pip install gribberish")
 
 # Try to import plotting libraries
 try:
@@ -62,20 +50,16 @@ try:
 except ImportError:
     PLOTTING_AVAILABLE = False
     print("Warning: matplotlib/cartopy/geopandas not available for plotting")
-    print("Install with: pip install matplotlib cartopy geopandas")
 
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
-
-# Set up anonymous S3 access for ECMWF data
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION - Modified for 20260106 data
 # ==============================================================================
 
-# Directory containing parquet files from run_ecmwf_tutorial.py
-PARQUET_DIR = Path("output_parquet")
+# Directory containing parquet files
+PARQUET_DIR = Path("ecmwf_three_stage_20260106_00z")
 
 # GeoJSON boundary file for plotting
 BOUNDARY_JSON = Path(__file__).parent / "ea_ghcf_simple.geojson"
@@ -88,7 +72,7 @@ LON_MIN, LON_MAX = 21, 53
 THRESHOLDS_24H = [5, 25, 50, 75, 100, 125]
 
 # ECMWF grid specification (0.25 degree global)
-ECMWF_GRID_SHAPE = (721, 1440)  # lat x lon
+ECMWF_GRID_SHAPE = (721, 1440)
 ECMWF_LATS = np.linspace(90, -90, 721)
 ECMWF_LONS = np.linspace(-180, 179.75, 1440)
 
@@ -98,7 +82,7 @@ EAT_OFFSET = 3
 # Output directory for plots
 OUTPUT_DIR = Path("output_plots")
 
-# Temporary zarr storage directory (to avoid memory issues)
+# Temporary zarr storage directory
 TEMP_ZARR_DIR = Path("temp_zarr_cache")
 
 
@@ -124,7 +108,6 @@ def read_parquet_refs(parquet_path: str) -> Dict:
                     value = decoded
             except:
                 value = value
-
         elif isinstance(value, str):
             if value.startswith('[') or value.startswith('{'):
                 try:
@@ -141,20 +124,25 @@ def discover_precipitation_chunks_ecmwf(zstore: Dict, member_name: str) -> List[
     """
     Discover precipitation chunks for ECMWF data.
 
-    ECMWF format: step_XXX/tp/sfc/member/0.0.0
-
-    Returns list of (step_hours, key, reference) tuples.
+    Handles both formats:
+    - step_XXX/tp/sfc/control/0.0.0
+    - step_XXX/tp/sfc/ensXX/0.0.0 (without underscore)
     """
     chunks = []
 
-    # Pattern: step_XXX/tp/sfc/member/0.0.0
-    pattern = re.compile(rf'^step_(\d+)/tp/sfc/{re.escape(member_name)}/0\.0\.0$')
+    # Try both patterns - with and without underscore
+    patterns = [
+        re.compile(rf'^step_(\d+)/tp/sfc/{re.escape(member_name)}/0\.0\.0$'),
+        re.compile(rf'^step_(\d+)/tp/sfc/{re.escape(member_name.replace("_", ""))}/0\.0\.0$'),
+    ]
 
     for key, value in zstore.items():
-        match = pattern.match(key)
-        if match and isinstance(value, list) and len(value) >= 3:
-            step_hours = int(match.group(1))
-            chunks.append((step_hours, key, value))
+        for pattern in patterns:
+            match = pattern.match(key)
+            if match and isinstance(value, list) and len(value) >= 3:
+                step_hours = int(match.group(1))
+                chunks.append((step_hours, key, value))
+                break
 
     chunks.sort(key=lambda x: x[0])
     return chunks
@@ -178,6 +166,23 @@ def extract_model_date_from_zstore(zstore: Dict) -> Tuple[datetime, int]:
     return model_date, run_hour
 
 
+def get_ea_indices() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Get East Africa subset indices and coordinates."""
+    lat_mask = (ECMWF_LATS >= LAT_MIN) & (ECMWF_LATS <= LAT_MAX)
+    lon_mask = (ECMWF_LONS >= LON_MIN) & (ECMWF_LONS <= LON_MAX)
+
+    lat_indices = np.where(lat_mask)[0]
+    lon_indices = np.where(lon_mask)[0]
+
+    lats = ECMWF_LATS[lat_indices[0]:lat_indices[-1]+1]
+    lons = ECMWF_LONS[lon_indices[0]:lon_indices[-1]+1]
+
+    return lat_indices, lon_indices, lats, lons
+
+
+LAT_INDICES, LON_INDICES, EA_LATS, EA_LONS = get_ea_indices()
+
+
 def fetch_grib_bytes(ref: List, fs) -> Tuple[bytes, int]:
     """Fetch GRIB bytes from S3 using the reference."""
     if not isinstance(ref, list) or len(ref) < 3:
@@ -185,7 +190,6 @@ def fetch_grib_bytes(ref: List, fs) -> Tuple[bytes, int]:
 
     url, offset, length = ref[0], ref[1], ref[2]
 
-    # Add .grib2 extension if missing (ECMWF S3 files require it)
     if not url.endswith('.grib2'):
         url = url + '.grib2'
 
@@ -197,7 +201,7 @@ def fetch_grib_bytes(ref: List, fs) -> Tuple[bytes, int]:
 
 
 def decode_with_gribberish(grib_bytes: bytes, grid_shape=ECMWF_GRID_SHAPE) -> np.ndarray:
-    """Decode GRIB bytes using gribberish (fast path)."""
+    """Decode GRIB bytes using gribberish."""
     if not GRIBBERISH_AVAILABLE:
         raise RuntimeError("gribberish not available")
 
@@ -207,7 +211,7 @@ def decode_with_gribberish(grib_bytes: bytes, grid_shape=ECMWF_GRID_SHAPE) -> np
 
 
 def decode_with_cfgrib(grib_bytes: bytes) -> np.ndarray:
-    """Decode GRIB bytes using cfgrib (fallback path)."""
+    """Decode GRIB bytes using cfgrib."""
     import tempfile
 
     with tempfile.NamedTemporaryFile(delete=False, suffix='.grib2') as tmp:
@@ -226,7 +230,7 @@ def decode_with_cfgrib(grib_bytes: bytes) -> np.ndarray:
 
 
 def decode_grib_hybrid(grib_bytes: bytes, grid_shape=ECMWF_GRID_SHAPE) -> Tuple[np.ndarray, str]:
-    """Decode GRIB with gribberish, fallback to cfgrib on failure."""
+    """Decode GRIB with gribberish, fallback to cfgrib."""
     if GRIBBERISH_AVAILABLE:
         try:
             array_2d = decode_with_gribberish(grib_bytes, grid_shape)
@@ -234,56 +238,33 @@ def decode_grib_hybrid(grib_bytes: bytes, grid_shape=ECMWF_GRID_SHAPE) -> Tuple[
         except Exception:
             pass
 
-    # Fallback to cfgrib
     array_2d = decode_with_cfgrib(grib_bytes)
     return array_2d, 'cfgrib'
 
 
-def get_ea_indices() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Get East Africa subset indices and coordinates."""
-    lat_mask = (ECMWF_LATS >= LAT_MIN) & (ECMWF_LATS <= LAT_MAX)
-    lon_mask = (ECMWF_LONS >= LON_MIN) & (ECMWF_LONS <= LON_MAX)
-
-    lat_indices = np.where(lat_mask)[0]
-    lon_indices = np.where(lon_mask)[0]
-
-    lats = ECMWF_LATS[lat_indices[0]:lat_indices[-1]+1]
-    lons = ECMWF_LONS[lon_indices[0]:lon_indices[-1]+1]
-
-    return lat_indices, lon_indices, lats, lons
-
-
-# Calculate East Africa region indices once
-LAT_INDICES, LON_INDICES, EA_LATS, EA_LONS = get_ea_indices()
-
-
 # ==============================================================================
-# ZARR-BASED STORAGE FOR MEMORY EFFICIENCY
+# ZARR STORAGE
 # ==============================================================================
 
 def create_temp_zarr_store(n_members: int, n_timesteps: int, n_lats: int, n_lons: int,
                            date_str: str, run_str: str) -> Tuple[zarr.Group, Path]:
-    """Create temporary zarr store for holding ensemble data on disk."""
-    # Create temporary directory
+    """Create temporary zarr store."""
     temp_dir = TEMP_ZARR_DIR / f"ecmwf_{date_str}_{run_str}z_{int(time.time())}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n  Creating temporary zarr store: {temp_dir}")
 
-    # Create zarr store
     store = zarr.open_group(str(temp_dir), mode='w')
 
-    # Create arrays with chunking optimized for member-by-member access
     store.create_dataset(
         'precipitation',
         shape=(n_members, n_timesteps, n_lats, n_lons),
-        chunks=(1, n_timesteps, n_lats, n_lons),  # One member per chunk
+        chunks=(1, n_timesteps, n_lats, n_lons),
         dtype=np.float32,
         fill_value=np.nan,
         compressors=[BloscCodec(cname='lz4', clevel=3)]
     )
 
-    # Store timesteps for each member (to track variable lengths)
     store.create_dataset(
         'timesteps',
         shape=(n_members, n_timesteps),
@@ -291,7 +272,6 @@ def create_temp_zarr_store(n_members: int, n_timesteps: int, n_lats: int, n_lons
         fill_value=-1
     )
 
-    # Store metadata
     store.attrs['n_members'] = n_members
     store.attrs['n_timesteps'] = n_timesteps
     store.attrs['n_lats'] = n_lats
@@ -311,6 +291,16 @@ def cleanup_temp_zarr_store(temp_dir: Path):
 # DATA STREAMING
 # ==============================================================================
 
+def fetch_chunk_parallel(args):
+    """Fetch a single chunk - helper for parallel execution."""
+    idx, step_hours, chunk_key, ref, fs = args
+    try:
+        grib_bytes, length = fetch_grib_bytes(ref, fs)
+        return idx, step_hours, grib_bytes, None
+    except Exception as e:
+        return idx, step_hours, None, str(e)
+
+
 def stream_single_member_precipitation_ecmwf(
     parquet_path: str,
     zarr_store: zarr.Group,
@@ -318,73 +308,87 @@ def stream_single_member_precipitation_ecmwf(
     member_name: str,
     fs
 ) -> Tuple[bool, List[int]]:
-    """
-    Stream precipitation data for a single ECMWF ensemble member.
-
-    Returns:
-        (success, list of timesteps loaded)
-    """
-    print(f"\n  Streaming {member_name}...")
+    """Stream precipitation data for a single ECMWF ensemble member with parallel S3 fetching."""
+    print(f"\n  [{member_idx+1}] Streaming {member_name}...")
 
     start_time = time.time()
 
     try:
-        # Read parquet references
         zstore = read_parquet_refs(parquet_path)
-
-        # Discover precipitation chunks
         chunks = discover_precipitation_chunks_ecmwf(zstore, member_name)
 
         if not chunks:
             print(f"    No precipitation data found for {member_name}")
             return False, []
 
-        print(f"    Found {len(chunks)} timesteps")
+        n_chunks = len(chunks)
+        print(f"    Found {n_chunks} timesteps")
+        print(f"    Fetching with {MAX_PARALLEL_FETCHES} parallel connections...")
 
-        # Stream and decode all timesteps, writing directly to zarr
+        # Prepare fetch arguments
+        fetch_args = [
+            (i, step_hours, chunk_key, ref, fs)
+            for i, (step_hours, chunk_key, ref) in enumerate(chunks)
+        ]
+
+        # Parallel fetch all GRIB bytes
+        fetch_start = time.time()
+        grib_data = {}  # idx -> (step_hours, grib_bytes, error)
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FETCHES) as executor:
+            futures = {executor.submit(fetch_chunk_parallel, args): args[0] for args in fetch_args}
+            for future in as_completed(futures):
+                idx, step_hours, grib_bytes, error = future.result()
+                grib_data[idx] = (step_hours, grib_bytes, error)
+
+        fetch_elapsed = time.time() - fetch_start
+        fetched_count = sum(1 for v in grib_data.values() if v[1] is not None)
+        print(f"    Fetched {fetched_count}/{n_chunks} in {fetch_elapsed:.1f}s ({fetch_elapsed/n_chunks:.2f}s avg)")
+
+        # Decode sequentially (gribberish is fast, no need to parallelize)
+        decode_start = time.time()
         decode_stats = {'gribberish': 0, 'cfgrib': 0, 'failed': 0}
         timesteps_loaded = []
 
-        for i, (step_hours, chunk_key, ref) in enumerate(chunks):
-            try:
-                # Fetch GRIB bytes
-                grib_bytes, _ = fetch_grib_bytes(ref, fs)
+        for i in range(n_chunks):
+            step_hours, grib_bytes, fetch_error = grib_data[i]
 
-                # Decode using hybrid approach
+            if fetch_error:
+                print(f"      Step {step_hours:3d}h: FETCH FAILED - {fetch_error[:50]}")
+                decode_stats['failed'] += 1
+                zarr_store['precipitation'][member_idx, i, :, :] = np.nan
+                continue
+
+            try:
                 array_2d, decoder = decode_grib_hybrid(grib_bytes)
 
                 decode_stats[decoder] += 1
                 timesteps_loaded.append(step_hours)
 
-                # Subset to East Africa and write to zarr immediately
                 data_subset = array_2d[LAT_INDICES[0]:LAT_INDICES[-1]+1,
                                        LON_INDICES[0]:LON_INDICES[-1]+1]
 
                 zarr_store['precipitation'][member_idx, i, :, :] = data_subset.astype(np.float32)
                 zarr_store['timesteps'][member_idx, i] = step_hours
 
-                # Progress logging
-                n_chunks = len(chunks)
                 if i < 2 or i >= n_chunks - 2:
                     print(f"      Step {step_hours:3d}h: decoded [{decoder}]")
                 elif i == 2:
                     print(f"      ... processing {n_chunks - 4} more steps ...")
 
             except Exception as e:
-                print(f"      Step {step_hours:3d}h: FAILED - {str(e)[:50]}")
+                print(f"      Step {step_hours:3d}h: DECODE FAILED - {str(e)[:50]}")
                 decode_stats['failed'] += 1
-                # Fill with NaN for failed chunks
                 zarr_store['precipitation'][member_idx, i, :, :] = np.nan
 
+        decode_elapsed = time.time() - decode_start
         elapsed = time.time() - start_time
         print(f"    Completed: gribberish={decode_stats['gribberish']}, "
               f"cfgrib={decode_stats['cfgrib']}, "
               f"failed={decode_stats['failed']}, "
-              f"time={elapsed:.1f}s")
+              f"time={elapsed:.1f}s (fetch={fetch_elapsed:.1f}s, decode={decode_elapsed:.1f}s)")
 
-        # Force garbage collection to free memory
         gc.collect()
-
         return True, timesteps_loaded
 
     except Exception as e:
@@ -395,31 +399,11 @@ def stream_single_member_precipitation_ecmwf(
 
 
 # ==============================================================================
-# 24-HOUR PRECIPITATION ACCUMULATION
+# 24-HOUR PRECIPITATION
 # ==============================================================================
 
-def convert_cumulative_to_24h_precip(
-    data_3d: np.ndarray,
-    timesteps: List[int]
-) -> Tuple[np.ndarray, List[int]]:
-    """
-    Convert ECMWF cumulative precipitation to 24-hour accumulated precipitation.
-
-    ECMWF tp is cumulative from T+0, so to get 24h accumulation:
-    - For T+24: tp(T+24) - tp(T+0)
-    - For T+48: tp(T+48) - tp(T+24)
-    - etc.
-
-    Also converts from meters to mm (multiply by 1000).
-
-    Args:
-        data_3d: Cumulative precipitation array (time, lat, lon) in meters
-        timesteps: List of forecast hours (e.g., [0, 3, 6, 9, 12, ..., 72])
-
-    Returns:
-        Tuple of (24h_precip_array, 24h_valid_times)
-    """
-    # Find pairs of timesteps that are 24 hours apart
+def convert_cumulative_to_24h_precip(data_3d: np.ndarray, timesteps: List[int]) -> Tuple[np.ndarray, List[int]]:
+    """Convert ECMWF cumulative precipitation to 24-hour accumulated."""
     timestep_to_idx = {ts: i for i, ts in enumerate(timesteps)}
 
     periods_24h = []
@@ -431,18 +415,14 @@ def convert_cumulative_to_24h_precip(
             start_idx = timestep_to_idx[start_hour]
             end_idx = timestep_to_idx[end_hour]
 
-            # Calculate 24h accumulation: end - start, convert m to mm
             precip_24h = (data_3d[end_idx] - data_3d[start_idx]) * 1000.0
-
-            # Ensure non-negative (numerical precision issues)
             precip_24h = np.maximum(precip_24h, 0.0)
 
             periods_24h.append(precip_24h)
             valid_hours.append(end_hour)
 
     if not periods_24h:
-        # If no 24h periods available, fall back to using raw cumulative values converted to mm
-        print("    Warning: No 24h periods found, using cumulative values converted to mm")
+        print("    Warning: No 24h periods found")
         return data_3d * 1000.0, timesteps
 
     return np.stack(periods_24h, axis=0).astype(np.float32), valid_hours
@@ -453,18 +433,9 @@ def calculate_exceedance_probabilities_from_zarr(
     n_members: int,
     thresholds: List[float]
 ) -> Tuple[Dict, int, int, List[int]]:
-    """
-    Calculate probability of exceeding thresholds from zarr-stored ensemble data.
-
-    Returns:
-        probabilities: dict with structure {day_idx: {threshold: probability_array}}
-        n_valid_members: number of valid ensemble members
-        n_24h_periods: number of 24-hour forecast periods
-        valid_24h_hours: list of ending hours for each 24h period
-    """
+    """Calculate probability of exceeding thresholds."""
     print(f"\n  Calculating 24-hour accumulations and probabilities...")
 
-    # First pass: determine structure from first member with valid data
     first_member_data = None
     first_member_timesteps = None
 
@@ -480,60 +451,52 @@ def calculate_exceedance_probabilities_from_zarr(
                 break
 
     if first_member_data is None:
-        print("    Error: No valid data found in any member")
+        print("    Error: No valid data found")
         return {}, 0, 0, []
 
-    # Convert first member to get 24h structure
     first_24h, valid_24h_hours = convert_cumulative_to_24h_precip(
         first_member_data, first_member_timesteps
     )
     n_24h_periods = len(valid_24h_hours)
     spatial_shape = first_24h.shape[1:]
 
-    print(f"    24h periods ending at hours: {valid_24h_hours}")
+    print(f"    24h periods ending at hours: {valid_24h_hours[:5]}...{valid_24h_hours[-3:] if len(valid_24h_hours) > 5 else ''}")
+    print(f"    Number of 24h periods: {n_24h_periods}")
     print(f"    Spatial shape: {spatial_shape}")
 
-    # Initialize probability accumulators (counting exceeding members)
     exceedance_counts = {}
     for day_idx in range(n_24h_periods):
         exceedance_counts[day_idx] = {}
         for threshold in thresholds:
             exceedance_counts[day_idx][threshold] = np.zeros(spatial_shape, dtype=np.int32)
 
-    # Process each member
     valid_members = 0
     for member_idx in range(n_members):
         try:
-            # Get timesteps for this member
             timesteps = zarr_store['timesteps'][member_idx, :]
             valid_timesteps = [int(ts) for ts in timesteps if ts >= 0]
 
             if len(valid_timesteps) == 0:
                 continue
 
-            # Load data for this member
             data = zarr_store['precipitation'][member_idx, :len(valid_timesteps), :, :]
 
-            # Check if data is valid
             if np.all(np.isnan(data)):
                 continue
 
-            # Convert to 24h accumulations
             data_24h, member_24h_hours = convert_cumulative_to_24h_precip(data, valid_timesteps)
 
             valid_members += 1
 
-            # Count exceedances for each period and threshold
             for day_idx, hour in enumerate(member_24h_hours):
                 if hour in valid_24h_hours:
                     target_idx = valid_24h_hours.index(hour)
                     for threshold in thresholds:
                         exceedance_counts[target_idx][threshold] += (data_24h[day_idx] >= threshold).astype(np.int32)
 
-            if (member_idx + 1) % 5 == 0:
+            if (member_idx + 1) % 10 == 0:
                 print(f"    Processed {member_idx + 1}/{n_members} members")
 
-            # Force garbage collection
             del data, data_24h
             gc.collect()
 
@@ -542,7 +505,6 @@ def calculate_exceedance_probabilities_from_zarr(
 
     print(f"    Valid members: {valid_members}/{n_members}")
 
-    # Convert counts to probabilities
     probabilities = {}
     for day_idx in range(n_24h_periods):
         probabilities[day_idx] = {}
@@ -556,7 +518,7 @@ def calculate_exceedance_probabilities_from_zarr(
 
 
 # ==============================================================================
-# PLOTTING FUNCTIONS
+# PLOTTING
 # ==============================================================================
 
 def load_geojson_boundaries(json_file: Path):
@@ -586,99 +548,75 @@ def create_24h_probability_plot(
     run_hour: int,
     output_dir: Path = None
 ) -> Optional[str]:
-    """
-    Create multi-panel plot showing 24h rainfall exceedance probabilities.
-
-    The plot has rows for each 24-hour period and columns for each threshold.
-    """
+    """Create multi-panel probability plot."""
     if not PLOTTING_AVAILABLE:
-        print("  Plotting not available - skipping visualization")
+        print("  Plotting not available")
         return None
 
-    # Create figure
-    fig, axes = plt.subplots(n_days, len(THRESHOLDS_24H),
-                            figsize=(4*len(THRESHOLDS_24H), 4*n_days),
+    # Limit to first 10 days for reasonable plot size
+    n_days_to_plot = min(n_days, 10)
+
+    fig, axes = plt.subplots(n_days_to_plot, len(THRESHOLDS_24H),
+                            figsize=(4*len(THRESHOLDS_24H), 4*n_days_to_plot),
                             subplot_kw={'projection': ccrs.PlateCarree()})
 
-    # Handle single row or column
-    if n_days == 1:
+    if n_days_to_plot == 1:
         axes = axes.reshape(1, -1)
     elif len(THRESHOLDS_24H) == 1:
         axes = axes.reshape(-1, 1)
 
-    # Common color levels
     levels = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     colors = ['white', '#FFFFCC', '#FFFF99', '#FFCC66', '#FF9933',
               '#FF6600', '#FF3300', '#CC0000', '#990000', '#660000']
 
-    # Load boundaries
     gdf = load_geojson_boundaries(BOUNDARY_JSON)
-
-    # Calculate base datetime (model run time)
     base_datetime = model_date + timedelta(hours=run_hour)
 
-    # Plot each panel
-    for day_idx in range(n_days):
+    for day_idx in range(n_days_to_plot):
         ending_hour = valid_24h_hours[day_idx]
 
         for t_idx, threshold in enumerate(THRESHOLDS_24H):
             ax = axes[day_idx, t_idx]
 
-            # Get probability data
             prob_data = probabilities[day_idx][threshold]
 
-            # Create contour plot
             cf = ax.contourf(lons, lats, prob_data, levels=levels, colors=colors,
                            transform=ccrs.PlateCarree(), extend='neither')
 
-            # Add 50% contour line
             ax.contour(lons, lats, prob_data, levels=[50],
                       colors='black', linewidths=1, alpha=0.7,
                       transform=ccrs.PlateCarree())
 
-            # Add boundaries from GeoJSON
             if gdf is not None:
                 ax.add_geometries(gdf["geometry"], crs=ccrs.PlateCarree(),
                                 facecolor="none", edgecolor="black", linewidth=0.8)
 
-            # Add coastlines and features (as backup)
             ax.add_feature(cfeature.COASTLINE, linewidth=0.5, color='gray', alpha=0.5)
             ax.add_feature(cfeature.LAND, alpha=0.1)
-
-            # Set extent
             ax.set_extent([LON_MIN, LON_MAX, LAT_MIN, LAT_MAX])
 
-            # Calculate actual forecast dates
             start_datetime = base_datetime + timedelta(hours=ending_hour - 24)
             end_datetime = base_datetime + timedelta(hours=ending_hour)
-
-            # Convert to East Africa Time
             start_eat = start_datetime + timedelta(hours=EAT_OFFSET)
             end_eat = end_datetime + timedelta(hours=EAT_OFFSET)
 
-            # Format title based on column
             max_prob = np.nanmax(prob_data)
 
-            if t_idx == 0:  # First column - show full date information
-                if day_idx == 0:  # First row - show threshold header
+            if t_idx == 0:
+                if day_idx == 0:
                     title = f'>{threshold}mm\n'
                 else:
                     title = ''
-
-                # Add date range in EAT
                 title += f'{start_eat.strftime("%Y-%m-%d %H:%M")} EAT\n'
                 title += f'to {end_eat.strftime("%Y-%m-%d %H:%M")} EAT\n'
                 title += f'Max: {max_prob:.0f}%'
-
                 ax.set_title(title, fontsize=9, pad=10)
             else:
-                # Other columns - just show threshold and max probability
                 if day_idx == 0:
                     ax.set_title(f'>{threshold}mm\nMax: {max_prob:.0f}%', fontsize=10)
                 else:
                     ax.set_title(f'Max: {max_prob:.0f}%', fontsize=10)
 
-            # Add gridlines to first column
             if t_idx == 0:
                 gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
                                 linewidth=0.3, color='gray', alpha=0.3, linestyle='--')
@@ -687,12 +625,10 @@ def create_24h_probability_plot(
                 gl.xlabel_style = {'size': 8}
                 gl.ylabel_style = {'size': 8}
 
-    # Add common colorbar
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
     cbar = plt.colorbar(cf, cax=cbar_ax)
     cbar.set_label('Probability (%)', rotation=270, labelpad=20)
 
-    # Overall title with model run information
     model_run_str = f'{model_date.strftime("%Y-%m-%d")} {run_hour:02d}:00 UTC'
     model_run_eat = f'{model_date.strftime("%Y-%m-%d")} {(run_hour + EAT_OFFSET) % 24:02d}:00 EAT'
 
@@ -701,7 +637,6 @@ def create_24h_probability_plot(
                  f'Based on {n_members} ensemble members | Coverage: {LAT_MIN}N-{LAT_MAX}N, {LON_MIN}E-{LON_MAX}E',
                  fontsize=14, y=0.98)
 
-    # Save figure
     date_str = model_date.strftime('%Y%m%d')
     if output_dir:
         output_dir.mkdir(exist_ok=True)
@@ -718,16 +653,17 @@ def create_24h_probability_plot(
 
 
 # ==============================================================================
-# MAIN ROUTINE
+# MAIN
 # ==============================================================================
 
 def main():
-    """Main processing routine with memory-efficient zarr-based storage."""
+    """Main processing routine."""
     print("="*70)
-    print("ECMWF Data Streaming V2 - Memory Efficient")
+    print("ECMWF Data Streaming - 20260106 Full Ensemble")
     print("="*70)
     print(f"Gribberish Available: {GRIBBERISH_AVAILABLE}")
     print(f"Plotting Available: {PLOTTING_AVAILABLE}")
+    print(f"Parquet Directory: {PARQUET_DIR}")
     print(f"East Africa Region: {len(EA_LATS)} x {len(EA_LONS)} grid points")
     print("="*70)
 
@@ -735,13 +671,11 @@ def main():
     temp_zarr_path = None
 
     try:
-        # Check if parquet directory exists
         if not PARQUET_DIR.exists():
             print(f"\nError: Parquet directory {PARQUET_DIR} not found!")
-            print(f"Run run_ecmwf_tutorial.py first to create parquet files.")
             return False
 
-        # Find parquet files (stage3_ens_XX_final.parquet or stage3_control_final.parquet)
+        # Find all stage3 parquet files
         parquet_files = sorted(PARQUET_DIR.glob("stage3_ens_*_final.parquet"))
         control_file = PARQUET_DIR / "stage3_control_final.parquet"
         if control_file.exists():
@@ -749,16 +683,15 @@ def main():
 
         if not parquet_files:
             print(f"\nError: No parquet files found in {PARQUET_DIR}")
-            print("Expected files named: stage3_control_final.parquet, stage3_ens_XX_final.parquet")
             return False
 
         print(f"\nFound {len(parquet_files)} parquet files")
-        for pf in parquet_files[:3]:
+        for pf in parquet_files[:5]:
             print(f"  - {pf.name}")
-        if len(parquet_files) > 3:
-            print(f"  ... and {len(parquet_files) - 3} more")
+        if len(parquet_files) > 5:
+            print(f"  ... and {len(parquet_files) - 5} more")
 
-        # Extract member names from parquet files
+        # Extract member names - use ens01, ens02, ... ens09, ens10, ... format
         member_names = []
         for pf in parquet_files:
             stem = pf.stem
@@ -767,26 +700,28 @@ def main():
             else:
                 match = re.search(r'ens_?(\d+)', stem)
                 if match:
-                    member_names.append(f'ens_{match.group(1)}')
+                    # Use format with leading zero for single digits: ens01, ens02, etc.
+                    member_num = int(match.group(1))
+                    member_names.append(f'ens{member_num:02d}')
                 else:
                     member_names.append(stem.replace('stage3_', '').replace('_final', ''))
 
-        print(f"Member names: {member_names}")
+        print(f"\nMember names: {member_names[:5]}...{member_names[-3:] if len(member_names) > 5 else ''}")
 
-        # Extract model date from first parquet file
+        # Extract model date
         print("\n[Step 1] Extracting model information...")
         zstore = read_parquet_refs(str(parquet_files[0]))
         model_date, run_hour = extract_model_date_from_zstore(zstore)
         print(f"  Model date: {model_date.strftime('%Y-%m-%d')} {run_hour:02d}Z")
 
-        # Discover timesteps from first member
+        # Discover timesteps
         first_member_name = member_names[0]
         chunks = discover_precipitation_chunks_ecmwf(zstore, first_member_name)
         n_timesteps = len(chunks)
         print(f"  Timesteps per member: {n_timesteps}")
 
         if n_timesteps == 0:
-            print(f"  Error: No precipitation chunks found for member {first_member_name}")
+            print(f"  Error: No precipitation chunks found")
             return False
 
         # Create S3 filesystem
@@ -804,14 +739,14 @@ def main():
         )
         print(f"  Storage shape: ({n_members}, {n_timesteps}, {n_lats}, {n_lons})")
 
-        # Stream data for all ensemble members
+        # Stream data
         print("\n[Step 3] Streaming Precipitation Data")
         print("="*70)
 
         if GRIBBERISH_AVAILABLE:
             print("Using GRIBBERISH for fast data streaming (~80x faster)")
         else:
-            print("Using CFGRIB for data streaming (gribberish not available)")
+            print("Using CFGRIB for data streaming")
 
         successful_members = 0
         for member_idx, (pf, member_name) in enumerate(zip(parquet_files, member_names)):
@@ -824,10 +759,10 @@ def main():
         print(f"\nSuccessfully loaded {successful_members} ensemble members")
 
         if successful_members == 0:
-            print("Error: No data loaded successfully!")
+            print("Error: No data loaded!")
             return False
 
-        # Calculate exceedance probabilities
+        # Calculate probabilities
         print("\n[Step 4] Calculating Exceedance Probabilities")
         print("="*70)
 
@@ -836,19 +771,19 @@ def main():
         )
 
         if n_24h_periods == 0:
-            print("Error: No 24-hour periods could be calculated!")
+            print("Error: No 24-hour periods calculated!")
             return False
 
         print(f"  24h Periods: {n_24h_periods}")
         print(f"  Thresholds: {THRESHOLDS_24H} mm")
         print(f"  Valid Members: {n_valid_members}")
 
-        # Print summary statistics
+        # Summary statistics
         print("\n  Summary Statistics:")
-        for day_idx in range(min(3, n_24h_periods)):  # Show first 3 periods
+        for day_idx in range(min(3, n_24h_periods)):
             ending_hour = valid_24h_hours[day_idx]
             print(f"\n    Period ending T+{ending_hour}h:")
-            for threshold in THRESHOLDS_24H[:3]:  # Show first 3 thresholds
+            for threshold in THRESHOLDS_24H[:3]:
                 max_prob = np.nanmax(probabilities[day_idx][threshold])
                 area_50 = np.sum(probabilities[day_idx][threshold] >= 50)
                 print(f"      >{threshold:3d}mm: Max={max_prob:5.1f}%, P>=50% at {area_50} points")
@@ -878,21 +813,15 @@ def main():
         if plot_file:
             print(f"\nOutput Plot: {plot_file}")
 
-        print("\nNext Steps:")
-        print("  1. Examine the probability plot for flood risk assessment")
-        print("  2. Adjust THRESHOLDS_24H for different rainfall categories")
-        print("  3. Modify LAT/LON bounds for different regions")
-
         return True
 
     except Exception as e:
-        print(f"\nError during processing: {e}")
+        print(f"\nError: {e}")
         import traceback
         traceback.print_exc()
         return False
 
     finally:
-        # Cleanup temporary storage
         if temp_zarr_path and temp_zarr_path.exists():
             cleanup_temp_zarr_store(temp_zarr_path)
 
@@ -902,5 +831,5 @@ if __name__ == "__main__":
     if success:
         print("\nData streaming completed successfully!")
     else:
-        print("\nData streaming failed. Check error messages above.")
+        print("\nData streaming failed.")
         sys.exit(1)
