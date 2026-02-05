@@ -7,13 +7,20 @@ This tutorial demonstrates the complete GIK method for ECMWF data:
 - Stage 1: Scan GRIB files to create deflated parquet (OPTIONAL - ~30 min)
 - Stage 2: Merge fresh index with template metadata (fast)
 - Stage 3: Create final zarr-compatible parquet files
+- Stage 4: Upload parquet files to GCS (for Coiled parallel processing)
 
 The tutorial uses:
 - process_single_date from ecmwf_three_stage_multidate.py
 - Stage 1 processing from ecmwf_ensemble_par_creator_efficient.py
 
 Prerequisites:
-    pip install kerchunk zarr xarray pandas numpy fsspec s3fs requests
+    pip install kerchunk zarr xarray pandas numpy fsspec s3fs requests python-dotenv gcsfs
+
+Environment Configuration:
+    Copy .env.example to .env and configure:
+    - GCS_BUCKET: GCS bucket name (default: gik-fmrc)
+    - GCS_PARQUET_PREFIX: Prefix path (default: run_par_ecmwf)
+    - GCS_SERVICE_ACCOUNT_FILE: Optional path to service account JSON
 
 Usage:
     # Full pipeline (includes Stage 1 - takes ~30 minutes)
@@ -27,6 +34,9 @@ Usage:
 
     # Limit members for faster Stage 1 testing
     python run_ecmwf_tutorial.py --run-stage1 --max-members 3
+
+    # Upload to GCS after processing (for Coiled workers)
+    python run_ecmwf_tutorial.py --upload-gcs
 
 Template Source:
     Hugging Face: https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz
@@ -45,6 +55,13 @@ from pathlib import Path
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use environment variables directly
 
 # Set up anonymous S3 access for ECMWF data
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
@@ -73,6 +90,11 @@ TUTORIAL_HOURS = [0, 3]  # Just 2 hours for fast Stage 1 demo
 
 # Output directory
 OUTPUT_DIR = Path("output_parquet")
+
+# GCS Configuration (loaded from .env or environment variables)
+GCS_BUCKET = os.environ.get('GCS_BUCKET', 'gik-ecmwf-aws-tf')
+GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', 'run_par_ecmwf')
+GCS_SERVICE_ACCOUNT_FILE = os.environ.get('GCS_SERVICE_ACCOUNT_FILE', 'coiled-data.json')
 
 
 def log_message(msg: str, level: str = "INFO"):
@@ -125,6 +147,111 @@ def download_template_file(url: str, local_path: str) -> bool:
         log_message(f"Error downloading template: {e}", "ERROR")
         log_message(f"Please download manually from: {url}", "ERROR")
         return False
+
+
+# ==============================================================================
+# STEP 1.5: Upload Parquet Files to GCS (for Coiled parallel processing)
+# ==============================================================================
+
+def upload_parquets_to_gcs(
+    output_dir: Path,
+    date_str: str,
+    run: str,
+    gcs_bucket: str = GCS_BUCKET,
+    gcs_prefix: str = GCS_PARQUET_PREFIX,
+    service_account_file: str = GCS_SERVICE_ACCOUNT_FILE
+) -> str:
+    """
+    Upload final parquet files to GCS for Coiled workers to access.
+
+    Files are uploaded to: gs://{bucket}/{prefix}/{date}_{run}z/
+
+    Returns the GCS path where files were uploaded.
+    """
+    print(f"\n{'='*70}")
+    print("[Step 4] Uploading Parquet Files to GCS")
+    print(f"{'='*70}")
+
+    try:
+        import gcsfs
+
+        # Setup GCS filesystem
+        if service_account_file and os.path.exists(service_account_file):
+            log_message(f"Using service account: {service_account_file}")
+            fs = gcsfs.GCSFileSystem(token=service_account_file)
+        else:
+            log_message("Using Application Default Credentials (ADC)")
+            fs = gcsfs.GCSFileSystem()
+
+        # Build GCS path: gs://bucket/prefix/YYYYMMDD_runz/
+        gcs_path = f"{gcs_bucket}/{gcs_prefix}/{date_str}_{run}z"
+        log_message(f"GCS destination: gs://{gcs_path}")
+
+        # Find all *_final.parquet files
+        parquet_files = list(output_dir.glob("*_final.parquet"))
+
+        if not parquet_files:
+            log_message(f"No *_final.parquet files found in {output_dir}", "WARNING")
+            return None
+
+        log_message(f"Found {len(parquet_files)} parquet files to upload")
+
+        # Upload each file
+        uploaded_count = 0
+        for pf in parquet_files:
+            gcs_file_path = f"{gcs_path}/{pf.name}"
+            try:
+                fs.put(str(pf), gcs_file_path)
+                size_kb = pf.stat().st_size / 1024
+                log_message(f"  Uploaded: {pf.name} ({size_kb:.1f} KB)")
+                uploaded_count += 1
+            except Exception as e:
+                log_message(f"  Failed to upload {pf.name}: {e}", "ERROR")
+
+        log_message(f"Uploaded {uploaded_count}/{len(parquet_files)} files to GCS")
+
+        return f"gs://{gcs_path}"
+
+    except ImportError:
+        log_message("gcsfs not installed. Install with: pip install gcsfs", "ERROR")
+        return None
+    except Exception as e:
+        log_message(f"GCS upload failed: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def check_gcs_parquets(
+    date_str: str,
+    run: str,
+    gcs_bucket: str = GCS_BUCKET,
+    gcs_prefix: str = GCS_PARQUET_PREFIX,
+    service_account_file: str = GCS_SERVICE_ACCOUNT_FILE
+) -> list:
+    """
+    Check if parquet files exist on GCS for a given date/run.
+
+    Returns list of GCS paths if found, empty list otherwise.
+    """
+    try:
+        import gcsfs
+
+        if service_account_file and os.path.exists(service_account_file):
+            fs = gcsfs.GCSFileSystem(token=service_account_file)
+        else:
+            fs = gcsfs.GCSFileSystem()
+
+        gcs_path = f"{gcs_bucket}/{gcs_prefix}/{date_str}_{run}z"
+
+        if fs.exists(gcs_path):
+            files = fs.glob(f"{gcs_path}/*_final.parquet")
+            return [f"gs://{f}" for f in files]
+
+        return []
+
+    except Exception:
+        return []
 
 
 # ==============================================================================
@@ -349,6 +476,12 @@ def main():
                         help='Maximum number of members to process')
     parser.add_argument('--hours', type=str, default=None,
                         help='Forecast hours for Stage 1 (comma-separated, e.g., "0,3,6")')
+    parser.add_argument('--upload-gcs', action='store_true',
+                        help='Upload final parquet files to GCS (for Coiled parallel processing)')
+    parser.add_argument('--gcs-bucket', type=str, default=GCS_BUCKET,
+                        help=f'GCS bucket name (default: {GCS_BUCKET})')
+    parser.add_argument('--gcs-prefix', type=str, default=GCS_PARQUET_PREFIX,
+                        help=f'GCS prefix path (default: {GCS_PARQUET_PREFIX})')
     args = parser.parse_args()
 
     target_date = args.date
@@ -369,7 +502,10 @@ def main():
     print(f"Run Stage 1: {'Yes' if args.run_stage1 else 'No (use existing zip)'}")
     print(f"Max Members: {args.max_members if args.max_members else 'all'}")
     print(f"Stage 1 Hours: {stage1_hours}")
-    print(f"ECMWF Module Path: {ECMWF_DIR}")
+    print(f"Upload to GCS: {'Yes' if args.upload_gcs else 'No'}")
+    if args.upload_gcs:
+        print(f"GCS Destination: gs://{args.gcs_bucket}/{args.gcs_prefix}/{target_date}_{target_run}z/")
+    print(f"ECMWF Module Path: {GIK_ECMWF_DIR}")
     print("="*70)
 
     start_time = time.time()
@@ -422,6 +558,19 @@ def main():
         max_members=args.max_members
     )
 
+    # Step 4: Upload to GCS if requested
+    output_dir = Path(f"ecmwf_three_stage_{target_date}_{target_run}z")
+    gcs_path = None
+
+    if success and args.upload_gcs:
+        gcs_path = upload_parquets_to_gcs(
+            output_dir=output_dir,
+            date_str=target_date,
+            run=target_run,
+            gcs_bucket=args.gcs_bucket,
+            gcs_prefix=args.gcs_prefix
+        )
+
     # Summary
     total_time = time.time() - start_time
 
@@ -434,17 +583,24 @@ def main():
     print(f"  Total Time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
 
     # List output files
-    output_dir = Path(f"ecmwf_three_stage_{target_date}_{target_run}z")
     if output_dir.exists():
-        print(f"\nOutput Files in {output_dir}:")
+        print(f"\nLocal Output Files in {output_dir}:")
         for pf in sorted(output_dir.glob("*.parquet")):
             size_kb = pf.stat().st_size / 1024
             print(f"  - {pf.name} ({size_kb:.1f} KB)")
 
+    # GCS upload summary
+    if gcs_path:
+        print(f"\nGCS Upload:")
+        print(f"  Location: {gcs_path}")
+        print(f"  Use for Coiled: --gcs-parquet-path {gcs_path}")
+
     print(f"\nNext Steps:")
-    print(f"  1. Run run_ecmwf_data_streaming_v1.py to stream data and create plots")
-    print(f"  2. Process different date: python run_ecmwf_tutorial.py --date YYYYMMDD --run-stage1")
-    print(f"  3. Process more members: python run_ecmwf_tutorial.py --max-members 10")
+    print(f"  1. Run stream_cgan_variables.py to stream data locally")
+    print(f"  2. Run stream_cgan_variables_coiled_simple.py for parallel processing (requires GCS upload)")
+    print(f"  3. Process different date: python run_ecmwf_tutorial.py --date YYYYMMDD --run-stage1")
+    if not args.upload_gcs:
+        print(f"  4. Upload to GCS: python run_ecmwf_tutorial.py --date {target_date} --upload-gcs")
 
     return success
 
