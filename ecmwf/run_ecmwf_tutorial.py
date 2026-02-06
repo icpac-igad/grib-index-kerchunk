@@ -18,7 +18,7 @@ Prerequisites:
 
 Environment Configuration:
     Copy .env.example to .env and configure:
-    - GCS_BUCKET: GCS bucket name (default: gik-fmrc)
+    - GCS_BUCKET: GCS bucket name (default: gik-ecmwf-aws-tf)
     - GCS_PARQUET_PREFIX: Prefix path (default: run_par_ecmwf)
     - GCS_SERVICE_ACCOUNT_FILE: Optional path to service account JSON
 
