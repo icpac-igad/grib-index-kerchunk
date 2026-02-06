@@ -408,16 +408,19 @@ def run_three_stage_pipeline(
     date_str: str,
     run: str,
     template_path: str,
-    max_members: int = None
+    max_members: int = None,
+    skip_grib_scan: bool = False
 ) -> bool:
     """
     Run the complete three-stage pipeline using process_single_date
     from ecmwf_three_stage_multidate.py.
 
-    This requires the Stage 1 zip file to exist.
+    When skip_grib_scan=True, builds Stage 1 from template (no zip needed).
+    Otherwise requires the Stage 1 zip file to exist.
     """
     print(f"\n{'='*70}")
-    print("[Step 3] Running Three-Stage Pipeline (process_single_date)")
+    mode = "template fast-path" if skip_grib_scan else "process_single_date"
+    print(f"[Step 3] Running Three-Stage Pipeline ({mode})")
     print(f"{'='*70}")
 
     try:
@@ -428,6 +431,7 @@ def run_three_stage_pipeline(
         log_message(f"Date: {date_str}, Run: {run}z")
         log_message(f"Template: {template_path}")
         log_message(f"Max members: {max_members if max_members else 'all'}")
+        log_message(f"Skip GRIB scan: {skip_grib_scan}")
 
         # Run the three-stage pipeline with local template
         success, output_dir = process_single_date(
@@ -435,7 +439,8 @@ def run_three_stage_pipeline(
             run=run,
             max_members=max_members,
             use_local_template=True,
-            local_template_path=template_path
+            local_template_path=template_path,
+            skip_grib_scan=skip_grib_scan
         )
 
         if success:
@@ -482,6 +487,9 @@ def main():
                         help=f'GCS bucket name (default: {GCS_BUCKET})')
     parser.add_argument('--gcs-prefix', type=str, default=GCS_PARQUET_PREFIX,
                         help=f'GCS prefix path (default: {GCS_PARQUET_PREFIX})')
+    parser.add_argument('--skip-grib-scan', action='store_true',
+                        help='Skip Stage 1 GRIB scanning entirely — build from template '
+                             '(Phase 1 fast-path: ~73 min → ~5 sec, no zip needed)')
     args = parser.parse_args()
 
     target_date = args.date
@@ -502,6 +510,7 @@ def main():
     print(f"Run Stage 1: {'Yes' if args.run_stage1 else 'No (use existing zip)'}")
     print(f"Max Members: {args.max_members if args.max_members else 'all'}")
     print(f"Stage 1 Hours: {stage1_hours}")
+    print(f"Skip GRIB Scan: {'Yes (template fast-path)' if args.skip_grib_scan else 'No'}")
     print(f"Upload to GCS: {'Yes' if args.upload_gcs else 'No'}")
     if args.upload_gcs:
         print(f"GCS Destination: gs://{args.gcs_bucket}/{args.gcs_prefix}/{target_date}_{target_run}z/")
@@ -516,46 +525,52 @@ def main():
         return False
 
     # Step 2: Check for Stage 1 zip or run Stage 1
-    zip_patterns = [
-        f"ecmwf_{target_date}_{target_run}z_efficient.zip",
-        f"ecmwf_{target_date}_{target_run}_efficient.zip"
-    ]
-
-    zip_file = None
-    for pattern in zip_patterns:
-        if Path(pattern).exists():
-            zip_file = Path(pattern)
-            break
-
-    if zip_file:
-        log_message(f"Found existing Stage 1 zip: {zip_file}")
-        if args.run_stage1:
-            log_message("--run-stage1 specified, but zip exists. Using existing zip.")
+    if args.skip_grib_scan:
+        log_message("GRIB scanning SKIPPED — using template fast-path (Phase 1)")
+        log_message(f"Template: {LOCAL_TEMPLATE_FILE}")
     else:
-        if args.run_stage1:
-            # Run Stage 1 to create the zip
-            zip_file = run_stage1_processing(
-                target_date,
-                target_run,
-                max_members=args.max_members,
-                hours=stage1_hours
-            )
-            if not zip_file:
-                log_message("Stage 1 failed. Cannot continue.", "ERROR")
-                return False
+        zip_patterns = [
+            f"ecmwf_{target_date}_{target_run}z_efficient.zip",
+            f"ecmwf_{target_date}_{target_run}_efficient.zip"
+        ]
+
+        zip_file = None
+        for pattern in zip_patterns:
+            if Path(pattern).exists():
+                zip_file = Path(pattern)
+                break
+
+        if zip_file:
+            log_message(f"Found existing Stage 1 zip: {zip_file}")
+            if args.run_stage1:
+                log_message("--run-stage1 specified, but zip exists. Using existing zip.")
         else:
-            log_message(f"Stage 1 zip file not found: {zip_patterns[0]}", "ERROR")
-            log_message("Options:", "ERROR")
-            log_message("  1. Run with --run-stage1 to create it (~30 min)", "ERROR")
-            log_message("  2. Download pre-built zip if available", "ERROR")
-            return False
+            if args.run_stage1:
+                # Run Stage 1 to create the zip
+                zip_file = run_stage1_processing(
+                    target_date,
+                    target_run,
+                    max_members=args.max_members,
+                    hours=stage1_hours
+                )
+                if not zip_file:
+                    log_message("Stage 1 failed. Cannot continue.", "ERROR")
+                    return False
+            else:
+                log_message(f"Stage 1 zip file not found: {zip_patterns[0]}", "ERROR")
+                log_message("Options:", "ERROR")
+                log_message("  1. Run with --run-stage1 to create it (~30 min)", "ERROR")
+                log_message("  2. Run with --skip-grib-scan for template fast-path (~5 sec)", "ERROR")
+                log_message("  3. Download pre-built zip if available", "ERROR")
+                return False
 
     # Step 3: Run three-stage pipeline
     success = run_three_stage_pipeline(
         date_str=target_date,
         run=target_run,
         template_path=LOCAL_TEMPLATE_FILE,
-        max_members=args.max_members
+        max_members=args.max_members,
+        skip_grib_scan=args.skip_grib_scan
     )
 
     # Step 4: Upload to GCS if requested
