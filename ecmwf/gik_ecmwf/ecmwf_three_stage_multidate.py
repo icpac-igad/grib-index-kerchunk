@@ -517,8 +517,61 @@ def spot_check_grib_integrity(date_str: str, run: str, n_checks: int = 3) -> boo
 # STAGE 2: INDEX + GCS TEMPLATES
 # ==============================================================================
 
+def _process_single_member_stage2(args):
+    """Worker function for parallel Stage 2 processing.
+
+    Processes one ensemble member: fetches .index files from S3,
+    merges with template, saves parquet. Returns (member, refs) or
+    (member, None) on failure.
+    """
+    (member, member_normalized, test_date, test_run, output_dir_str,
+     use_local_template, local_template_path) = args
+
+    import os
+    os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
+
+    try:
+        from ecmwf_index_processor import build_complete_parquet_from_indices
+
+        refs = build_complete_parquet_from_indices(
+            date_str=test_date,
+            run=test_run,
+            member_name=member_normalized,
+            hours=ECMWF_FORECAST_HOURS,
+            use_gcs_template=not use_local_template,
+            gcs_template_date=REFERENCE_DATE,
+            use_local_template=use_local_template,
+            local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
+        )
+
+        if refs:
+            output_dir = Path(output_dir_str)
+            stage2_output = output_dir / f"stage2_{member}_merged.parquet"
+
+            df_data = []
+            for key, value in refs.items():
+                if isinstance(value, str):
+                    encoded_value = value.encode('utf-8')
+                elif isinstance(value, (list, dict)):
+                    encoded_value = json.dumps(value).encode('utf-8')
+                else:
+                    encoded_value = str(value).encode('utf-8')
+                df_data.append((key, encoded_value))
+
+            df = pd.DataFrame(df_data, columns=['key', 'value'])
+            df.to_parquet(stage2_output)
+
+            return (member, refs)
+
+        return (member, None)
+
+    except Exception as e:
+        return (member, None, str(e))
+
+
 def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
-                                   use_local_template=False, local_template_path=None):
+                                   use_local_template=False, local_template_path=None,
+                                   parallel_workers=8):
     """Stage 2: INDEX + Templates merge (GCS or local).
 
     Args:
@@ -528,23 +581,24 @@ def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
         output_dir: Output directory path
         use_local_template: If True, use local tar.gz file instead of GCS bucket
         local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
+        parallel_workers: Number of parallel workers (0 or 1 = sequential)
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     template_source = "LOCAL TAR.GZ" if use_local_template else "GCS BUCKET"
-    log_stage(2, f"INDEX + TEMPLATES MERGE ({template_source}, All 85 hours)")
+    mode = f"PARALLEL {parallel_workers} workers" if parallel_workers > 1 else "SEQUENTIAL"
+    log_stage(2, f"INDEX + TEMPLATES MERGE ({template_source}, {mode}, All 85 hours)")
 
     start_time = time.time()
 
     try:
-        from ecmwf_index_processor import build_complete_parquet_from_indices
-
         log_checkpoint(f"Target date: {test_date}")
         log_checkpoint(f"Reference date: {REFERENCE_DATE}")
-        log_checkpoint(f"Processing {len(test_members)} members")
+        log_checkpoint(f"Processing {len(test_members)} members ({mode})")
 
-        member_results = {}
-
+        # Prepare args for each member
+        task_args = []
         for member in test_members:
-            # Normalize member format
             if member == 'control':
                 member_normalized = 'control'
             else:
@@ -553,40 +607,85 @@ def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
                     member_num_str = member_normalized.replace('ens', '')
                     member_normalized = f'ens{int(member_num_str):02d}'
 
-            try:
-                refs = build_complete_parquet_from_indices(
-                    date_str=test_date,
-                    run=test_run,
-                    member_name=member_normalized,
-                    hours=ECMWF_FORECAST_HOURS,
-                    use_gcs_template=not use_local_template,
-                    gcs_template_date=REFERENCE_DATE,
-                    use_local_template=use_local_template,
-                    local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
-                )
+            task_args.append((
+                member, member_normalized, test_date, test_run,
+                str(output_dir), use_local_template, local_template_path
+            ))
 
-                if refs:
-                    stage2_output = output_dir / f"stage2_{member}_merged.parquet"
+        member_results = {}
 
-                    df_data = []
-                    for key, value in refs.items():
-                        if isinstance(value, str):
-                            encoded_value = value.encode('utf-8')
-                        elif isinstance(value, (list, dict)):
-                            encoded_value = json.dumps(value).encode('utf-8')
+        if parallel_workers > 1 and len(test_members) > 1:
+            # --- PARALLEL PATH ---
+            n_workers = min(parallel_workers, len(test_members))
+            log_checkpoint(f"Launching {n_workers} parallel workers")
+
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                future_to_member = {
+                    executor.submit(_process_single_member_stage2, args): args[0]
+                    for args in task_args
+                }
+
+                completed = 0
+                for future in as_completed(future_to_member):
+                    member_name = future_to_member[future]
+                    completed += 1
+                    try:
+                        result = future.result()
+                        if len(result) == 2:
+                            member, refs = result
+                            if refs:
+                                member_results[member] = refs
+                                log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                             f"{member}: {len(refs)} references")
+                            else:
+                                log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                             f"{member}: no refs returned")
                         else:
-                            encoded_value = str(value).encode('utf-8')
-                        df_data.append((key, encoded_value))
+                            member, _, error = result
+                            log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                         f"Error {member}: {error}")
+                    except Exception as e:
+                        log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                     f"Worker error {member_name}: {e}")
+        else:
+            # --- SEQUENTIAL PATH (fallback) ---
+            from ecmwf_index_processor import build_complete_parquet_from_indices
 
-                    df = pd.DataFrame(df_data, columns=['key', 'value'])
-                    df.to_parquet(stage2_output)
+            for member, member_normalized, _, _, _, _, _ in task_args:
+                try:
+                    refs = build_complete_parquet_from_indices(
+                        date_str=test_date,
+                        run=test_run,
+                        member_name=member_normalized,
+                        hours=ECMWF_FORECAST_HOURS,
+                        use_gcs_template=not use_local_template,
+                        gcs_template_date=REFERENCE_DATE,
+                        use_local_template=use_local_template,
+                        local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
+                    )
 
-                    member_results[member] = refs
-                    log_checkpoint(f"{member}: {len(refs)} references")
+                    if refs:
+                        stage2_output = output_dir / f"stage2_{member}_merged.parquet"
 
-            except Exception as e:
-                log_checkpoint(f"Error processing {member}: {e}")
-                continue
+                        df_data = []
+                        for key, value in refs.items():
+                            if isinstance(value, str):
+                                encoded_value = value.encode('utf-8')
+                            elif isinstance(value, (list, dict)):
+                                encoded_value = json.dumps(value).encode('utf-8')
+                            else:
+                                encoded_value = str(value).encode('utf-8')
+                            df_data.append((key, encoded_value))
+
+                        df = pd.DataFrame(df_data, columns=['key', 'value'])
+                        df.to_parquet(stage2_output)
+
+                        member_results[member] = refs
+                        log_checkpoint(f"{member}: {len(refs)} references")
+
+                except Exception as e:
+                    log_checkpoint(f"Error processing {member}: {e}")
+                    continue
 
         elapsed = time.time() - start_time
 
@@ -668,7 +767,8 @@ def run_stage3(deflated_stores, stage2_refs, test_date, output_dir):
 
 def process_single_date(date_str: str, run: str, max_members: Optional[int] = None,
                         use_local_template: bool = False, local_template_path: Optional[str] = None,
-                        skip_grib_scan: bool = False) -> Tuple[bool, Optional[Path]]:
+                        skip_grib_scan: bool = False,
+                        parallel_workers: int = 8) -> Tuple[bool, Optional[Path]]:
     """
     Process a single date through all three stages.
 
@@ -680,6 +780,7 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
     - local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
     - skip_grib_scan: If True, build deflated_stores from template instead of zip
                       (Phase 1 optimization: eliminates 73-min scan_grib dependency)
+    - parallel_workers: Number of parallel workers for Stage 2 (0 or 1 = sequential)
 
     Returns:
     - Tuple of (success, output_directory_path)
@@ -791,7 +892,8 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
         stage2_refs = run_stage2_with_gcs_templates(
             date_str, run, test_members, output_dir,
             use_local_template=use_local_template,
-            local_template_path=template_path
+            local_template_path=template_path,
+            parallel_workers=parallel_workers
         )
 
         # Stage 3

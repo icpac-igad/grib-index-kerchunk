@@ -409,7 +409,8 @@ def run_three_stage_pipeline(
     run: str,
     template_path: str,
     max_members: int = None,
-    skip_grib_scan: bool = False
+    skip_grib_scan: bool = False,
+    parallel_workers: int = 8
 ) -> bool:
     """
     Run the complete three-stage pipeline using process_single_date
@@ -432,6 +433,7 @@ def run_three_stage_pipeline(
         log_message(f"Template: {template_path}")
         log_message(f"Max members: {max_members if max_members else 'all'}")
         log_message(f"Skip GRIB scan: {skip_grib_scan}")
+        log_message(f"Parallel workers: {parallel_workers}")
 
         # Run the three-stage pipeline with local template
         success, output_dir = process_single_date(
@@ -440,7 +442,8 @@ def run_three_stage_pipeline(
             max_members=max_members,
             use_local_template=True,
             local_template_path=template_path,
-            skip_grib_scan=skip_grib_scan
+            skip_grib_scan=skip_grib_scan,
+            parallel_workers=parallel_workers
         )
 
         if success:
@@ -490,6 +493,8 @@ def main():
     parser.add_argument('--skip-grib-scan', action='store_true',
                         help='Skip Stage 1 GRIB scanning entirely — build from template '
                              '(Phase 1 fast-path: ~73 min → ~5 sec, no zip needed)')
+    parser.add_argument('--parallel-workers', type=int, default=8,
+                        help='Number of parallel workers for Stage 2 (default: 8, use 1 for sequential)')
     args = parser.parse_args()
 
     target_date = args.date
@@ -511,6 +516,7 @@ def main():
     print(f"Max Members: {args.max_members if args.max_members else 'all'}")
     print(f"Stage 1 Hours: {stage1_hours}")
     print(f"Skip GRIB Scan: {'Yes (template fast-path)' if args.skip_grib_scan else 'No'}")
+    print(f"Parallel Workers: {args.parallel_workers}")
     print(f"Upload to GCS: {'Yes' if args.upload_gcs else 'No'}")
     if args.upload_gcs:
         print(f"GCS Destination: gs://{args.gcs_bucket}/{args.gcs_prefix}/{target_date}_{target_run}z/")
@@ -570,7 +576,8 @@ def main():
         run=target_run,
         template_path=LOCAL_TEMPLATE_FILE,
         max_members=args.max_members,
-        skip_grib_scan=args.skip_grib_scan
+        skip_grib_scan=args.skip_grib_scan,
+        parallel_workers=args.parallel_workers
     )
 
     # Step 4: Upload to GCS if requested
