@@ -102,16 +102,17 @@ python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --max-members 5
 
 ### Phase 2: Stream cGAN Variables
 
-**Local streaming** (no cloud cluster needed):
+**Local streaming** (no cloud cluster needed, ~24 min with 8 parallel threads):
 ```bash
+# Stream all 51 members with parallel S3 fetches (~24 min)
+python stream_cgan_variables.py \
+    --parquet-dir ecmwf_three_stage_20260206_00z \
+    --parallel-fetches 8
+
 # Stream 3 members for quick test
 python stream_cgan_variables.py \
     --parquet-dir ecmwf_three_stage_20260206_00z \
     --max-members 3
-
-# Stream all 51 members
-python stream_cgan_variables.py \
-    --parquet-dir ecmwf_three_stage_20260206_00z
 
 # Custom timesteps
 python stream_cgan_variables.py \
@@ -160,7 +161,16 @@ Main entry point for the GIK three-stage pipeline.
 
 ### 2. `stream_cgan_variables.py`
 
-Local streaming: extracts 12 cGAN input variables with ensemble mean and standard deviation.
+Local streaming with parallel S3 fetches: extracts 12 cGAN input variables with ensemble mean and standard deviation. Uses `ThreadPoolExecutor` at two levels (members + timestep fetches) for ~10x speedup over sequential.
+
+**Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--parquet-dir` | ecmwf_three_stage_20260203_00z | Directory containing stage3 parquet files |
+| `--steps` | 36,39,42,45,48,51,54,57,60 | Comma-separated forecast hours |
+| `--max-members` | 51 | Maximum number of ensemble members |
+| `--parallel-fetches` | 8 | Number of concurrent member streams |
+| `--output-dir` | cgan_output | Output directory for NetCDF file |
 
 **Variables Extracted:**
 | Variable | ECMWF Name | Description |
@@ -278,8 +288,30 @@ The bottleneck is S3 I/O (fetching 85 `.index` files per member), so the optimal
 
 | Method | Time (51 members, 9 steps) | Notes |
 |--------|---------------------------|-------|
-| Local (`stream_cgan_variables.py`) | ~4 hours | Sequential S3 fetch |
-| Coiled (`coiled_simple.py`, 20 workers) | ~15-30 min | Parallel across workers |
+| Local sequential | ~4 hours | `--parallel-fetches 1` |
+| **Local threaded (default)** | **~24 min** | **`--parallel-fetches 8` (ThreadPoolExecutor)** |
+| Coiled (`coiled_simple.py`, 20 workers) | ~15-30 min | Distributed cloud VMs |
+
+### Local Streaming Parallelization Details
+
+`stream_cgan_variables.py` uses two levels of `ThreadPoolExecutor` parallelism:
+
+1. **Member level**: `--parallel-fetches N` members are streamed concurrently (default: 8)
+2. **Fetch level**: Within each member, all 9 timestep S3 fetches run in parallel threads
+
+```bash
+# Default: 8 concurrent member streams (~24 min for 51 members)
+python stream_cgan_variables.py \
+    --parquet-dir ecmwf_three_stage_20260206_00z \
+    --parallel-fetches 8
+
+# Sequential fallback (~4 hours)
+python stream_cgan_variables.py \
+    --parquet-dir ecmwf_three_stage_20260206_00z \
+    --parallel-fetches 1
+```
+
+Threads are used (not processes) because the bottleneck is S3 I/O latency — Python's GIL releases during network I/O, so threads achieve full parallelism with minimal memory overhead. This makes it effective even on small machines (2 CPUs, 8 GB RAM).
 
 See `GRIBBERISH_EXPERIMENT_REPORT.md` for the full experiment report and risk analysis.
 
