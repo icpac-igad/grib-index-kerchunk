@@ -27,6 +27,7 @@ cgan_ecmwf/
 ├── run_ecmwf_tutorial.py               # Main entry point for Phase 1
 ├── stream_cgan_variables.py            # Phase 2: Local data streaming
 ├── stream_cgan_variables_coiled_simple.py  # Phase 2: Coiled parallel streaming
+├── plot_cgan_maps.py                   # Visualization: 4x3 panel maps
 ├── test_gribberish_vs_scangrib.py      # Benchmark: .index vs scan_grib
 └── gik_ecmwf/                          # Core GIK processing modules
     ├── __init__.py
@@ -81,11 +82,14 @@ GCS_SERVICE_ACCOUNT_FILE=coiled-data.json  # Service account key (optional)
 ```bash
 cd cgan_ecmwf/
 
-# Recommended: Template fast-path (skips GRIB scanning, ~31 min)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan
+# Recommended: Template fast-path + parallel Stage 2 (~10.5 min)
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
 
 # Upload parquets to GCS (needed for Coiled streaming)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --upload-gcs
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8 --upload-gcs
+
+# Sequential processing (no parallelization, ~31 min)
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
 
 # Legacy: Full pipeline with GRIB scanning (~110 min)
 python run_ecmwf_tutorial.py --date 20260206 --run-stage1
@@ -137,7 +141,7 @@ Main entry point for the GIK three-stage pipeline.
 
 **Stages:**
 1. **Stage 1** (~1 min with `--skip-grib-scan`, ~73 min legacy): Build zarr structure from template or scan GRIB files
-2. **Stage 2** (~30 min): Index-based processing using pre-built templates, 51 members sequential
+2. **Stage 2** (~8.8 min with 8 workers, ~30 min sequential): Index-based processing using pre-built templates, 51 members parallelized via `ProcessPoolExecutor`
 3. **Stage 3** (~2 sec): Create final zarr-compatible parquet files
 
 **Arguments:**
@@ -149,6 +153,7 @@ Main entry point for the GIK three-stage pipeline.
 | `--run-stage1` | False | Legacy: Run Stage 1 GRIB scanning |
 | `--max-members` | None | Limit ensemble members |
 | `--hours` | "0,3" | Forecast hours for Stage 1 |
+| `--parallel-workers` | 8 | Number of parallel workers for Stage 2 (set to 1 for sequential) |
 | `--upload-gcs` | False | Upload final parquets to GCS |
 | `--gcs-bucket` | gik-ecmwf-aws-tf | GCS bucket for upload |
 | `--gcs-prefix` | run_par_ecmwf | GCS prefix path |
@@ -223,12 +228,21 @@ IFS_20260206_00Z_cgan.nc
 
 ## Performance
 
-### With `--skip-grib-scan` (recommended)
+### With `--skip-grib-scan --parallel-workers 8` (recommended)
+
+| Stage | Operation | Time | Notes |
+|-------|-----------|------|-------|
+| 1 | Template loading + validation | ~1.1 min | Replaces 73 min GRIB scanning |
+| 2 | Index processing (51 members, 8 workers) | ~8.8 min | `ProcessPoolExecutor` parallelization |
+| 3 | Final parquet merge | ~3.8 sec | Fast dict merge |
+| **Total** | | **~10.5 min** | **10.5x faster than legacy** |
+
+### With `--skip-grib-scan --parallel-workers 1` (sequential)
 
 | Stage | Operation | Time | Notes |
 |-------|-----------|------|-------|
 | 1 | Template loading + validation | ~1 min | Replaces 73 min GRIB scanning |
-| 2 | Index processing (51 members) | ~30 min | Sequential; parallelizable |
+| 2 | Index processing (51 members) | ~30 min | Sequential, single-threaded |
 | 3 | Final parquet merge | ~2 sec | Fast dict merge |
 | **Total** | | **~31 min** | **3.6x faster than legacy** |
 
@@ -241,16 +255,31 @@ IFS_20260206_00Z_cgan.nc
 | 3 | Final parquet merge | ~5 sec | |
 | **Total** | | **~110 min** | |
 
+### Stage 2 Parallelization Details
+
+Stage 2 processes 51 ensemble members (control + ens01–ens50). Each member is independent — it fetches `.index` files from ECMWF S3, parses byte offsets, and merges with the local template to produce a parquet file with ~6,685 references.
+
+With `--parallel-workers N`, Stage 2 uses Python's `ProcessPoolExecutor` to process N members concurrently:
+
+```bash
+# 8 workers (default, recommended for most machines)
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
+
+# 16 workers (for machines with more cores and bandwidth)
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 16
+
+# Sequential fallback (no parallelization)
+python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
+```
+
+The bottleneck is S3 I/O (fetching 85 `.index` files per member), so the optimal worker count depends on network bandwidth rather than CPU cores. With 8 workers, Stage 2 drops from ~30 min to ~8.8 min (3.4x speedup).
+
 ### Data Streaming (Phase 2)
 
 | Method | Time (51 members, 9 steps) | Notes |
 |--------|---------------------------|-------|
 | Local (`stream_cgan_variables.py`) | ~4 hours | Sequential S3 fetch |
 | Coiled (`coiled_simple.py`, 20 workers) | ~15-30 min | Parallel across workers |
-
-### Bottleneck Analysis
-
-After the `--skip-grib-scan` optimization, **Stage 2 is the remaining bottleneck** at ~30 min (96% of total). Each of 51 members is processed sequentially (~35 sec each). Future Phase 2 parallelization with ProcessPoolExecutor (8 workers) would reduce this to ~5 min.
 
 See `GRIBBERISH_EXPERIMENT_REPORT.md` for the full experiment report and risk analysis.
 
