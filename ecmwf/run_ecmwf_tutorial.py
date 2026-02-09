@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "requests",
+#     "python-dotenv",
+#     "fsspec",
+#     "s3fs",
+#     "gcsfs",
+#     "kerchunk",
+#     "zarr<3",
+#     "xarray",
+#     "pandas",
+#     "numpy",
+#     "pyarrow",
+#     "cfgrib",
+#     "eccodes",
+# ]
+# ///
 """
 ECMWF Grib-Index-Kerchunk (GIK) Tutorial - Full Three-Stage Pipeline
 =====================================================================
@@ -92,9 +110,9 @@ TUTORIAL_HOURS = [0, 3]  # Just 2 hours for fast Stage 1 demo
 OUTPUT_DIR = Path("output_parquet")
 
 # GCS Configuration (loaded from .env or environment variables)
-GCS_BUCKET = os.environ.get('GCS_BUCKET', 'gik-ecmwf-aws-tf')
-GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', 'run_par_ecmwf')
-GCS_SERVICE_ACCOUNT_FILE = os.environ.get('GCS_SERVICE_ACCOUNT_FILE', 'coiled-data.json')
+GCS_BUCKET = os.environ.get('GCS_BUCKET', '')
+GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', '')
+GCS_SERVICE_ACCOUNT_FILE = os.environ.get('GCS_SERVICE_ACCOUNT_FILE', '')
 
 
 def log_message(msg: str, level: str = "INFO"):
@@ -487,9 +505,9 @@ def main():
     parser.add_argument('--upload-gcs', action='store_true',
                         help='Upload final parquet files to GCS (for Coiled parallel processing)')
     parser.add_argument('--gcs-bucket', type=str, default=GCS_BUCKET,
-                        help=f'GCS bucket name (default: {GCS_BUCKET})')
+                        help='GCS bucket name (from GCS_BUCKET in .env)')
     parser.add_argument('--gcs-prefix', type=str, default=GCS_PARQUET_PREFIX,
-                        help=f'GCS prefix path (default: {GCS_PARQUET_PREFIX})')
+                        help='GCS prefix path (from GCS_PARQUET_PREFIX in .env)')
     parser.add_argument('--skip-grib-scan', action='store_true',
                         help='Skip Stage 1 GRIB scanning entirely — build from template '
                              '(Phase 1 fast-path: ~73 min → ~5 sec, no zip needed)')
@@ -585,6 +603,9 @@ def main():
     gcs_path = None
 
     if success and args.upload_gcs:
+        if not args.gcs_bucket or not args.gcs_prefix:
+            log_message("GCS_BUCKET and GCS_PARQUET_PREFIX must be set in .env for --upload-gcs", "ERROR")
+            return False
         gcs_path = upload_parquets_to_gcs(
             output_dir=output_dir,
             date_str=target_date,

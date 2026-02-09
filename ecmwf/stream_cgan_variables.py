@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy",
+#     "pandas",
+#     "xarray",
+#     "fsspec",
+#     "s3fs",
+#     "gcsfs",
+#     "pyarrow",
+#     "zarr<3",
+#     "netcdf4",
+#     "gribberish",
+#     "cfgrib",
+#     "eccodes",
+#     "python-dotenv",
+# ]
+# ///
 """
 ECMWF Data Streaming for cGAN Inference Variables
 ===================================================
@@ -48,6 +66,13 @@ import fsspec
 warnings.filterwarnings('ignore')
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Try to import gribberish for fast decoding
 try:
     import gribberish
@@ -60,7 +85,12 @@ except ImportError:
 # CONFIGURATION
 # ==============================================================================
 
-# Directory containing parquet files
+# GCS Configuration (loaded from .env or environment variables)
+GCS_BUCKET = os.environ.get('GCS_BUCKET', '')
+GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', '')
+GCS_SERVICE_ACCOUNT_FILE = os.environ.get('GCS_SERVICE_ACCOUNT_FILE', '')
+
+# Directory containing parquet files (local fallback)
 PARQUET_DIR = Path("ecmwf_three_stage_20260203_00z")
 
 # Target timesteps (36-60 hours in 3-hour intervals)
@@ -113,6 +143,26 @@ OUTPUT_DIR = Path("cgan_output")
 # HELPER FUNCTIONS
 # ==============================================================================
 
+def get_gcs_filesystem():
+    """Create a GCS filesystem using service account from .env or ADC."""
+    import gcsfs
+    sa_file = GCS_SERVICE_ACCOUNT_FILE
+    if sa_file and os.path.exists(sa_file):
+        return gcsfs.GCSFileSystem(token=sa_file)
+    return gcsfs.GCSFileSystem()
+
+
+def list_gcs_parquets(gcs_path: str, max_members: int = None) -> List[str]:
+    """List stage3 parquet files on GCS. Returns list of gs:// paths."""
+    gcs_fs = get_gcs_filesystem()
+    # Strip gs:// prefix for gcsfs
+    bucket_path = gcs_path.replace('gs://', '')
+    files = sorted(gcs_fs.glob(f"{bucket_path}/stage3_*_final.parquet"))
+    if max_members:
+        files = files[:max_members]
+    return [f"gs://{f}" for f in files]
+
+
 def get_icpac_indices() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Get ICPAC region subset indices and coordinates."""
     lat_mask = (ECMWF_LATS >= LAT_MIN) & (ECMWF_LATS <= LAT_MAX)
@@ -131,8 +181,15 @@ LAT_INDICES, LON_INDICES, ICPAC_LATS, ICPAC_LONS = get_icpac_indices()
 
 
 def read_parquet_refs(parquet_path: str) -> Dict:
-    """Read parquet file and extract zstore references."""
-    df = pd.read_parquet(parquet_path)
+    """Read parquet file and extract zstore references.
+
+    Supports local paths and gs:// GCS paths.
+    """
+    if parquet_path.startswith('gs://'):
+        gcs_fs = get_gcs_filesystem()
+        df = pd.read_parquet(parquet_path, filesystem=gcs_fs)
+    else:
+        df = pd.read_parquet(parquet_path)
 
     zstore = {}
     for _, row in df.iterrows():
@@ -336,14 +393,15 @@ def _stream_one_member(args):
 
 
 def stream_all_members_for_variable(
-    parquet_dir: Path,
+    parquet_dir,
     var_name: str,
     step_hours: List[int],
     output_name: str,
     is_pressure_level: bool = False,
     pressure_level: int = 700,
     max_members: int = 51,
-    parallel_members: int = MAX_PARALLEL_FETCHES
+    parallel_members: int = MAX_PARALLEL_FETCHES,
+    gcs_parquet_path: str = None
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], List[int]]:
     """
     Stream a variable across all ensemble members in parallel.
@@ -351,16 +409,21 @@ def stream_all_members_for_variable(
     Uses ThreadPoolExecutor to process `parallel_members` members concurrently.
     Each member's S3 fetches also run in parallel threads.
 
+    Supports local parquet_dir or GCS via gcs_parquet_path.
+
     Returns (ensemble_mean, ensemble_std, valid_steps).
     """
     print(f"\n  Streaming {var_name} -> {output_name}...")
 
-    # Find all member parquet files
-    parquet_files = sorted(parquet_dir.glob("stage3_*.parquet"))
-    if max_members:
-        parquet_files = parquet_files[:max_members]
+    # Find all member parquet files — GCS or local
+    if gcs_parquet_path:
+        parquet_paths = list_gcs_parquets(gcs_parquet_path, max_members)
+    else:
+        parquet_paths = [str(pf) for pf in sorted(parquet_dir.glob("stage3_*.parquet"))]
+        if max_members:
+            parquet_paths = parquet_paths[:max_members]
 
-    n_members = len(parquet_files)
+    n_members = len(parquet_paths)
     n_steps = len(step_hours)
     n_lats = len(ICPAC_LATS)
     n_lons = len(ICPAC_LONS)
@@ -373,11 +436,13 @@ def stream_all_members_for_variable(
 
     # Build args for each member
     member_args = []
-    for pf in parquet_files:
-        raw_member = pf.stem.replace('stage3_', '').replace('_final', '')
+    for pf_path in parquet_paths:
+        # Extract member name from filename (works for both local and GCS paths)
+        stem = os.path.basename(pf_path).replace('.parquet', '')
+        raw_member = stem.replace('stage3_', '').replace('_final', '')
         member_key = raw_member.replace('_', '')
         member_args.append((
-            str(pf), var_name, step_hours, member_key,
+            pf_path, var_name, step_hours, member_key,
             is_pressure_level, pressure_level
         ))
 
@@ -512,13 +577,17 @@ def main(
     target_steps: List[int] = TARGET_STEPS,
     max_members: int = 51,
     output_dir: Path = OUTPUT_DIR,
-    parallel_members: int = MAX_PARALLEL_FETCHES
+    parallel_members: int = MAX_PARALLEL_FETCHES,
+    gcs_parquet_path: str = None
 ):
     """Main streaming routine."""
     print("="*70)
     print("ECMWF Data Streaming for cGAN Inference")
     print("="*70)
-    print(f"Parquet Directory: {parquet_dir}")
+    if gcs_parquet_path:
+        print(f"Parquet Source: {gcs_parquet_path} (GCS)")
+    else:
+        print(f"Parquet Source: {parquet_dir} (local)")
     print(f"Target Steps: {target_steps}")
     print(f"Max Members: {max_members}")
     print(f"Parallel Members: {parallel_members}")
@@ -528,12 +597,20 @@ def main(
 
     start_time = time.time()
 
-    if not parquet_dir.exists():
-        print(f"\nError: Parquet directory {parquet_dir} not found!")
-        return False
+    # Validate source
+    if gcs_parquet_path:
+        test_files = list_gcs_parquets(gcs_parquet_path, max_members=1)
+        if not test_files:
+            print(f"\nError: No parquet files found at {gcs_parquet_path}")
+            return False
+    else:
+        if not parquet_dir.exists():
+            print(f"\nError: Parquet directory {parquet_dir} not found!")
+            return False
 
-    # Extract date from directory name
-    match = re.search(r'(\d{8})_(\d{2})z', str(parquet_dir))
+    # Extract date from path name (works for both local dir and GCS path)
+    source_str = gcs_parquet_path if gcs_parquet_path else str(parquet_dir)
+    match = re.search(r'(\d{8})_(\d{2})z', source_str)
     if match:
         model_date = datetime.strptime(match.group(1), '%Y%m%d')
         run_hour = int(match.group(2))
@@ -545,6 +622,11 @@ def main(
 
     # Stream each variable
     data_dict = {}
+    stream_kwargs = dict(
+        max_members=max_members,
+        parallel_members=parallel_members,
+        gcs_parquet_path=gcs_parquet_path,
+    )
 
     # Surface variables
     print("\n[Phase 1] Streaming Surface Variables")
@@ -552,8 +634,7 @@ def main(
     for ecmwf_var, output_var in CGAN_SURFACE_VARS.items():
         mean, std, steps = stream_all_members_for_variable(
             parquet_dir, ecmwf_var, target_steps, output_var,
-            max_members=max_members,
-            parallel_members=parallel_members
+            **stream_kwargs
         )
         if mean is not None:
             data_dict[output_var] = (mean, std)
@@ -564,8 +645,7 @@ def main(
     for ecmwf_var, output_var in CGAN_ATMOS_VARS.items():
         mean, std, steps = stream_all_members_for_variable(
             parquet_dir, ecmwf_var, target_steps, output_var,
-            max_members=max_members,
-            parallel_members=parallel_members
+            **stream_kwargs
         )
         if mean is not None:
             data_dict[output_var] = (mean, std)
@@ -578,8 +658,7 @@ def main(
             parquet_dir, ecmwf_var, target_steps, output_var,
             is_pressure_level=True,
             pressure_level=TARGET_PRESSURE_LEVEL,
-            max_members=max_members,
-            parallel_members=parallel_members
+            **stream_kwargs
         )
         if mean is not None:
             data_dict[output_var] = (mean, std)
@@ -626,9 +705,22 @@ def main(
 if __name__ == "__main__":
     import argparse
 
+    # Build default GCS path from .env if bucket and prefix are configured
+    default_gcs_path = None
+    if GCS_BUCKET and GCS_PARQUET_PREFIX:
+        default_gcs_path = f"gs://{GCS_BUCKET}/{GCS_PARQUET_PREFIX}"
+
     parser = argparse.ArgumentParser(description='Stream ECMWF data for cGAN inference')
     parser.add_argument('--parquet-dir', type=str, default=str(PARQUET_DIR),
-                        help='Directory containing stage3 parquet files')
+                        help='Local directory containing stage3 parquet files')
+    parser.add_argument('--gcs-parquet-path', type=str, default=None,
+                        help='GCS path to parquet files (e.g. gs://bucket/prefix/20260207_00z). '
+                             'Overrides --parquet-dir. Uses service account from .env')
+    parser.add_argument('--date', type=str, default=None,
+                        help='Date to stream (YYYYMMDD). Builds GCS path from .env bucket/prefix '
+                             'if --gcs-parquet-path is not set')
+    parser.add_argument('--run', type=str, default='00',
+                        help='Model run hour (default: 00)')
     parser.add_argument('--steps', type=str, default=','.join(map(str, TARGET_STEPS)),
                         help='Comma-separated forecast hours (default: 36-60)')
     parser.add_argument('--max-members', type=int, default=51,
@@ -642,12 +734,18 @@ if __name__ == "__main__":
 
     steps = [int(s.strip()) for s in args.steps.split(',')]
 
+    # Resolve GCS path: explicit > --date + .env > None (local)
+    gcs_path = args.gcs_parquet_path
+    if not gcs_path and args.date and default_gcs_path:
+        gcs_path = f"{default_gcs_path}/{args.date}_{args.run}z"
+
     success = main(
         parquet_dir=Path(args.parquet_dir),
         target_steps=steps,
         max_members=args.max_members,
         output_dir=Path(args.output_dir),
-        parallel_members=args.parallel_fetches
+        parallel_members=args.parallel_fetches,
+        gcs_parquet_path=gcs_path
     )
 
     if success:

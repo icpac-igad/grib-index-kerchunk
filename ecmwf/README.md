@@ -40,9 +40,21 @@ cgan_ecmwf/
 
 ## Installation
 
+### Using `uv` (recommended)
+
+Both main scripts include [PEP 723](https://peps.python.org/pep-0723/) inline metadata, so `uv` will automatically create an isolated environment and install dependencies:
+
+```bash
+# No manual install needed — just run:
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan
+uv run stream_cgan_variables.py --parquet-dir ecmwf_three_stage_20260206_00z
+```
+
+### Using `pip`
+
 ```bash
 # Core dependencies
-pip install kerchunk zarr xarray pandas numpy fsspec s3fs requests pyarrow
+pip install kerchunk "zarr<3" xarray pandas numpy fsspec s3fs requests pyarrow
 
 # GRIB processing
 pip install cfgrib eccodes gribberish
@@ -50,9 +62,70 @@ pip install cfgrib eccodes gribberish
 # NetCDF output
 pip install netCDF4 h5netcdf
 
+# Environment file support
+pip install python-dotenv
+
+# Optional: For GCS upload (--upload-gcs)
+pip install gcsfs
+
 # Optional: For Dask/Coiled parallelization
 pip install dask distributed coiled gcsfs
 ```
+
+## Credentials & Service Account Requirements
+
+### AWS S3 (ECMWF forecast data)
+
+**No credentials needed.** Both scripts use anonymous S3 access to read ECMWF public forecast data:
+
+```python
+os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
+```
+
+This is set automatically — no AWS account, keys, or configuration required.
+
+### Google Cloud Storage (GCS)
+
+GCS credentials are **only required** when using the `--upload-gcs` flag in `run_ecmwf_tutorial.py` (to upload parquet files for Coiled workers) or when using `stream_cgan_variables_coiled_simple.py`.
+
+| Script | GCS Required? | When? |
+|--------|--------------|-------|
+| `run_ecmwf_tutorial.py` | Only with `--upload-gcs` | Uploading parquets to GCS |
+| `stream_cgan_variables.py` | **No** | Reads local parquets, fetches from S3 |
+| `stream_cgan_variables_coiled_simple.py` | **Yes** | Reads parquets from GCS |
+
+**Setting up GCS credentials:**
+
+1. **Service account JSON file** (recommended for CI/automation):
+   ```bash
+   # Set in .env file or environment
+   GCS_SERVICE_ACCOUNT_FILE=coiled-data.json
+   ```
+   The file must have `storage.objects.create` and `storage.objects.list` permissions on the target bucket.
+
+2. **Application Default Credentials** (recommended for local development):
+   ```bash
+   gcloud auth application-default login
+   ```
+   If no service account file is found, scripts automatically fall back to ADC.
+
+3. **Environment variables** (copy `.env.example` to `.env`):
+   ```bash
+   cp .env.example .env
+   # Edit .env with your values:
+   #   GCS_BUCKET=gik-ecmwf-aws-tf
+   #   GCS_PARQUET_PREFIX=run_par_ecmwf
+   #   GCS_SERVICE_ACCOUNT_FILE=coiled-data.json
+   ```
+
+### Summary: What you need for each workflow
+
+| Workflow | AWS Creds | GCS Creds | Service Account File |
+|----------|-----------|-----------|---------------------|
+| Phase 1: Create parquets locally | None | None | None |
+| Phase 1 + upload to GCS | None | Required | Optional (ADC works) |
+| Phase 2: Local streaming | None | None | None |
+| Phase 2: Coiled streaming | None | Required | Recommended |
 
 ## GCS Bucket Configuration
 
@@ -68,11 +141,11 @@ The pipeline uses two GCS buckets:
 --gcs-parquet-path gs://gik-ecmwf-aws-tf/run_par_ecmwf/YYYYMMDD_00z
 ```
 
-Environment variables (optional, set in `.env` file):
+Environment variables (set in `.env` file — see `.env.example`):
 ```bash
-GCS_BUCKET=gik-ecmwf-aws-tf          # Parquet upload bucket
-GCS_PARQUET_PREFIX=run_par_ecmwf      # Prefix path within bucket
-GCS_SERVICE_ACCOUNT_FILE=coiled-data.json  # Service account key (optional)
+GCS_BUCKET=gik-ecmwf-aws-tf              # Parquet bucket
+GCS_PARQUET_PREFIX=run_par_ecmwf          # Prefix path within bucket
+GCS_SERVICE_ACCOUNT_FILE=coiled-data.json # Service account JSON (falls back to ADC)
 ```
 
 ## Quick Start
@@ -83,41 +156,47 @@ GCS_SERVICE_ACCOUNT_FILE=coiled-data.json  # Service account key (optional)
 cd cgan_ecmwf/
 
 # Recommended: Template fast-path + parallel Stage 2 (~10.5 min)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
 
-# Upload parquets to GCS (needed for Coiled streaming)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8 --upload-gcs
+# Upload parquets to GCS (needed for Coiled streaming — requires GCS credentials)
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8 --upload-gcs
 
 # Sequential processing (no parallelization, ~31 min)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
 
 # Legacy: Full pipeline with GRIB scanning (~110 min)
-python run_ecmwf_tutorial.py --date 20260206 --run-stage1
+uv run run_ecmwf_tutorial.py --date 20260206 --run-stage1
 
 # With limited members for testing
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --max-members 5
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --max-members 5
 ```
 
 **Output:** `ecmwf_three_stage_YYYYMMDD_HHz/` directory with `stage3_*.parquet` files
 
 ### Phase 2: Stream cGAN Variables
 
-**Local streaming** (no cloud cluster needed, ~24 min with 8 parallel threads):
+**GCS streaming** (reads parquets from GCS, requires `.env` with service account):
 ```bash
-# Stream all 51 members with parallel S3 fetches (~24 min)
-python stream_cgan_variables.py \
+# Stream by date — builds GCS path from .env (GCS_BUCKET/GCS_PARQUET_PREFIX)
+uv run stream_cgan_variables.py --date 20260207
+
+# Explicit GCS path
+uv run stream_cgan_variables.py \
+    --gcs-parquet-path gs://gik-ecmwf-aws-tf/run_par_ecmwf/20260207_00z
+
+# Quick test: 1 member, 1 step
+uv run stream_cgan_variables.py --date 20260207 --max-members 1 --steps "48"
+
+# Custom timesteps with more parallelism
+uv run stream_cgan_variables.py --date 20260207 \
+    --steps "36,39,42,45,48,51,54,57,60" --parallel-fetches 8
+```
+
+**Local streaming** (reads parquets from local directory, no credentials required):
+```bash
+uv run stream_cgan_variables.py \
     --parquet-dir ecmwf_three_stage_20260206_00z \
     --parallel-fetches 8
-
-# Stream 3 members for quick test
-python stream_cgan_variables.py \
-    --parquet-dir ecmwf_three_stage_20260206_00z \
-    --max-members 3
-
-# Custom timesteps
-python stream_cgan_variables.py \
-    --parquet-dir ecmwf_three_stage_20260206_00z \
-    --steps "30,36,42,48,54,60"
 ```
 
 **Coiled parallel streaming** (requires GCS parquets + Coiled account):
@@ -161,12 +240,15 @@ Main entry point for the GIK three-stage pipeline.
 
 ### 2. `stream_cgan_variables.py`
 
-Local streaming with parallel S3 fetches: extracts 12 cGAN input variables with ensemble mean and standard deviation. Uses `ThreadPoolExecutor` at two levels (members + timestep fetches) for ~10x speedup over sequential.
+Local or GCS streaming with parallel S3 fetches: extracts 12 cGAN input variables with ensemble mean and standard deviation. Uses `ThreadPoolExecutor` at two levels (members + timestep fetches) for ~10x speedup over sequential. Reads GCS/bucket config from `.env` via `python-dotenv`.
 
 **Arguments:**
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--parquet-dir` | ecmwf_three_stage_20260203_00z | Directory containing stage3 parquet files |
+| `--date` | None | Date (YYYYMMDD). Builds GCS path from `.env` bucket/prefix |
+| `--run` | 00 | Model run hour |
+| `--gcs-parquet-path` | None | Explicit GCS path (overrides `--parquet-dir` and `--date`) |
+| `--parquet-dir` | ecmwf_three_stage_20260203_00z | Local directory (fallback when no GCS path) |
 | `--steps` | 36,39,42,45,48,51,54,57,60 | Comma-separated forecast hours |
 | `--max-members` | 51 | Maximum number of ensemble members |
 | `--parallel-fetches` | 8 | Number of concurrent member streams |
@@ -273,13 +355,13 @@ With `--parallel-workers N`, Stage 2 uses Python's `ProcessPoolExecutor` to proc
 
 ```bash
 # 8 workers (default, recommended for most machines)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 8
 
 # 16 workers (for machines with more cores and bandwidth)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 16
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 16
 
 # Sequential fallback (no parallelization)
-python run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
+uv run run_ecmwf_tutorial.py --date 20260206 --skip-grib-scan --parallel-workers 1
 ```
 
 The bottleneck is S3 I/O (fetching 85 `.index` files per member), so the optimal worker count depends on network bandwidth rather than CPU cores. With 8 workers, Stage 2 drops from ~30 min to ~8.8 min (3.4x speedup).
@@ -301,12 +383,12 @@ The bottleneck is S3 I/O (fetching 85 `.index` files per member), so the optimal
 
 ```bash
 # Default: 8 concurrent member streams (~24 min for 51 members)
-python stream_cgan_variables.py \
+uv run stream_cgan_variables.py \
     --parquet-dir ecmwf_three_stage_20260206_00z \
     --parallel-fetches 8
 
 # Sequential fallback (~4 hours)
-python stream_cgan_variables.py \
+uv run stream_cgan_variables.py \
     --parquet-dir ecmwf_three_stage_20260206_00z \
     --parallel-fetches 1
 ```
@@ -347,7 +429,7 @@ export AWS_NO_SIGN_REQUEST=YES
 
 **Parquets not on GCS after pipeline run:**
 - The `--upload-gcs` flag is required for GCS upload (not automatic)
-- Run: `python run_ecmwf_tutorial.py --date YYYYMMDD --skip-grib-scan --upload-gcs`
+- Run: `uv run run_ecmwf_tutorial.py --date YYYYMMDD --skip-grib-scan --upload-gcs`
 
 ## References
 
