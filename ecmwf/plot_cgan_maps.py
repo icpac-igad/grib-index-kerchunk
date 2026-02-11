@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "matplotlib",
+#     "cartopy",
+#     "xarray",
+#     "numpy",
+#     "netcdf4",
+# ]
+# ///
 """
 Plot ECMWF cGAN ensemble forecast maps over the ICPAC region.
 
@@ -108,7 +118,7 @@ def plot_cgan_maps(input_file: str, step_index: int = 4, output_file: str = None
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Plot ECMWF cGAN ensemble maps')
-    parser.add_argument('--input', type=str, default='cgan_output/IFS_20260206_00Z_cgan_simple.nc',
+    parser.add_argument('--input', type=str, default='cgan_output/IFS_20260207_00Z_cgan.nc',
                         help='Input NetCDF file')
     parser.add_argument('--output', type=str, default=None,
                         help='Output PNG file (default: same name as input with .png)')

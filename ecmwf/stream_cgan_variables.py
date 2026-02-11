@@ -578,9 +578,14 @@ def main(
     max_members: int = 51,
     output_dir: Path = OUTPUT_DIR,
     parallel_members: int = MAX_PARALLEL_FETCHES,
-    gcs_parquet_path: str = None
+    gcs_parquet_path: str = None,
+    variables: List[str] = None
 ):
-    """Main streaming routine."""
+    """Main streaming routine.
+
+    If *variables* is given (list of output-variable names such as
+    ``['tp']``), only those variables will be streamed.
+    """
     print("="*70)
     print("ECMWF Data Streaming for cGAN Inference")
     print("="*70)
@@ -628,10 +633,23 @@ def main(
         gcs_parquet_path=gcs_parquet_path,
     )
 
+    # Optionally filter variable dicts when --variables is supplied
+    var_set = set(variables) if variables else None
+
+    surface_vars = {k: v for k, v in CGAN_SURFACE_VARS.items()
+                    if var_set is None or v in var_set}
+    atmos_vars   = {k: v for k, v in CGAN_ATMOS_VARS.items()
+                    if var_set is None or v in var_set}
+    pressure_vars = {k: v for k, v in CGAN_PRESSURE_VARS.items()
+                     if var_set is None or v in var_set}
+
+    if var_set:
+        print(f"Variable filter: {sorted(var_set)}")
+
     # Surface variables
     print("\n[Phase 1] Streaming Surface Variables")
     print("-"*50)
-    for ecmwf_var, output_var in CGAN_SURFACE_VARS.items():
+    for ecmwf_var, output_var in surface_vars.items():
         mean, std, steps = stream_all_members_for_variable(
             parquet_dir, ecmwf_var, target_steps, output_var,
             **stream_kwargs
@@ -642,7 +660,7 @@ def main(
     # Atmospheric variables
     print("\n[Phase 2] Streaming Atmospheric Variables")
     print("-"*50)
-    for ecmwf_var, output_var in CGAN_ATMOS_VARS.items():
+    for ecmwf_var, output_var in atmos_vars.items():
         mean, std, steps = stream_all_members_for_variable(
             parquet_dir, ecmwf_var, target_steps, output_var,
             **stream_kwargs
@@ -653,7 +671,7 @@ def main(
     # Pressure level variables (700 hPa winds)
     print("\n[Phase 3] Streaming Pressure Level Variables (700 hPa)")
     print("-"*50)
-    for ecmwf_var, output_var in CGAN_PRESSURE_VARS.items():
+    for ecmwf_var, output_var in pressure_vars.items():
         mean, std, steps = stream_all_members_for_variable(
             parquet_dir, ecmwf_var, target_steps, output_var,
             is_pressure_level=True,
@@ -729,10 +747,18 @@ if __name__ == "__main__":
                         help='Output directory for NetCDF file')
     parser.add_argument('--parallel-fetches', type=int, default=MAX_PARALLEL_FETCHES,
                         help=f'Number of concurrent member streams (default: {MAX_PARALLEL_FETCHES})')
+    parser.add_argument('--variables', type=str, default=None,
+                        help='Comma-separated output variable names to stream '
+                             '(e.g. "tp" or "tp,t2m"). Default: all variables')
 
     args = parser.parse_args()
 
     steps = [int(s.strip()) for s in args.steps.split(',')]
+
+    # Parse variable filter
+    var_filter = None
+    if args.variables:
+        var_filter = [v.strip() for v in args.variables.split(',')]
 
     # Resolve GCS path: explicit > --date + .env > None (local)
     gcs_path = args.gcs_parquet_path
@@ -745,7 +771,8 @@ if __name__ == "__main__":
         max_members=args.max_members,
         output_dir=Path(args.output_dir),
         parallel_members=args.parallel_fetches,
-        gcs_parquet_path=gcs_path
+        gcs_parquet_path=gcs_path,
+        variables=var_filter
     )
 
     if success:
