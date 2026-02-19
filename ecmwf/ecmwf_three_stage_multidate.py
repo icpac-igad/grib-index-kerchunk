@@ -275,11 +275,303 @@ def run_stage1_prebuilt(member_parquets, test_date, test_run):
 
 
 # ==============================================================================
+# STAGE 1 FAST PATH: BUILD FROM TEMPLATE (NO GRIB SCANNING)
+# ==============================================================================
+
+def build_deflated_stores_from_template(
+    template_tar_path: str,
+    template_date: str,
+    max_members: Optional[int] = None
+) -> Optional[Dict]:
+    """
+    Build deflated_stores directly from the HuggingFace template archive.
+
+    This replaces the slow scan_grib approach (~73 min) with direct template
+    loading (~2-5 seconds). The template contains the zarr structure metadata
+    that Stage 3 needs as a base for merging with Stage 2 references.
+
+    Args:
+        template_tar_path: Path to the template tar.gz file
+        template_date: Reference date in the template (e.g., '20240529')
+        max_members: Optional limit on number of members
+
+    Returns:
+        deflated_stores dict mapping member names to zarr store dicts
+    """
+    import tarfile
+
+    log_stage(1, "LOAD ZARR STRUCTURE FROM TEMPLATE (No GRIB scanning)")
+
+    start_time = time.time()
+
+    if not Path(template_tar_path).exists():
+        log_checkpoint(f"Template archive not found: {template_tar_path}")
+        return None
+
+    try:
+        # All member directory names in the template archive
+        all_members = ['ens_control'] + [f'ens_{i:02d}' for i in range(1, 51)]
+
+        if max_members:
+            all_members = all_members[:max_members]
+
+        log_checkpoint(f"Loading zarr structure for {len(all_members)} members from template")
+        log_checkpoint(f"Template: {template_tar_path}")
+        log_checkpoint(f"Reference date: {template_date}")
+
+        deflated_stores = {}
+
+        with tarfile.open(template_tar_path, 'r:gz') as tar:
+            for member_dir in all_members:
+                # Map directory name to member key used downstream
+                if member_dir == 'ens_control':
+                    member_key = 'control'
+                    filename_member = 'control'
+                else:
+                    num = int(member_dir.replace('ens_', ''))
+                    member_key = f'ens_{num:02d}'
+                    filename_member = f'ens{num:02d}'
+
+                # Path inside tar.gz
+                tar_member_path = (
+                    f"gik-fmrc/v2ecmwf_fmrc/{member_dir}/"
+                    f"ecmwf-{template_date}00-{filename_member}-rt000.par"
+                )
+
+                try:
+                    member_info = tar.getmember(tar_member_path)
+                except KeyError:
+                    log_checkpoint(f"  Template not found for {member_key}: {tar_member_path}")
+                    continue
+
+                # Extract and read the parquet
+                f = tar.extractfile(member_info)
+                if f is None:
+                    continue
+
+                import io
+                parquet_bytes = f.read()
+                template_df = pd.read_parquet(io.BytesIO(parquet_bytes))
+
+                # Convert to zarr store dict (same as read_parquet_to_zarr_store)
+                zstore = {}
+                for _, row in template_df.iterrows():
+                    key = row['key']
+                    value = row['value']
+                    if isinstance(value, bytes):
+                        value = value.decode('utf-8')
+                    if isinstance(value, str):
+                        if value.startswith('[') or value.startswith('{'):
+                            try:
+                                value = json.loads(value)
+                            except Exception:
+                                pass
+                    zstore[key] = value
+
+                if 'version' in zstore:
+                    del zstore['version']
+
+                deflated_stores[member_key] = zstore
+
+        elapsed = time.time() - start_time
+
+        log_checkpoint(f"Stage 1 (Template) Complete!")
+        log_checkpoint(f"   Time: {elapsed:.1f} seconds")
+        log_checkpoint(f"   Members loaded: {len(deflated_stores)}")
+
+        if deflated_stores:
+            sample_key = next(iter(deflated_stores))
+            sample_size = len(deflated_stores[sample_key])
+            log_checkpoint(f"   Sample '{sample_key}': {sample_size} zarr entries")
+
+        return deflated_stores
+
+    except Exception as e:
+        log_checkpoint(f"Stage 1 (Template) Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def validate_index_availability(date_str: str, run: str) -> Tuple[bool, int, int]:
+    """
+    Validate that .index files are available on S3 for the target date.
+
+    Checks hour 0 index file and verifies expected message count and members.
+
+    Returns:
+        (is_valid, n_messages, n_members)
+    """
+    import fsspec
+
+    idx_url = (
+        f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/"
+        f"{date_str}000000-0h-enfo-ef.index"
+    )
+
+    try:
+        fs = fsspec.filesystem("s3", anon=True)
+
+        if not fs.exists(idx_url):
+            log_checkpoint(f"Index file not found: {idx_url}")
+            return False, 0, 0
+
+        with fs.open(idx_url, 'r') as f:
+            lines = f.readlines()
+
+        members = set()
+        for line in lines:
+            data = json.loads(line.strip().rstrip(','))
+            members.add(int(data.get('number', -1)))
+
+        n_messages = len(lines)
+        n_members = len(members)
+
+        log_checkpoint(f"Index validation: {n_messages} messages, {n_members} members")
+
+        # Expected: 51 members, ~160 variables each = ~8160 messages
+        if n_members < 50:
+            log_checkpoint(f"WARNING: Expected 51 members, found {n_members}")
+            return False, n_messages, n_members
+
+        return True, n_messages, n_members
+
+    except Exception as e:
+        log_checkpoint(f"Index validation failed: {e}")
+        return False, 0, 0
+
+
+def spot_check_grib_integrity(date_str: str, run: str, n_checks: int = 3) -> bool:
+    """
+    Spot-check GRIB file integrity by fetching a few byte ranges
+    and verifying they parse as valid GRIB messages with gribberish.
+
+    Args:
+        date_str: Target date
+        run: Model run hour
+        n_checks: Number of random messages to check
+
+    Returns:
+        True if all checks pass
+    """
+    import fsspec
+
+    grib_url = (
+        f"ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/"
+        f"{date_str}000000-0h-enfo-ef.grib2"
+    )
+    idx_url = f"s3://{grib_url}".replace('.grib2', '.index')
+
+    try:
+        from gribberish import parse_grib_mapping
+
+        fs = fsspec.filesystem("s3", anon=True)
+
+        # Read index to get message offsets
+        with fs.open(idx_url, 'r') as f:
+            lines = f.readlines()
+
+        entries = [json.loads(line.strip().rstrip(',')) for line in lines]
+
+        # Pick n_checks messages spread across the file (large messages only)
+        large_entries = [e for e in entries if int(e['_length']) > 10000]
+        if not large_entries:
+            log_checkpoint("No large messages found for spot-check")
+            return True
+
+        import random
+        random.seed(42)  # Reproducible
+        check_entries = random.sample(large_entries, min(n_checks, len(large_entries)))
+
+        passed = 0
+        for entry in check_entries:
+            offset = int(entry['_offset'])
+            length = int(entry['_length'])
+
+            with fs.open(grib_url, 'rb') as f:
+                f.seek(offset)
+                msg_bytes = f.read(length)
+
+            try:
+                mapping = parse_grib_mapping(msg_bytes)
+                if mapping:
+                    passed += 1
+            except Exception:
+                log_checkpoint(
+                    f"  Spot-check failed: param={entry['param']}, "
+                    f"offset={offset}"
+                )
+
+        log_checkpoint(f"Spot-check: {passed}/{len(check_entries)} GRIB messages valid")
+        return passed == len(check_entries)
+
+    except ImportError:
+        log_checkpoint("gribberish not available, skipping spot-check")
+        return True
+    except Exception as e:
+        log_checkpoint(f"Spot-check error: {e}")
+        return True  # Don't block pipeline on spot-check failure
+
+
+# ==============================================================================
 # STAGE 2: INDEX + GCS TEMPLATES
 # ==============================================================================
 
+def _process_single_member_stage2(args):
+    """Worker function for parallel Stage 2 processing.
+
+    Processes one ensemble member: fetches .index files from S3,
+    merges with template, saves parquet. Returns (member, refs) or
+    (member, None) on failure.
+    """
+    (member, member_normalized, test_date, test_run, output_dir_str,
+     use_local_template, local_template_path) = args
+
+    import os
+    os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
+
+    try:
+        from ecmwf_index_processor import build_complete_parquet_from_indices
+
+        refs = build_complete_parquet_from_indices(
+            date_str=test_date,
+            run=test_run,
+            member_name=member_normalized,
+            hours=ECMWF_FORECAST_HOURS,
+            use_gcs_template=not use_local_template,
+            gcs_template_date=REFERENCE_DATE,
+            use_local_template=use_local_template,
+            local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
+        )
+
+        if refs:
+            output_dir = Path(output_dir_str)
+            stage2_output = output_dir / f"stage2_{member}_merged.parquet"
+
+            df_data = []
+            for key, value in refs.items():
+                if isinstance(value, str):
+                    encoded_value = value.encode('utf-8')
+                elif isinstance(value, (list, dict)):
+                    encoded_value = json.dumps(value).encode('utf-8')
+                else:
+                    encoded_value = str(value).encode('utf-8')
+                df_data.append((key, encoded_value))
+
+            df = pd.DataFrame(df_data, columns=['key', 'value'])
+            df.to_parquet(stage2_output)
+
+            return (member, refs)
+
+        return (member, None)
+
+    except Exception as e:
+        return (member, None, str(e))
+
+
 def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
-                                   use_local_template=False, local_template_path=None):
+                                   use_local_template=False, local_template_path=None,
+                                   parallel_workers=8):
     """Stage 2: INDEX + Templates merge (GCS or local).
 
     Args:
@@ -289,23 +581,24 @@ def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
         output_dir: Output directory path
         use_local_template: If True, use local tar.gz file instead of GCS bucket
         local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
+        parallel_workers: Number of parallel workers (0 or 1 = sequential)
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     template_source = "LOCAL TAR.GZ" if use_local_template else "GCS BUCKET"
-    log_stage(2, f"INDEX + TEMPLATES MERGE ({template_source}, All 85 hours)")
+    mode = f"PARALLEL {parallel_workers} workers" if parallel_workers > 1 else "SEQUENTIAL"
+    log_stage(2, f"INDEX + TEMPLATES MERGE ({template_source}, {mode}, All 85 hours)")
 
     start_time = time.time()
 
     try:
-        from ecmwf_index_processor import build_complete_parquet_from_indices
-
         log_checkpoint(f"Target date: {test_date}")
         log_checkpoint(f"Reference date: {REFERENCE_DATE}")
-        log_checkpoint(f"Processing {len(test_members)} members")
+        log_checkpoint(f"Processing {len(test_members)} members ({mode})")
 
-        member_results = {}
-
+        # Prepare args for each member
+        task_args = []
         for member in test_members:
-            # Normalize member format
             if member == 'control':
                 member_normalized = 'control'
             else:
@@ -314,40 +607,85 @@ def run_stage2_with_gcs_templates(test_date, test_run, test_members, output_dir,
                     member_num_str = member_normalized.replace('ens', '')
                     member_normalized = f'ens{int(member_num_str):02d}'
 
-            try:
-                refs = build_complete_parquet_from_indices(
-                    date_str=test_date,
-                    run=test_run,
-                    member_name=member_normalized,
-                    hours=ECMWF_FORECAST_HOURS,
-                    use_gcs_template=not use_local_template,
-                    gcs_template_date=REFERENCE_DATE,
-                    use_local_template=use_local_template,
-                    local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
-                )
+            task_args.append((
+                member, member_normalized, test_date, test_run,
+                str(output_dir), use_local_template, local_template_path
+            ))
 
-                if refs:
-                    stage2_output = output_dir / f"stage2_{member}_merged.parquet"
+        member_results = {}
 
-                    df_data = []
-                    for key, value in refs.items():
-                        if isinstance(value, str):
-                            encoded_value = value.encode('utf-8')
-                        elif isinstance(value, (list, dict)):
-                            encoded_value = json.dumps(value).encode('utf-8')
+        if parallel_workers > 1 and len(test_members) > 1:
+            # --- PARALLEL PATH ---
+            n_workers = min(parallel_workers, len(test_members))
+            log_checkpoint(f"Launching {n_workers} parallel workers")
+
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                future_to_member = {
+                    executor.submit(_process_single_member_stage2, args): args[0]
+                    for args in task_args
+                }
+
+                completed = 0
+                for future in as_completed(future_to_member):
+                    member_name = future_to_member[future]
+                    completed += 1
+                    try:
+                        result = future.result()
+                        if len(result) == 2:
+                            member, refs = result
+                            if refs:
+                                member_results[member] = refs
+                                log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                             f"{member}: {len(refs)} references")
+                            else:
+                                log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                             f"{member}: no refs returned")
                         else:
-                            encoded_value = str(value).encode('utf-8')
-                        df_data.append((key, encoded_value))
+                            member, _, error = result
+                            log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                         f"Error {member}: {error}")
+                    except Exception as e:
+                        log_checkpoint(f"[{completed}/{len(test_members)}] "
+                                     f"Worker error {member_name}: {e}")
+        else:
+            # --- SEQUENTIAL PATH (fallback) ---
+            from ecmwf_index_processor import build_complete_parquet_from_indices
 
-                    df = pd.DataFrame(df_data, columns=['key', 'value'])
-                    df.to_parquet(stage2_output)
+            for member, member_normalized, _, _, _, _, _ in task_args:
+                try:
+                    refs = build_complete_parquet_from_indices(
+                        date_str=test_date,
+                        run=test_run,
+                        member_name=member_normalized,
+                        hours=ECMWF_FORECAST_HOURS,
+                        use_gcs_template=not use_local_template,
+                        gcs_template_date=REFERENCE_DATE,
+                        use_local_template=use_local_template,
+                        local_template_path=local_template_path or LOCAL_TEMPLATE_TAR
+                    )
 
-                    member_results[member] = refs
-                    log_checkpoint(f"{member}: {len(refs)} references")
+                    if refs:
+                        stage2_output = output_dir / f"stage2_{member}_merged.parquet"
 
-            except Exception as e:
-                log_checkpoint(f"Error processing {member}: {e}")
-                continue
+                        df_data = []
+                        for key, value in refs.items():
+                            if isinstance(value, str):
+                                encoded_value = value.encode('utf-8')
+                            elif isinstance(value, (list, dict)):
+                                encoded_value = json.dumps(value).encode('utf-8')
+                            else:
+                                encoded_value = str(value).encode('utf-8')
+                            df_data.append((key, encoded_value))
+
+                        df = pd.DataFrame(df_data, columns=['key', 'value'])
+                        df.to_parquet(stage2_output)
+
+                        member_results[member] = refs
+                        log_checkpoint(f"{member}: {len(refs)} references")
+
+                except Exception as e:
+                    log_checkpoint(f"Error processing {member}: {e}")
+                    continue
 
         elapsed = time.time() - start_time
 
@@ -428,7 +766,9 @@ def run_stage3(deflated_stores, stage2_refs, test_date, output_dir):
 # ==============================================================================
 
 def process_single_date(date_str: str, run: str, max_members: Optional[int] = None,
-                        use_local_template: bool = False, local_template_path: Optional[str] = None) -> Tuple[bool, Optional[Path]]:
+                        use_local_template: bool = False, local_template_path: Optional[str] = None,
+                        skip_grib_scan: bool = False,
+                        parallel_workers: int = 8) -> Tuple[bool, Optional[Path]]:
     """
     Process a single date through all three stages.
 
@@ -438,6 +778,9 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
     - max_members: Maximum number of members to process (optional)
     - use_local_template: If True, use local tar.gz file instead of GCS bucket
     - local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
+    - skip_grib_scan: If True, build deflated_stores from template instead of zip
+                      (Phase 1 optimization: eliminates 73-min scan_grib dependency)
+    - parallel_workers: Number of parallel workers for Stage 2 (0 or 1 = sequential)
 
     Returns:
     - Tuple of (success, output_directory_path)
@@ -448,7 +791,15 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
 
     start_time = time.time()
 
-    # Find the zip file for this date
+    # Create output directory
+    output_dir = Path(f"ecmwf_three_stage_{date_str}_{run}z")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine the template path for both Stage 1 fast-path and Stage 2
+    template_path = local_template_path or LOCAL_TEMPLATE_TAR
+
+    # --- Determine Stage 1 strategy ---
+    # Priority: 1) Existing zip file  2) Template fast-path  3) Fail
     zip_patterns = [
         f"ecmwf_{date_str}_{run}z_efficient.zip",
         f"ecmwf_{date_str}_{run}_efficient.zip"
@@ -460,44 +811,89 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
             zip_file = Path(pattern)
             break
 
-    if not zip_file:
-        log_checkpoint(f"Zip file not found for {date_str}_{run}z")
-        log_checkpoint(f"Expected: {zip_patterns[0]} or {zip_patterns[1]}")
-        return False, None
-
-    log_checkpoint(f"Using zip file: {zip_file}")
-
-    # Create output directory
-    output_dir = Path(f"ecmwf_three_stage_{date_str}_{run}z")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    use_template_fast_path = False
+    if zip_file and not skip_grib_scan:
+        log_checkpoint(f"Using zip file: {zip_file}")
+    elif skip_grib_scan or not zip_file:
+        if Path(template_path).exists():
+            use_template_fast_path = True
+            log_checkpoint(f"Using template fast-path (no GRIB scanning)")
+        elif zip_file:
+            log_checkpoint(f"Template not found, falling back to zip: {zip_file}")
+        else:
+            log_checkpoint(f"No zip file and no template found")
+            log_checkpoint(f"  Zip expected: {zip_patterns[0]}")
+            log_checkpoint(f"  Template expected: {template_path}")
+            return False, None
 
     try:
-        # Extract zip file
-        extract_dir = output_dir / "extracted"
-        extraction_info = unzip_and_prepare(zip_file, extract_dir)
+        extract_dir = None
 
-        member_parquets = extraction_info['members']
-        test_members = sorted(member_parquets.keys())
+        if use_template_fast_path:
+            # --- FAST PATH: Build deflated_stores from template ---
 
-        log_checkpoint(f"Found {len(test_members)} members in zip")
+            # Validate that index files exist on S3
+            idx_valid, n_msgs, n_members = validate_index_availability(date_str, run)
+            if not idx_valid:
+                log_checkpoint("Index validation failed — falling back to zip if available")
+                if zip_file:
+                    use_template_fast_path = False
+                else:
+                    return False, None
 
-        # Apply max_members limit
-        if max_members and max_members < len(test_members):
-            test_members = test_members[:max_members]
-            member_parquets = {k: v for k, v in member_parquets.items() if k in test_members}
-            log_checkpoint(f"Limiting to {max_members} members")
+        if use_template_fast_path:
+            # Spot-check GRIB integrity (non-blocking, ~10s)
+            spot_ok = spot_check_grib_integrity(date_str, run, n_checks=3)
+            if not spot_ok:
+                log_checkpoint("WARNING: GRIB spot-check had failures (continuing anyway)")
 
-        # Stage 1
-        deflated_stores = run_stage1_prebuilt(member_parquets, date_str, run)
+            # Build deflated_stores from template
+            deflated_stores = build_deflated_stores_from_template(
+                template_tar_path=template_path,
+                template_date=REFERENCE_DATE,
+                max_members=max_members
+            )
 
-        if not deflated_stores:
-            return False, None
+            if not deflated_stores:
+                log_checkpoint("Template loading failed")
+                if zip_file:
+                    log_checkpoint("Falling back to zip file")
+                    use_template_fast_path = False
+                else:
+                    return False, None
+
+            if use_template_fast_path:
+                test_members = sorted(deflated_stores.keys())
+
+        if not use_template_fast_path:
+            # --- ORIGINAL PATH: Extract zip file ---
+            extract_dir = output_dir / "extracted"
+            extraction_info = unzip_and_prepare(zip_file, extract_dir)
+
+            member_parquets = extraction_info['members']
+            test_members = sorted(member_parquets.keys())
+
+            log_checkpoint(f"Found {len(test_members)} members in zip")
+
+            # Apply max_members limit
+            if max_members and max_members < len(test_members):
+                test_members = test_members[:max_members]
+                member_parquets = {k: v for k, v in member_parquets.items()
+                                   if k in test_members}
+                log_checkpoint(f"Limiting to {max_members} members")
+
+            # Stage 1 from prebuilt parquets
+            deflated_stores = run_stage1_prebuilt(member_parquets, date_str, run)
+
+            if not deflated_stores:
+                return False, None
 
         # Stage 2
         stage2_refs = run_stage2_with_gcs_templates(
             date_str, run, test_members, output_dir,
             use_local_template=use_local_template,
-            local_template_path=local_template_path
+            local_template_path=template_path,
+            parallel_workers=parallel_workers
         )
 
         # Stage 3
@@ -506,17 +902,20 @@ def process_single_date(date_str: str, run: str, max_members: Optional[int] = No
             stage3_results = run_stage3(deflated_stores, stage2_refs, date_str, output_dir)
 
         # Cleanup extracted files to save space
-        if extract_dir.exists():
+        if extract_dir and extract_dir.exists():
             shutil.rmtree(extract_dir)
             log_checkpoint("Cleaned up extracted files")
 
         elapsed = time.time() - start_time
 
-        print(f"\nResults for {date_str}:")
+        mode = "template fast-path" if use_template_fast_path else "zip prebuilt"
+        print(f"\nResults for {date_str} (mode: {mode}):")
         print(f"   Processing time: {elapsed/60:.1f} minutes")
         print(f"   Stage 1: {'Success' if deflated_stores else 'Failed'}")
-        print(f"   Stage 2: {'Success' if stage2_refs else 'Failed'} ({len(stage2_refs) if stage2_refs else 0} members)")
-        print(f"   Stage 3: {'Success' if stage3_results else 'Failed'} ({len(stage3_results) if stage3_results else 0} members)")
+        print(f"   Stage 2: {'Success' if stage2_refs else 'Failed'} "
+              f"({len(stage2_refs) if stage2_refs else 0} members)")
+        print(f"   Stage 3: {'Success' if stage3_results else 'Failed'} "
+              f"({len(stage3_results) if stage3_results else 0} members)")
 
         success = stage3_results is not None and len(stage3_results) > 0
         return success, output_dir
@@ -544,6 +943,9 @@ def main():
                         help='Use local tar.gz file instead of GCS bucket for templates')
     parser.add_argument('--local-template-path', type=str, default=None,
                         help=f'Path to local template tar.gz file (default: {LOCAL_TEMPLATE_TAR})')
+    parser.add_argument('--skip-grib-scan', action='store_true',
+                        help='Skip GRIB scanning, build Stage 1 from template '
+                             '(Phase 1 optimization: ~73 min → ~5 sec)')
     args = parser.parse_args()
 
     print("="*80)
@@ -557,6 +959,7 @@ def main():
 
     log_message(f"Processing {len(dates)} dates: {dates}")
     log_message(f"Run: {run}z")
+    log_message(f"Skip GRIB scan: {args.skip_grib_scan}")
     if args.max_members:
         log_message(f"Max members per date: {args.max_members}")
     if args.use_local_template:
@@ -576,7 +979,8 @@ def main():
         success, output_dir = process_single_date(
             date_str, run, args.max_members,
             use_local_template=args.use_local_template,
-            local_template_path=args.local_template_path
+            local_template_path=args.local_template_path,
+            skip_grib_scan=args.skip_grib_scan
         )
 
         if success and output_dir is not None:
