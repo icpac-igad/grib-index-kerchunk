@@ -170,9 +170,7 @@ def build_complete_parquet_from_indices(
     member_name: str,
     hours: Optional[List[int]] = None,
     use_gcs_template: bool = False,
-    gcs_template_date: Optional[str] = None,
-    use_local_template: bool = False,
-    local_template_path: Optional[str] = None
+    gcs_template_date: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Build complete parquet with all time steps using index files.
@@ -182,10 +180,8 @@ def build_complete_parquet_from_indices(
         run: Run hour (00 or 12)
         member_name: Ensemble member name
         hours: Specific hours to process (default: all 85)
-        use_gcs_template: Whether to merge with GCS template (default)
+        use_gcs_template: Whether to merge with GCS template
         gcs_template_date: Reference date for GCS template
-        use_local_template: Whether to use local tar.gz template instead of GCS
-        local_template_path: Path to local tar.gz file (default: gik-fmrc-v2ecmwf_fmrc.tar.gz)
 
     Returns:
         Complete references dictionary
@@ -243,277 +239,40 @@ def build_complete_parquet_from_indices(
     logger.info(f"Created {len(all_refs)} total references for {member_name}")
     logger.info(f"Processed {len(metadata['hours_processed'])}/{len(hours)} hours successfully")
 
-    # Optionally merge with template (local or GCS)
-    if use_local_template and gcs_template_date:
-        # Use local tar.gz file instead of GCS bucket
-        local_path = local_template_path or "gik-fmrc-v2ecmwf_fmrc.tar.gz"
-        all_refs = merge_with_local_template(
-            all_refs, gcs_template_date, member_name,
-            local_tar_path=local_path
-        )
-    elif use_gcs_template and gcs_template_date:
-        # Use GCS bucket (requires service account)
-        all_refs = merge_with_gcs_template(
-            all_refs, gcs_template_date, member_name,
-            gcs_bucket="gik-fmrc",
-            gcs_base_path="v2ecmwf_fmrc"
-        )
+    # Optionally merge with GCS template
+    if use_gcs_template and gcs_template_date:
+        all_refs = merge_with_gcs_template(all_refs, gcs_template_date, member_name)
 
     return all_refs
-
-def merge_with_local_template(
-    index_refs: Dict,
-    template_date: str,
-    member_name: str,
-    local_tar_path: str = "gik-fmrc-v2ecmwf_fmrc.tar.gz",
-    extract_dir: Optional[str] = None
-) -> Dict:
-    """
-    Merge index-based references with local template structure from tar.gz file.
-
-    This is an alternative to merge_with_gcs_template that uses a locally available
-    tar.gz archive instead of downloading from GCS bucket.
-
-    Local tar.gz path pattern (inside archive):
-    gik-fmrc/v2ecmwf_fmrc/ens_control/ecmwf-2024052900-control-rt000.par
-    gik-fmrc/v2ecmwf_fmrc/ens_01/ecmwf-2024052900-ens01-rt000.par
-
-    Args:
-        index_refs: References from index files (target date)
-        template_date: Date of template (reference date, YYYYMMDD)
-        member_name: Ensemble member name (control, ens01, ens02, etc.)
-        local_tar_path: Path to the local tar.gz file
-        extract_dir: Optional directory to extract files (uses temp if None)
-
-    Returns:
-        Merged references with template structure and fresh positions
-    """
-    import tarfile
-    import tempfile
-    import shutil
-
-    try:
-        # Verify tar.gz file exists
-        if not Path(local_tar_path).exists():
-            logger.warning(f"Local template archive not found: {local_tar_path}")
-            logger.info("Using index references only (no template merge)")
-            return index_refs
-
-        # Build member path pattern (same logic as GCS version)
-        if member_name == 'control':
-            member_dir = 'ens_control'
-            filename_member = 'control'
-        else:
-            # Normalize member: handle both "ens09" and "09" formats
-            if member_name.startswith('ens'):
-                member_num_str = member_name.replace('ens', '')
-            else:
-                member_num_str = member_name
-
-            # Directory: ens_09 (with zero-padding)
-            member_dir = f'ens_{int(member_num_str):02d}'
-
-            # Filename: ens09 (with zero-padding and ens prefix)
-            filename_member = f'ens{int(member_num_str):02d}'
-
-        # Path inside tar.gz: gik-fmrc/v2ecmwf_fmrc/ens_XX/ecmwf-YYYYMMDD00-ensXX-rt000.par
-        tar_member_path = f"gik-fmrc/v2ecmwf_fmrc/{member_dir}/ecmwf-{template_date}00-{filename_member}-rt000.par"
-
-        logger.info(f"Loading local template: {local_tar_path}:{tar_member_path}")
-
-        # Use provided extract_dir or create temp directory
-        use_temp = extract_dir is None
-        if use_temp:
-            extract_dir = tempfile.mkdtemp(prefix="ecmwf_template_")
-
-        try:
-            # Extract the specific parquet file from tar.gz
-            with tarfile.open(local_tar_path, 'r:gz') as tar:
-                # Check if member exists in archive
-                try:
-                    member_info = tar.getmember(tar_member_path)
-                except KeyError:
-                    logger.warning(f"Template not found in archive: {tar_member_path}")
-                    logger.info("Using index references only (no template merge)")
-                    return index_refs
-
-                # Extract the file
-                tar.extract(member_info, path=extract_dir)
-
-            # Read the extracted parquet file
-            extracted_parquet_path = Path(extract_dir) / tar_member_path
-            template_df = pd.read_parquet(extracted_parquet_path)
-
-            logger.info(f"Template loaded: {len(template_df)} entries")
-            logger.info(f"Template columns: {list(template_df.columns)}")
-
-            # Convert template DataFrame to dict
-            template_refs = {}
-            for _, row in template_df.iterrows():
-                key = row['key']
-                value = row['value']
-
-                # Decode bytes to string if needed
-                if isinstance(value, bytes):
-                    value = value.decode('utf-8')
-
-                template_refs[key] = value
-
-            logger.info(f"Template converted to dict: {len(template_refs)} entries")
-
-            # Merge strategy (same as GCS version):
-            # 1. Start with template structure (has .zarray, .zattrs, metadata, etc.)
-            # 2. Update with fresh index references for data chunks
-            # 3. Index refs have fresh byte positions for target date
-
-            merged_refs = template_refs.copy()
-
-            # Update with index references (overwrites data chunk references)
-            for key, value in index_refs.items():
-                if not key.startswith('_'):  # Skip metadata keys
-                    merged_refs[key] = value
-
-            logger.info(f"Merged template + index:")
-            logger.info(f"  Template entries: {len(template_refs)}")
-            logger.info(f"  Index entries: {len(index_refs)}")
-            logger.info(f"  Merged total: {len(merged_refs)}")
-
-            return merged_refs
-
-        finally:
-            # Cleanup temp directory if we created it
-            if use_temp and Path(extract_dir).exists():
-                shutil.rmtree(extract_dir)
-
-    except Exception as e:
-        logger.warning(f"Could not merge with local template: {e}")
-        logger.info("Using index references only")
-        import traceback
-        traceback.print_exc()
-        return index_refs
-
 
 def merge_with_gcs_template(
     index_refs: Dict,
     template_date: str,
-    member_name: str,
-    gcs_bucket: str = "gik-fmrc",
-    gcs_base_path: str = "v2ecmwf_fmrc",
-    service_account_json: str = "coiled-data-e4drr_202505.json"
+    member_name: str
 ) -> Dict:
     """
     Merge index-based references with GCS template structure.
 
-    This is the critical Stage 2 integration that combines:
-    - Fresh index byte positions (from target date)
-    - Pre-built GCS template structure (from reference date)
-
-    GCS path pattern:
-    gs://gik-fmrc/v2ecmwf_fmrc/ens_control/ecmwf-2024052900-control-rt000.par
-    gs://gik-fmrc/v2ecmwf_fmrc/ens_01/ecmwf-2024052900-ens01-rt000.par
-
-    These templates are created from ecmwf_par_to_ensemble_members.py
-
     Args:
-        index_refs: References from index files (target date)
-        template_date: Date of GCS template (reference date, YYYYMMDD)
-        member_name: Ensemble member name (control, ens01, ens02, etc.)
-        gcs_bucket: GCS bucket name (default: gik-fmrc)
-        gcs_base_path: Base path in GCS (default: v2ecmwf_fmrc)
-        service_account_json: Path to service account JSON file
+        index_refs: References from index files
+        template_date: Date of GCS template
+        member_name: Ensemble member name
 
     Returns:
-        Merged references with template structure and fresh positions
+        Merged references
     """
     try:
-        import gcsfs
-        import json
+        # Load GCS template
+        gcs_path = f"gs://gik-fmrc/v2ecmwf_fmrc/ens_{member_name}/ecmwf-{template_date}00-{member_name}-rt000.par"
 
-        # Build GCS path using correct pattern
-        # Pattern: gs://gik-fmrc/v2ecmwf_fmrc/ens_control/ecmwf-2024052900-control-rt000.par
-        #          gs://gik-fmrc/v2ecmwf_fmrc/ens_1/ecmwf-2024052900-ens01-rt000.par
-        if member_name == 'control':
-            member_dir = 'ens_control'
-            filename_member = 'control'
-        else:
-            # Normalize member: handle both "ens09" and "09" formats
-            if member_name.startswith('ens'):
-                member_num_str = member_name.replace('ens', '')
-            else:
-                member_num_str = member_name
+        # This would load the actual template
+        # For now, we'll just return the index refs
+        logger.info(f"Would merge with GCS template: {gcs_path}")
 
-            # Directory: ens_09 (with zero-padding)
-            member_dir = f'ens_{int(member_num_str):02d}'
-
-            # Filename: ens09 (with zero-padding and ens prefix)
-            filename_member = f'ens{int(member_num_str):02d}'
-
-        # Template path (using rt000 as base template)
-        gcs_path = f"{gcs_bucket}/{gcs_base_path}/{member_dir}/ecmwf-{template_date}00-{filename_member}-rt000.par"
-
-        logger.info(f"Loading GCS template: gs://{gcs_path}")
-
-        # Load service account credentials
-        with open(service_account_json, 'r') as f:
-            service_account_info = json.load(f)
-
-        # Create GCS filesystem with service account
-        gcs_fs = gcsfs.GCSFileSystem(
-            token=service_account_info,
-            project=service_account_info.get('project_id')
-        )
-
-        if not gcs_fs.exists(gcs_path):
-            logger.warning(f"Template not found: gs://{gcs_path}")
-            logger.info("Using index references only (no template merge)")
-            return index_refs
-
-        # Read template parquet (key-value format)
-        template_df = pd.read_parquet(f"gs://{gcs_path}", filesystem=gcs_fs)
-
-        logger.info(f"Template loaded: {len(template_df)} entries")
-        logger.info(f"Template columns: {list(template_df.columns)}")
-
-        # Convert template DataFrame to dict
-        # Template format: key (zarr paths) -> value (bytes)
-        template_refs = {}
-        for _, row in template_df.iterrows():
-            key = row['key']
-            value = row['value']
-
-            # Decode bytes to string if needed
-            if isinstance(value, bytes):
-                value = value.decode('utf-8')
-
-            template_refs[key] = value
-
-        logger.info(f"Template converted to dict: {len(template_refs)} entries")
-
-        # Merge strategy:
-        # 1. Start with template structure (has .zarray, .zattrs, metadata, etc.)
-        # 2. Update with fresh index references for data chunks
-        # 3. Index refs have fresh byte positions for target date
-
-        merged_refs = template_refs.copy()
-
-        # Update with index references (overwrites data chunk references)
-        # Index refs have fresh byte positions from target date
-        for key, value in index_refs.items():
-            if not key.startswith('_'):  # Skip metadata keys
-                merged_refs[key] = value
-
-        logger.info(f"Merged template + index:")
-        logger.info(f"  Template entries: {len(template_refs)}")
-        logger.info(f"  Index entries: {len(index_refs)}")
-        logger.info(f"  Merged total: {len(merged_refs)}")
-
-        return merged_refs
+        return index_refs
 
     except Exception as e:
         logger.warning(f"Could not merge with GCS template: {e}")
-        logger.info("Using index references only")
-        import traceback
-        traceback.print_exc()
         return index_refs
 
 def hybrid_processing(

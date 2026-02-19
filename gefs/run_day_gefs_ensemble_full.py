@@ -20,9 +20,11 @@ import time
 
 # Import from gefs_util
 from gefs_util import generate_axes
-from gefs_util import filter_build_grib_tree 
+from gefs_util import filter_build_grib_tree
 from gefs_util import calculate_time_dimensions
 from gefs_util import cs_create_mapped_index
+from gefs_util import cs_create_mapped_index_local
+from gefs_util import LocalTarGzMappingManager
 from gefs_util import prepare_zarr_store
 from gefs_util import process_unique_groups
 
@@ -57,6 +59,21 @@ KEEP_PARQUET_FILES = True  # Set to True to keep files, False to delete them
 # The function now only creates parquet files without loading data into memory.
 STREAM_AFTER_CREATION = True  # Creates parquet files (works with Zarr v3)
 
+# ==============================================================================
+# Mapping Source Configuration
+# ==============================================================================
+# Choose between GCS bucket (requires service account) or local tar.gz file
+# Set USE_LOCAL_TARBALL = True to use local tar.gz file instead of GCS bucket
+USE_LOCAL_TARBALL = False  # Set to True to use local tar.gz file
+
+# Path to local tar.gz file containing parquet mappings
+# Only used when USE_LOCAL_TARBALL = True
+LOCAL_TARBALL_PATH = 'gik-fmrc-gefs-20241112.tar.gz'
+
+# GCS configuration (only used when USE_LOCAL_TARBALL = False)
+GCS_BUCKET_NAME = 'gik-fmrc'
+GCP_SERVICE_ACCOUNT_JSON = 'coiled-data-e4drr_202505.json'
+
 # East Africa bounding box
 EA_LAT_MIN, EA_LAT_MAX = -12, 15
 EA_LON_MIN, EA_LON_MAX = 25, 52
@@ -66,6 +83,10 @@ print(f"👥 Ensemble members: {len(ENSEMBLE_MEMBERS)} members (gep01-gep30)")
 print(f"📊 Using reference mappings from: {REFERENCE_DATE_STR}")
 print(f"🌍 East Africa region: {EA_LAT_MIN}°S-{EA_LAT_MAX}°N, {EA_LON_MIN}°E-{EA_LON_MAX}°E")
 print(f"💾 Parquet files will be {'KEPT' if KEEP_PARQUET_FILES else 'DELETED'} after processing")
+if USE_LOCAL_TARBALL:
+    print(f"📦 Mapping source: LOCAL TAR.GZ FILE ({LOCAL_TARBALL_PATH})")
+else:
+    print(f"☁️  Mapping source: GCS BUCKET ({GCS_BUCKET_NAME})")
 
 
 # Option 1: Specify forecast hour directly (hours from model run time)
@@ -165,10 +186,22 @@ def read_parquet_fixed(parquet_path):
 
 
 def process_single_ensemble_member(member, target_date_str, target_run, reference_date_str,
-                                 axes, forecast_dict, time_dims, time_coords, times, valid_times, steps):
-    """Process a single ensemble member and return its zarr store."""
+                                 axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
+                                 mapping_manager=None):
+    """Process a single ensemble member and return its zarr store.
+
+    Args:
+        member: Ensemble member identifier (e.g., 'gep01')
+        target_date_str: Target date string (YYYYMMDD)
+        target_run: Run time (e.g., '00')
+        reference_date_str: Reference date for parquet mappings
+        axes: Time axes from generate_axes()
+        forecast_dict: Dictionary of variables to process
+        time_dims, time_coords, times, valid_times, steps: Time dimension info
+        mapping_manager: Optional LocalTarGzMappingManager for local tar.gz usage
+    """
     print(f"\n🎯 Processing ensemble member: {member}")
-    
+
     # Define GEFS files for this member
     gefs_files = []
     for hour in [0, 3]:  # Only initial timesteps needed
@@ -176,61 +209,83 @@ def process_single_ensemble_member(member, target_date_str, target_run, referenc
             f"s3://noaa-gefs-pds/gefs.{target_date_str}/{target_run}/atmos/pgrb2sp25/"
             f"{member}.t{target_run}z.pgrb2s.0p25.f{hour:03d}"
         )
-    
+
     try:
         # Build GRIB tree from files
         print(f"🔨 Building GRIB tree for {member}...")
         _, deflated_gefs_grib_tree_store = filter_build_grib_tree(gefs_files, forecast_dict)
         print(f"✅ GRIB tree built successfully for {member}")
-        
+
         # Create zarr store using reference mappings
         print(f"🗃️ Creating zarr store for {member}...")
-        gcs_bucket_name = 'gik-fmrc'
-        gcp_service_account_json = 'coiled-data-e4drr_202505.json'
-        
+
         try:
-            # Use the original function with reference date
-            gefs_kind = cs_create_mapped_index(
-                axes, gcs_bucket_name, target_date_str, member,
-                gcp_service_account_json=gcp_service_account_json,
-                reference_date_str=reference_date_str
-            )
-            
+            # Choose between local tar.gz or GCS bucket based on configuration
+            if USE_LOCAL_TARBALL and mapping_manager is not None:
+                # Use local tar.gz file
+                print(f"📦 Using local tar.gz mappings for {member}...")
+                gefs_kind = cs_create_mapped_index_local(
+                    axes, target_date_str, member,
+                    tar_gz_path=LOCAL_TARBALL_PATH,
+                    mapping_manager=mapping_manager
+                )
+            else:
+                # Use GCS bucket (original method)
+                print(f"☁️  Using GCS bucket mappings for {member}...")
+                gefs_kind = cs_create_mapped_index(
+                    axes, GCS_BUCKET_NAME, target_date_str, member,
+                    gcp_service_account_json=GCP_SERVICE_ACCOUNT_JSON,
+                    reference_date_str=reference_date_str
+                )
+
             zstore, chunk_index = prepare_zarr_store(deflated_gefs_grib_tree_store, gefs_kind)
-            updated_zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords, 
+            updated_zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords,
                                                  times, valid_times, steps)
-            
+
             print(f"✅ Zarr store created for {member} using reference mappings")
-            
+
             return member, updated_zstore, True
-            
+
         except Exception as e:
             print(f"⚠️ Reference mapping failed for {member}: {e}")
             print(f"🔄 Using direct zarr store for {member}...")
             return member, deflated_gefs_grib_tree_store, False
-        
+
     except Exception as e:
         print(f"❌ Error processing {member}: {e}")
         return member, None, False
 
 
 def process_ensemble_members_batch(members_batch, target_date_str, target_run, reference_date_str,
-                                  axes, forecast_dict, time_dims, time_coords, times, valid_times, steps):
-    """Process a batch of ensemble members."""
+                                  axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
+                                  mapping_manager=None):
+    """Process a batch of ensemble members.
+
+    Args:
+        members_batch: List of ensemble member identifiers
+        target_date_str: Target date string (YYYYMMDD)
+        target_run: Run time (e.g., '00')
+        reference_date_str: Reference date for parquet mappings
+        axes: Time axes from generate_axes()
+        forecast_dict: Dictionary of variables to process
+        time_dims, time_coords, times, valid_times, steps: Time dimension info
+        mapping_manager: Optional LocalTarGzMappingManager for local tar.gz usage
+    """
     results = {}
-    
+
     for member in members_batch:
         member_name, member_store, success = process_single_ensemble_member(
             member, target_date_str, target_run, reference_date_str,
-            axes, forecast_dict, time_dims, time_coords, times, valid_times, steps
+            axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
+            mapping_manager=mapping_manager
         )
-        
+
         if member_store is not None:
             results[member_name] = {
                 'store': member_store,
                 'success': success
             }
-    
+
     return results
 
 
@@ -299,18 +354,31 @@ def main():
     print("="*80)
     print("GEFS Full Ensemble Processing (30 Members)")
     print("="*80)
-    
+
     start_time = time.time()
-    
+
     # Create output directory structure
     output_dir = None
     if KEEP_PARQUET_FILES:
         output_dir = create_output_directory(TARGET_DATE_STR, TARGET_RUN)
-    
+
+    # Initialize mapping manager if using local tar.gz
+    mapping_manager = None
+    if USE_LOCAL_TARBALL:
+        print(f"\n📦 Initializing local tar.gz mapping manager...")
+        if not os.path.exists(LOCAL_TARBALL_PATH):
+            print(f"❌ Error: Local tarball not found: {LOCAL_TARBALL_PATH}")
+            print(f"   Please download the tar.gz file or set USE_LOCAL_TARBALL = False")
+            return False
+        mapping_manager = LocalTarGzMappingManager(LOCAL_TARBALL_PATH)
+        available_members = mapping_manager.list_ensemble_members()
+        print(f"✅ Found mappings for {len(available_members)} ensemble members")
+        print(f"   Available: {', '.join(available_members[:5])}{'...' if len(available_members) > 5 else ''}")
+
     # 1. Generate axes for the target date
     print(f"\n📅 Generating axes for {TARGET_DATE_STR}...")
     axes = generate_axes(TARGET_DATE_STR)
-    
+
     # 2. Define forecast variables
     forecast_dict = {
         "Surface pressure": "PRES:surface",
@@ -322,34 +390,40 @@ def main():
         "Mean sea level pressure": "MSLET:mean sea level",
         "Total Precipitation": "APCP:surface",
     }
-    
+
     # 3. Calculate time dimensions (same for all members)
     print(f"\n⏰ Calculating time dimensions...")
     time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
     print(f"✅ Time dimensions: {len(times)} timesteps")
-    
+
     # 4. Process ensemble members in batches
     print(f"\n🚀 Processing {len(ENSEMBLE_MEMBERS)} ensemble members...")
-    
+
     # Process in batches of 5 to manage resources
     batch_size = 5
     all_results = {}
-    
-    for i in range(0, len(ENSEMBLE_MEMBERS), batch_size):
-        batch = ENSEMBLE_MEMBERS[i:i+batch_size]
-        batch_num = i // batch_size + 1
-        total_batches = (len(ENSEMBLE_MEMBERS) + batch_size - 1) // batch_size
-        
-        print(f"\n📦 Processing batch {batch_num}/{total_batches}: {', '.join(batch)}")
-        
-        batch_results = process_ensemble_members_batch(
-            batch, TARGET_DATE_STR, TARGET_RUN, REFERENCE_DATE_STR,
-            axes, forecast_dict, time_dims, time_coords, times, valid_times, steps
-        )
-        
-        all_results.update(batch_results)
-        
-        print(f"✅ Batch {batch_num} completed: {len(batch_results)} successful")
+
+    try:
+        for i in range(0, len(ENSEMBLE_MEMBERS), batch_size):
+            batch = ENSEMBLE_MEMBERS[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (len(ENSEMBLE_MEMBERS) + batch_size - 1) // batch_size
+
+            print(f"\n📦 Processing batch {batch_num}/{total_batches}: {', '.join(batch)}")
+
+            batch_results = process_ensemble_members_batch(
+                batch, TARGET_DATE_STR, TARGET_RUN, REFERENCE_DATE_STR,
+                axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
+                mapping_manager=mapping_manager
+            )
+
+            all_results.update(batch_results)
+
+            print(f"✅ Batch {batch_num} completed: {len(batch_results)} successful")
+    finally:
+        # Clean up mapping manager if it was created
+        if mapping_manager is not None:
+            mapping_manager.cleanup()
     
     # Summary
     successful = [m for m, data in all_results.items() if data['success']]
