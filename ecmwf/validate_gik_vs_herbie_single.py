@@ -123,7 +123,10 @@ def list_member_parquets(date_str: str, run: str, max_members: int = None) -> li
     fs = get_gcs_fs()
     files = sorted(fs.glob(f"{gcs_path}/*.parquet"))
     if max_members and len(files) > max_members:
-        files = files[:max_members]
+        # Skip control member when subsetting so GIK members align with
+        # Herbie's ensemble numbering (Herbie returns number=[1..N], no control)
+        ens_only = [f for f in files if "control" not in f.split("/")[-1]]
+        files = ens_only[:max_members]
     return [f"gs://{f}" for f in files]
 
 
