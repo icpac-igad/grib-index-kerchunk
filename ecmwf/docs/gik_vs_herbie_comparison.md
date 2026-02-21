@@ -123,6 +123,174 @@ can target individual messages but cannot subset within a message.
 
 ---
 
+## Spatial Subsetting: How and When the ICPAC Region Is Extracted
+
+### The Short Answer
+
+**Neither method subsets before downloading.** Both GIK and Herbie download the
+full global GRIB message (~800 KB, 721 × 1440 grid points) and only apply the
+spatial crop after decoding in memory. The subset step is a numpy index slice
+on the decoded array -- it is not a server-side operation and cannot be.
+
+### Why Pre-Download Subsetting Is Impossible with GRIB
+
+A GRIB2 message stores all grid points for one variable, one member, and one
+timestep as a single compressed binary blob (JPEG2000 or CCSDS packing). The
+compression is applied across the full 1,038,240-point global grid as a unit.
+There is no internal byte boundary between the East Africa grid points and the
+rest of the world. You cannot seek into a partial spatial window the way you
+can seek to a specific message within a multi-message GRIB file.
+
+```
+GRIB message structure (one variable, one member, one timestep):
+┌─────────────────────────────────────────────────────────────────┐
+│  Section 0: Indicator (16 bytes)                                │
+│  Section 1: Identification (21 bytes)                           │
+│  Section 3: Grid definition  (e.g., lat/lon, 721x1440)         │
+│  Section 4: Product definition (param, level, step, member...)  │
+│  Section 5: Data representation (packing method, scale factor)  │
+│  Section 6: Bitmap (optional, marks missing values)             │
+│  Section 7: Data values — ALL 1,038,240 points, compressed      │  ← cannot subset here
+│               as a single JPEG2000 or CCSDS-packed block        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Byte-range requests CAN target a specific message within a file (using the
+offset + length from the index), but CANNOT target a spatial window within a
+message. The only way to extract East Africa is to download Section 7 in full,
+decompress all 1,038,240 values, and then slice out the 22,765 points that
+fall in the ICPAC bounding box.
+
+### GIK Method: Step-by-Step Subsetting
+
+```
+Step 1 — Parquet lookup (no I/O, pure in-memory dict lookup)
+  zstore["step_048/tp/sfc/ens01/0.0.0"]
+  → ["s3://ecmwf-forecasts/20260218/06z/.../2026021806z0000-48h-enfo-ef.grib2",
+      2_847_103_488,   ← byte offset of this message in the 3.8 GB file
+      835_712]         ← byte length of this message
+
+Step 2 — Byte-range fetch from S3 (downloads ~835 KB)
+  fs.open(url, "rb")
+  f.seek(2_847_103_488)
+  grib_bytes = f.read(835_712)   ← full GRIB message, 721x1440 grid
+
+Step 3 — In-memory decode with gribberish (~25 ms)
+  flat = gribberish.parse_grib_array(grib_bytes, 0)
+  full_grid = flat.reshape((721, 1440))   ← shape: (721, 1440), dtype: float32
+
+Step 4 — Numpy index slice to ICPAC region (~0 ms)
+  # Precomputed at module load time:
+  #   LAT_INDICES = where(ECMWF_LATS between -14 and 25)  → rows 260..325
+  #   LON_INDICES = where(ECMWF_LONS between 19 and 55)   → cols 556..620
+  icpac = full_grid[260:326, 556:621]   ← shape: (66, 65) ... actually (157, 145)
+```
+
+The precomputed index arrays (`LAT_INDICES`, `LON_INDICES`) are built once at
+script start from the known ECMWF grid definition. This makes Step 4 a single
+O(1) numpy slice with no recomputation per message.
+
+```python
+# From validate_gik_vs_herbie_single.py lines 83-98
+ECMWF_LATS = np.linspace(90, -90, 721)    # 90 → -90 in 0.25 deg steps
+ECMWF_LONS = np.linspace(-180, 179.75, 1440)
+
+_lat_mask = (ECMWF_LATS >= -14) & (ECMWF_LATS <= 25)
+_lon_mask = (ECMWF_LONS >= 19)  & (ECMWF_LONS <= 55)
+LAT_INDICES = np.where(_lat_mask)[0]   # integer row indices into full grid
+LON_INDICES = np.where(_lon_mask)[0]   # integer col indices into full grid
+
+def subset_icpac(data: np.ndarray) -> np.ndarray:
+    return data[LAT_INDICES[0] : LAT_INDICES[-1] + 1,
+                LON_INDICES[0] : LON_INDICES[-1] + 1]
+```
+
+Note: ECMWF latitudes run **north to south** (90 → -90), so higher row indices
+correspond to lower latitudes. `LAT_INDICES` naturally selects the correct rows
+without any reversal.
+
+### Herbie Method: Step-by-Step Subsetting
+
+```
+Step 1 — Runtime index fetch (downloads ~1 MB .index file per timestep)
+  Herbie reads the ECMWF JSON-lines .index file to locate the message offset
+  for each member and timestep. This is equivalent to GIK's parquet lookup
+  but performed at runtime.
+
+Step 2 — Byte-range fetch from S3 (downloads ~817 KB)
+  Same physical operation as GIK Step 2: seeks to offset, reads length bytes.
+
+Step 3 — cfgrib decode via eccodes (~2000 ms)
+  Herbie writes the GRIB bytes to a temporary file on disk, then calls cfgrib:
+    xr.open_dataset(tmp_path, engine="cfgrib")
+  cfgrib uses the eccodes C library to decode all 1,038,240 grid points and
+  wraps the result in a full xarray Dataset with coordinates and attributes.
+
+Step 4 — xarray .sel() clip to ICPAC region (~0 ms)
+  sub = ds.sel(latitude=slice(25, -14), longitude=slice(19, 55))
+```
+
+Herbie uses xarray's label-based `.sel()` with coordinate values (degrees),
+while GIK uses precomputed integer indices into the underlying numpy array.
+The end result is the same region. The `herbie_subset_icpac()` function also
+handles the case where Herbie returns longitudes in 0--360 range by remapping
+them to -180--180 before the `.sel()` call.
+
+### Comparison: GIK vs Herbie Subsetting
+
+| Stage | GIK | Herbie |
+|-------|-----|--------|
+| **Index lookup** | Dict lookup in in-memory parquet (≈0 ms) | Read ~1 MB .index file from S3 per timestep (~50-200 ms) |
+| **Download unit** | Full GRIB message (~835 KB) | Full GRIB message (~817 KB) |
+| **Server-side subset?** | No | No |
+| **Decode** | gribberish on byte buffer in memory (~25 ms) | cfgrib via eccodes on temp file on disk (~2000 ms) |
+| **Decoded array shape** | (721, 1440) numpy float32 | (51, 721, 1440) xarray DataArray (all members at once) |
+| **Spatial clip method** | Integer index slice `[row0:row1, col0:col1]` | Label-based `.sel(latitude=..., longitude=...)` |
+| **Clip timing** | After decode, before returning to caller | After decode, as part of xarray selection |
+| **Output shape** | (157, 145) numpy float32 | (157, 145) numpy via `.values` |
+
+### Could We Subset Earlier?
+
+**No -- not with GRIB.** The byte-range request at Step 2 already represents the
+minimum granularity possible: one GRIB message (one variable, one member, one
+timestep). There is no finer-grained addressable unit in a GRIB2 file.
+
+The parquet reference file does **not** store per-grid-point references. Each
+parquet row points to a full GRIB message:
+
+```
+key:   "step_048/tp/sfc/ens01/0.0.0"
+value: ["s3://ecmwf-forecasts/.../2026021806z0000-48h-enfo-ef.grib2",
+         2847103488,   ← start byte of this message
+         835712]       ← byte length of this message
+```
+
+The `0.0.0` suffix in the zarr key is the chunk index -- it means chunk 0 along
+all three spatial dimensions. Because the entire global field is stored as one
+chunk (no chunking within the spatial dimensions), the chunk reference IS the
+full message. There is no way to request chunk `[2:4, 5:6]` of a GRIB2 message.
+
+### Alternative Formats That DO Allow Pre-Download Subsetting
+
+For reference, formats that support server-side or pre-download spatial
+subsetting include:
+
+| Format | Mechanism |
+|--------|-----------|
+| **Zarr** | Spatial chunking → each chunk is a small tile, fetch only tiles that overlap the bbox |
+| **Cloud-Optimised GeoTIFF (COG)** | Overviews + tiling → HTTP range request for the tile covering the bbox |
+| **NetCDF-4 with HDF5 chunking** | Same principle as Zarr; chunks are independently addressable |
+| **GRIB2 with sub-message indexing** | Not supported by the ECMWF or NOAA S3 offerings |
+
+The fundamental tradeoff for GIK: the byte-range addressing works at the
+**message level** (variable × member × timestep), not at the **spatial level**.
+This is efficient for selecting variables and ensemble members but downloads
+the full global grid for each selected message. Converting ECMWF GRIB to a
+spatially chunked Zarr store on GCS/S3 would eliminate this inefficiency but
+requires a one-time re-encoding of the full archive (petabytes of data).
+
+---
+
 ## Decode Speed: gribberish vs cfgrib
 
 The critical performance difference between GIK and Herbie is not data transfer

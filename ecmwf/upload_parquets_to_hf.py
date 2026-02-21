@@ -48,7 +48,8 @@ def get_gcs_fs():
     return gcsfs.GCSFileSystem(token=GCS_SA_FILE)
 
 
-def upload_month(fs, api, year: str, month: str, dry_run: bool = False):
+def upload_month(fs, api, year: str, month: str, dry_run: bool = False,
+                 run_filter: str = None):
     """Download all parquets for one month from GCS, upload batch to HF."""
     gcs_month_path = f"{GCS_BUCKET}/{GCS_PREFIX}/{year}/{month}"
 
@@ -66,6 +67,8 @@ def upload_month(fs, api, year: str, month: str, dry_run: bool = False):
 
         for run_dir in run_dirs:
             run_name = run_dir.split("/")[-1]  # e.g. 00z
+            if run_filter and run_name != f"{run_filter}z":
+                continue
             parquets = [f for f in fs.ls(run_dir) if f.endswith(".parquet")]
 
             if not parquets:
@@ -108,6 +111,8 @@ def main():
                         help="Single year to upload (default: 2024,2025,2026)")
     parser.add_argument("--month", type=str, default=None,
                         help="Single month MM to upload (requires --year)")
+    parser.add_argument("--run", type=str, default=None,
+                        help="Run hour filter: 00, 06, 12, 18 (default: all)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List files without uploading")
     args = parser.parse_args()
@@ -129,6 +134,8 @@ def main():
     print(f"Years: {years}")
     if args.month:
         print(f"Month: {args.month}")
+    if args.run:
+        print(f"Run: {args.run}z")
     if args.dry_run:
         print("Mode: DRY RUN")
     print("=" * 70)
@@ -155,7 +162,8 @@ def main():
         year_total = 0
         for month in months:
             t0 = time.time()
-            n = upload_month(fs, api, year, month, dry_run=args.dry_run)
+            n = upload_month(fs, api, year, month, dry_run=args.dry_run,
+                            run_filter=args.run)
             elapsed = time.time() - t0
             year_total += n
             if not args.dry_run and n > 0:
