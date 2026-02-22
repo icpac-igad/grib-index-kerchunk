@@ -14,6 +14,7 @@
 #     "gribberish",
 #     "coiled",
 #     "distributed",
+#     "bokeh>=3.1.0",
 # ]
 # ///
 """
@@ -318,8 +319,8 @@ def fill_store(args):
     n_workers = args.n_workers
     cluster = coiled.Cluster(
         name=f"ecmwf-ea-tp-{int(time.time()) % 10000}",
-        n_workers=[min(5, n_workers), n_workers],
-        worker_vm_types="n2-standard-4",
+        n_workers=n_workers,
+        worker_vm_types="e2-standard-4",
         package_sync=True,
         region="europe-west1",
         idle_timeout="30 minutes",
