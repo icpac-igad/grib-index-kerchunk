@@ -288,26 +288,25 @@ def fill_store(args):
         target_storage, config=icechunk.RepositoryConfig.default(),
     )
 
-    # Resume detection: find highest completed date index from commit messages
-    completed_up_to = -1
+    # Resume detection: find completed date indices from commit messages
+    # Commit messages are per-date: "fill date 42 (20240411): 51/51 members"
+    completed_indices = set()
     try:
         for commit in target_repo.ancestry(branch="main"):
             msg = commit.message
-            if msg.startswith("fill dates "):
+            if msg.startswith("fill date "):
                 try:
-                    range_str = msg.split(":")[0].replace("fill dates ", "")
-                    d_start, d_end = range_str.split("-")
-                    d_end_int = int(d_end)
-                    if d_end_int > completed_up_to:
-                        completed_up_to = d_end_int
+                    # Parse "fill date 42 (20240411): 51/51 members"
+                    idx_str = msg.split("fill date ")[1].split(" ")[0]
+                    completed_indices.add(int(idx_str))
                 except (ValueError, IndexError):
                     pass
     except Exception:
         pass
 
-    start_idx = completed_up_to + 1
+    start_idx = max(completed_indices) + 1 if completed_indices else 0
     if start_idx > 0:
-        logger.info(f"  Resuming from date index {start_idx} (0-{completed_up_to} done)")
+        logger.info(f"  Resuming from date index {start_idx} ({len(completed_indices)} dates done)")
 
     remaining = [(i, d) for i, d in enumerate(dates) if i >= start_idx]
     if not remaining:
@@ -322,7 +321,7 @@ def fill_store(args):
         n_workers=[min(5, n_workers), n_workers],
         worker_vm_types="n2-standard-4",
         package_sync=True,
-        region="us-east1",
+        region="europe-west1",
         idle_timeout="30 minutes",
     )
     client = distributed.Client(cluster)
@@ -510,15 +509,15 @@ def fill_store(args):
                 )
                 futures[future] = (date_idx, date_str, m_idx)
 
-        # Collect results and write each date to Icechunk as soon as all
-        # 51 members arrive.  This keeps coordinator memory bounded to ~245 MB
-        # (one assembled date) instead of accumulating all 2,550 results (~11 GB).
+        # Collect results and write+commit each date to Icechunk as soon as
+        # all 51 members arrive.  Each date gets its own commit so that:
+        #   - If the process is killed, all previously committed dates survive
+        #   - Memory stays bounded to ~245 MB (one assembled date at a time)
+        #   - Resume detection finds individual committed dates
         date_members = {}     # date_idx -> {m_idx: (53,157,145) array}
         date_expected = {}    # date_idx -> total members received (ok + fail)
         date_fail_count = {}  # date_idx -> number of failed members
-        date_str_map = {d_idx: d_str for d_idx, d_str in batch}
 
-        session = target_repo.writable_session("main")
         batch_ok = 0
         batch_fail = 0
         tasks_done = 0
@@ -553,7 +552,7 @@ def fill_store(args):
                     )
                     continue
 
-                # Assemble (51, 53, 157, 145) and write immediately
+                # Assemble (51, 53, 157, 145), write, and commit immediately
                 data = np.full(
                     (N_MEMBERS, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
                 )
@@ -562,6 +561,7 @@ def fill_store(args):
                 del members
 
                 try:
+                    session = target_repo.writable_session("main")
                     ds_write = xr.Dataset({
                         "tp": (
                             ("init_date", "member", "lead_time", "lat", "lon"),
@@ -574,36 +574,25 @@ def fill_store(args):
                         consolidated=False,
                     )
                     del data
+                    session.commit(
+                        f"fill date {date_idx} ({date_str}): "
+                        f"{n_ok}/{N_MEMBERS} members"
+                    )
 
                     batch_ok += 1
                     total_written += 1
                     logger.info(
-                        f"    Wrote date {date_idx} ({date_str}) "
-                        f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed]"
+                        f"    Committed date {date_idx} ({date_str}) "
+                        f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed] "
+                        f"({total_written}/{len(remaining)} total)"
                     )
                 except Exception as e:
                     batch_fail += 1
                     total_failed += 1
                     failed_dates.append(date_str)
                     logger.error(
-                        f"    Date {date_idx} ({date_str}) WRITE FAILED: {e}"
+                        f"    Date {date_idx} ({date_str}) WRITE/COMMIT FAILED: {e}"
                     )
-
-        # Commit if all dates in batch succeeded
-        if batch_fail == 0:
-            session.commit(
-                f"fill dates {batch_idx_min}-{batch_idx_max}: "
-                f"{batch_ok}/{len(batch)} OK"
-            )
-            logger.info(
-                f"  Committed dates {batch_idx_min}-{batch_idx_max} "
-                f"(total: {total_written}/{len(remaining)})"
-            )
-        else:
-            logger.warning(
-                f"  Batch {batch_idx_min}-{batch_idx_max} had {batch_fail} failures, "
-                f"NOT committed — will be retried on resume"
-            )
 
     client.close()
     cluster.close()
