@@ -510,79 +510,84 @@ def fill_store(args):
                 )
                 futures[future] = (date_idx, date_str, m_idx)
 
-        # Collect results, assemble per-date arrays, write to Icechunk
-        # date_results[date_idx] = {m_idx: (53, 157, 145) array, ...}
-        date_results = {}
-        date_member_counts = {}
-        member_failures = {}
+        # Collect results and write each date to Icechunk as soon as all
+        # 51 members arrive.  This keeps coordinator memory bounded to ~245 MB
+        # (one assembled date) instead of accumulating all 2,550 results (~11 GB).
+        date_members = {}     # date_idx -> {m_idx: (53,157,145) array}
+        date_expected = {}    # date_idx -> total members received (ok + fail)
+        date_fail_count = {}  # date_idx -> number of failed members
+        date_str_map = {d_idx: d_str for d_idx, d_str in batch}
+
+        session = target_repo.writable_session("main")
+        batch_ok = 0
+        batch_fail = 0
+        tasks_done = 0
 
         for future in distributed.as_completed(futures):
             date_idx, date_str, m_idx = futures[future]
             try:
                 result = future.result()
-                date_results.setdefault(date_idx, {})[m_idx] = result["data"]
-                date_member_counts[date_idx] = date_member_counts.get(date_idx, 0) + 1
+                date_members.setdefault(date_idx, {})[m_idx] = result["data"]
+                del result
             except Exception as e:
-                member_failures.setdefault(date_idx, []).append((m_idx, str(e)))
-                date_member_counts[date_idx] = date_member_counts.get(date_idx, 0) + 1
+                date_fail_count[date_idx] = date_fail_count.get(date_idx, 0) + 1
 
-            # Log progress periodically
-            total_done = sum(date_member_counts.values())
-            if total_done % 100 == 0:
-                logger.info(f"    Progress: {total_done}/{n_tasks} member-tasks done")
+            date_expected[date_idx] = date_expected.get(date_idx, 0) + 1
+            tasks_done += 1
 
-        # Assemble and write each date
-        session = target_repo.writable_session("main")
-        batch_ok = 0
-        batch_fail = 0
+            if tasks_done % 100 == 0:
+                logger.info(f"    Progress: {tasks_done}/{n_tasks} member-tasks done")
 
-        for date_idx, date_str in batch:
-            members = date_results.get(date_idx, {})
-            n_ok = len(members)
-            n_fail = len(member_failures.get(date_idx, []))
+            # Check if this date is complete (all 51 members received)
+            if date_expected[date_idx] == N_MEMBERS:
+                members = date_members.pop(date_idx, {})
+                n_ok = len(members)
+                n_fail = date_fail_count.get(date_idx, 0)
 
-            if n_ok == 0:
-                batch_fail += 1
-                total_failed += 1
-                failed_dates.append(date_str)
-                logger.error(f"    Date {date_idx} ({date_str}) FAILED: 0/{N_MEMBERS} members")
-                continue
+                if n_ok == 0:
+                    batch_fail += 1
+                    total_failed += 1
+                    failed_dates.append(date_str)
+                    logger.error(
+                        f"    Date {date_idx} ({date_str}) FAILED: 0/{N_MEMBERS} members"
+                    )
+                    continue
 
-            # Assemble (51, 53, 157, 145) array
-            data = np.full(
-                (N_MEMBERS, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
-            )
-            for m_idx, member_data in members.items():
-                data[m_idx] = member_data
-            del members
-            if date_idx in date_results:
-                del date_results[date_idx]
-
-            try:
-                ds_write = xr.Dataset({
-                    "tp": (
-                        ("init_date", "member", "lead_time", "lat", "lon"),
-                        data[np.newaxis],  # (1, 51, 53, 157, 145)
-                    ),
-                })
-                ds_write.to_zarr(
-                    session.store,
-                    region={"init_date": slice(date_idx, date_idx + 1)},
-                    consolidated=False,
+                # Assemble (51, 53, 157, 145) and write immediately
+                data = np.full(
+                    (N_MEMBERS, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
                 )
-                del data
+                for m_i, member_data in members.items():
+                    data[m_i] = member_data
+                del members
 
-                batch_ok += 1
-                total_written += 1
-                logger.info(
-                    f"    Wrote date {date_idx} ({date_str}) "
-                    f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed]"
-                )
-            except Exception as e:
-                batch_fail += 1
-                total_failed += 1
-                failed_dates.append(date_str)
-                logger.error(f"    Date {date_idx} ({date_str}) WRITE FAILED: {e}")
+                try:
+                    ds_write = xr.Dataset({
+                        "tp": (
+                            ("init_date", "member", "lead_time", "lat", "lon"),
+                            data[np.newaxis],  # (1, 51, 53, 157, 145)
+                        ),
+                    })
+                    ds_write.to_zarr(
+                        session.store,
+                        region={"init_date": slice(date_idx, date_idx + 1)},
+                        consolidated=False,
+                    )
+                    del data
+
+                    batch_ok += 1
+                    total_written += 1
+                    logger.info(
+                        f"    Wrote date {date_idx} ({date_str}) "
+                        f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed]"
+                    )
+                except Exception as e:
+                    batch_fail += 1
+                    total_failed += 1
+                    failed_dates.append(date_str)
+                    logger.error(
+                        f"    Date {date_idx} ({date_str}) WRITE FAILED: {e}"
+                    )
 
         # Commit if all dates in batch succeeded
         if batch_fail == 0:
