@@ -326,21 +326,27 @@ def fill_store(args):
         idle_timeout="30 minutes",
     )
     client = distributed.Client(cluster)
-    client.wait_for_workers(n_workers=min(5, n_workers), timeout=300)
+    client.wait_for_workers(n_workers=min(10, n_workers), timeout=600)
     logger.info(f"  Cluster ready: {client.dashboard_link}")
 
-    # Worker function — self-contained for cloudpickle serialization
-    def read_date_tp_ea(date_str, member_ids, lead_time_hours,
-                        hf_base_url, grid_shape, lat_idx_start, lat_idx_end,
-                        lon_idx_start, lon_idx_end):
-        """Process one date: download 51 parquets from HF, stream tp from S3.
+    # ── Worker function: one Dask task per (date, member) ──
+    # Each task downloads 1 parquet from HF, fetches 53 GRIB chunks from S3
+    # in parallel via ThreadPoolExecutor(8), returns ~4.6 MB.
+    # This gives Dask full visibility: 50 dates × 51 members = 2,550 tasks
+    # per batch, perfect load balancing across all workers.
 
-        Returns dict with date_str and data array of shape (51, 53, n_lat, n_lon).
+    def read_member_tp_ea(date_str, member_id, lead_time_hours,
+                          hf_base_url, grid_shape, lat_idx_start, lat_idx_end,
+                          lon_idx_start, lon_idx_end):
+        """Process one (date, member): fetch 53 tp steps from S3.
+
+        Returns dict with member data array of shape (53, n_lat, n_lon) ~4.6 MB.
         """
         import json
         import os
         import tempfile
         import warnings
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         import fsspec
         import numpy as np
@@ -355,118 +361,113 @@ def fill_store(args):
         except ImportError:
             has_gribberish = False
 
-        n_members = len(member_ids)
         n_steps = len(lead_time_hours)
         n_lat = lat_idx_end - lat_idx_start
         n_lon = lon_idx_end - lon_idx_start
 
-        result = np.full((n_members, n_steps, n_lat, n_lon), np.nan, dtype=np.float32)
-
         year = date_str[:4]
         month = date_str[4:6]
 
-        s3_fs = fsspec.filesystem("s3", anon=True)
+        # Download parquet from HuggingFace
+        parquet_url = (
+            f"{hf_base_url}/{year}/{month}/{date_str}/00z/"
+            f"{date_str}00z-{member_id}.parquet"
+        )
+        df = pd.read_parquet(parquet_url)
 
-        for m_idx, member_id in enumerate(member_ids):
-            # Build HuggingFace parquet URL
-            parquet_url = (
-                f"{hf_base_url}/{year}/{month}/{date_str}/00z/"
-                f"{date_str}00z-{member_id}.parquet"
-            )
-
-            # Download and parse parquet
-            try:
-                df = pd.read_parquet(parquet_url)
-            except Exception:
-                continue
-
-            # Build zstore dict
-            zstore = {}
-            for _, row in df.iterrows():
-                key = row["key"]
-                value = row["value"]
-                if isinstance(value, bytes):
+        # Build zstore dict
+        zstore = {}
+        for _, row in df.iterrows():
+            key = row["key"]
+            value = row["value"]
+            if isinstance(value, bytes):
+                try:
+                    decoded = value.decode("utf-8")
+                    if decoded.startswith("[") or decoded.startswith("{"):
+                        value = json.loads(decoded)
+                    else:
+                        value = decoded
+                except Exception:
+                    pass
+            elif isinstance(value, str):
+                if value.startswith("[") or value.startswith("{"):
                     try:
-                        decoded = value.decode("utf-8")
-                        if decoded.startswith("[") or decoded.startswith("{"):
-                            value = json.loads(decoded)
-                        else:
-                            value = decoded
+                        value = json.loads(value)
                     except Exception:
                         pass
-                elif isinstance(value, str):
-                    if value.startswith("[") or value.startswith("{"):
-                        try:
-                            value = json.loads(value)
-                        except Exception:
-                            pass
-                zstore[key] = value
+            zstore[key] = value
+        del df
 
-            # Member key for parquet lookups (ens_01 -> ens01)
-            member_key = member_id.replace("_", "")
+        member_key = member_id.replace("_", "")
 
-            # Fetch tp for each lead time
-            for s_idx, step_h in enumerate(lead_time_hours):
-                ref = None
-                for pattern in [
-                    f"step_{step_h:03d}/tp/sfc/{member_key}/0.0.0",
-                    f"step_{step_h:03d}/tp/sfc/0.0.0",
-                    f"step_{step_h:03d}/tp/surface/{member_key}/0.0.0",
-                ]:
-                    if pattern in zstore:
-                        val = zstore[pattern]
-                        if isinstance(val, list) and len(val) >= 3:
-                            ref = val
-                            break
+        # Collect (step_idx, ref) pairs for tp
+        step_refs = []
+        for s_idx, step_h in enumerate(lead_time_hours):
+            for pattern in [
+                f"step_{step_h:03d}/tp/sfc/{member_key}/0.0.0",
+                f"step_{step_h:03d}/tp/sfc/0.0.0",
+                f"step_{step_h:03d}/tp/surface/{member_key}/0.0.0",
+            ]:
+                if pattern in zstore:
+                    val = zstore[pattern]
+                    if isinstance(val, list) and len(val) >= 3:
+                        step_refs.append((s_idx, val))
+                        break
+        del zstore
 
-                if ref is None:
-                    continue
+        member_data = np.full((n_steps, n_lat, n_lon), np.nan, dtype=np.float32)
+        if not step_refs:
+            return {"date_str": date_str, "member_id": member_id, "data": member_data}
 
+        s3_fs = fsspec.filesystem("s3", anon=True)
+
+        def _fetch_one_step(s_idx, ref):
+            url, offset, length = ref[0], ref[1], ref[2]
+            if not url.endswith(".grib2"):
+                url = url + ".grib2"
+            with s3_fs.open(url, "rb") as f:
+                f.seek(offset)
+                grib_bytes = f.read(length)
+
+            arr = None
+            if has_gribberish:
                 try:
-                    url, offset, length = ref[0], ref[1], ref[2]
-                    if not url.endswith(".grib2"):
-                        url = url + ".grib2"
-
-                    with s3_fs.open(url, "rb") as f:
-                        f.seek(offset)
-                        grib_bytes = f.read(length)
-
-                    # Decode GRIB
-                    decoded = False
-                    if has_gribberish:
-                        try:
-                            flat = gribberish.parse_grib_array(grib_bytes, 0)
-                            arr = flat.reshape(grid_shape)
-                            decoded = True
-                        except Exception:
-                            pass
-
-                    if not decoded:
-                        import xarray as xr
-                        with tempfile.NamedTemporaryFile(
-                            delete=False, suffix=".grib2"
-                        ) as tmp:
-                            tmp.write(grib_bytes)
-                            tmp_path = tmp.name
-                        try:
-                            ds = xr.open_dataset(tmp_path, engine="cfgrib")
-                            arr = ds[list(ds.data_vars)[0]].values.copy()
-                            ds.close()
-                        finally:
-                            os.unlink(tmp_path)
-
-                    # Subset to EA
-                    ea_arr = arr[lat_idx_start:lat_idx_end,
-                                 lon_idx_start:lon_idx_end]
-                    result[m_idx, s_idx] = ea_arr.astype(np.float32)
-
+                    flat = gribberish.parse_grib_array(grib_bytes, 0)
+                    arr = flat.reshape(grid_shape)
                 except Exception:
-                    continue
+                    pass
+            if arr is None:
+                import xarray as xr
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".grib2"
+                ) as tmp:
+                    tmp.write(grib_bytes)
+                    tmp_path = tmp.name
+                try:
+                    ds = xr.open_dataset(tmp_path, engine="cfgrib")
+                    arr = ds[list(ds.data_vars)[0]].values.copy()
+                    ds.close()
+                finally:
+                    os.unlink(tmp_path)
 
-        return {
-            "date_str": date_str,
-            "data": result,
-        }
+            ea_arr = arr[lat_idx_start:lat_idx_end,
+                         lon_idx_start:lon_idx_end].astype(np.float32)
+            return s_idx, ea_arr
+
+        # Fetch all 53 steps in parallel (8 threads — I/O bound S3 reads)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {
+                pool.submit(_fetch_one_step, s_idx, ref): s_idx
+                for s_idx, ref in step_refs
+            }
+            for fut in as_completed(futs):
+                try:
+                    s_idx, ea_arr = fut.result()
+                    member_data[s_idx] = ea_arr
+                except Exception:
+                    pass
+
+        return {"date_str": date_str, "member_id": member_id, "data": member_data}
 
     # Precompute EA spatial slice indices
     lat_idx_start = int(LAT_INDICES[0])
@@ -484,65 +485,106 @@ def fill_store(args):
         batch = remaining[batch_start : batch_start + COMMIT_BATCH]
         batch_idx_min = batch[0][0]
         batch_idx_max = batch[-1][0]
+        n_tasks = len(batch) * N_MEMBERS
         logger.info(
             f"  Batch: date indices {batch_idx_min}-{batch_idx_max} "
-            f"({len(batch)} dates, {total_written}/{len(remaining)} done)"
+            f"({len(batch)} dates × {N_MEMBERS} members = {n_tasks} tasks, "
+            f"{total_written}/{len(remaining)} dates done)"
         )
 
-        # Submit batch to Coiled
+        # Submit one Dask task per (date, member)
+        # key format: "d{date_idx}-m{member_idx}" for dashboard readability
         futures = {}
         for date_idx, date_str in batch:
-            future = client.submit(
-                read_date_tp_ea,
-                date_str,
-                MEMBER_IDS,
-                LEAD_TIME_HOURS,
-                HF_BASE_URL,
-                ECMWF_GRID_SHAPE,
-                lat_idx_start, lat_idx_end,
-                lon_idx_start, lon_idx_end,
-                key=f"date-{date_idx}",
-            )
-            futures[future] = (date_idx, date_str)
+            for m_idx, member_id in enumerate(MEMBER_IDS):
+                future = client.submit(
+                    read_member_tp_ea,
+                    date_str,
+                    member_id,
+                    LEAD_TIME_HOURS,
+                    HF_BASE_URL,
+                    ECMWF_GRID_SHAPE,
+                    lat_idx_start, lat_idx_end,
+                    lon_idx_start, lon_idx_end,
+                    key=f"d{date_idx}-m{m_idx:02d}",
+                )
+                futures[future] = (date_idx, date_str, m_idx)
 
-        # Collect results and write to Icechunk
+        # Collect results, assemble per-date arrays, write to Icechunk
+        # date_results[date_idx] = {m_idx: (53, 157, 145) array, ...}
+        date_results = {}
+        date_member_counts = {}
+        member_failures = {}
+
+        for future in distributed.as_completed(futures):
+            date_idx, date_str, m_idx = futures[future]
+            try:
+                result = future.result()
+                date_results.setdefault(date_idx, {})[m_idx] = result["data"]
+                date_member_counts[date_idx] = date_member_counts.get(date_idx, 0) + 1
+            except Exception as e:
+                member_failures.setdefault(date_idx, []).append((m_idx, str(e)))
+                date_member_counts[date_idx] = date_member_counts.get(date_idx, 0) + 1
+
+            # Log progress periodically
+            total_done = sum(date_member_counts.values())
+            if total_done % 100 == 0:
+                logger.info(f"    Progress: {total_done}/{n_tasks} member-tasks done")
+
+        # Assemble and write each date
         session = target_repo.writable_session("main")
         batch_ok = 0
         batch_fail = 0
 
-        for future in distributed.as_completed(futures):
-            date_idx, date_str = futures[future]
-            try:
-                result = future.result()
-                data = result["data"]  # (51, 53, 157, 145)
+        for date_idx, date_str in batch:
+            members = date_results.get(date_idx, {})
+            n_ok = len(members)
+            n_fail = len(member_failures.get(date_idx, []))
 
-                # Write via region-indexing
+            if n_ok == 0:
+                batch_fail += 1
+                total_failed += 1
+                failed_dates.append(date_str)
+                logger.error(f"    Date {date_idx} ({date_str}) FAILED: 0/{N_MEMBERS} members")
+                continue
+
+            # Assemble (51, 53, 157, 145) array
+            data = np.full(
+                (N_MEMBERS, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
+            )
+            for m_idx, member_data in members.items():
+                data[m_idx] = member_data
+            del members
+            if date_idx in date_results:
+                del date_results[date_idx]
+
+            try:
                 ds_write = xr.Dataset({
                     "tp": (
                         ("init_date", "member", "lead_time", "lat", "lon"),
-                        data[np.newaxis],  # add init_date dim → (1, 51, 53, 157, 145)
+                        data[np.newaxis],  # (1, 51, 53, 157, 145)
                     ),
                 })
                 ds_write.to_zarr(
                     session.store,
-                    region={
-                        "init_date": slice(date_idx, date_idx + 1),
-                    },
+                    region={"init_date": slice(date_idx, date_idx + 1)},
                     consolidated=False,
                 )
-                del result, data
+                del data
 
                 batch_ok += 1
                 total_written += 1
-                logger.info(f"    Wrote date {date_idx} ({date_str})")
-
+                logger.info(
+                    f"    Wrote date {date_idx} ({date_str}) "
+                    f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed]"
+                )
             except Exception as e:
                 batch_fail += 1
                 total_failed += 1
                 failed_dates.append(date_str)
-                logger.error(f"    Date {date_idx} ({date_str}) FAILED: {e}")
+                logger.error(f"    Date {date_idx} ({date_str}) WRITE FAILED: {e}")
 
-        # Commit if all succeeded (contiguous guarantee for resume)
+        # Commit if all dates in batch succeeded
         if batch_fail == 0:
             session.commit(
                 f"fill dates {batch_idx_min}-{batch_idx_max}: "
