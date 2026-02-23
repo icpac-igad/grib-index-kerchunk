@@ -19,10 +19,12 @@ Processes year-by-year, month-by-month to manage memory. Downloads each
 parquet from GCS to a temp directory, then uploads the batch to HF.
 
 Usage:
-    uv run upload_parquets_to_hf.py                     # all 3 years
-    uv run upload_parquets_to_hf.py --year 2025          # single year
-    uv run upload_parquets_to_hf.py --dry-run             # list without uploading
-    uv run upload_parquets_to_hf.py --year 2024 --month 03  # single month
+    uv run upload_parquets_to_hf.py                        # all 3 years
+    uv run upload_parquets_to_hf.py --year 2025             # single year
+    uv run upload_parquets_to_hf.py --dry-run                # list without uploading
+    uv run upload_parquets_to_hf.py --year 2024 --month 03   # single month
+    uv run upload_parquets_to_hf.py --sync                   # upload only dates missing from HF
+    uv run upload_parquets_to_hf.py --sync --run 18 --dry-run # show missing 18z dates
 """
 
 import argparse
@@ -48,18 +50,53 @@ def get_gcs_fs():
     return gcsfs.GCSFileSystem(token=GCS_SA_FILE)
 
 
+def get_hf_dates(api, run_filter: str = None) -> dict[str, set[str]]:
+    """List all (run_hour -> set of date strings) already on HuggingFace.
+
+    Returns e.g. {'00z': {'20240301', '20240302', ...}, '12z': {...}}.
+    """
+    print("  Scanning HuggingFace repo for existing dates...", flush=True)
+    t0 = time.time()
+    files = list(api.list_repo_tree(
+        repo_id=HF_REPO, repo_type="dataset", recursive=True,
+    ))
+
+    dates_by_run: dict[str, set[str]] = {}
+    for f in files:
+        path = f.path if hasattr(f, "path") else str(f)
+        if not path.endswith(".parquet"):
+            continue
+        parts = path.split("/")
+        if len(parts) >= 5 and parts[0] == GCS_PREFIX:
+            run_hour = parts[4]  # e.g. "00z"
+            date_str = parts[3]  # e.g. "20240301"
+            if run_filter and run_hour != f"{run_filter}z":
+                continue
+            dates_by_run.setdefault(run_hour, set()).add(date_str)
+
+    elapsed = time.time() - t0
+    for run in sorted(dates_by_run):
+        print(f"    HF {run}: {len(dates_by_run[run])} dates", flush=True)
+    print(f"  HF scan done in {elapsed:.0f}s", flush=True)
+    return dates_by_run
+
+
 def upload_month(fs, api, year: str, month: str, dry_run: bool = False,
-                 run_filter: str = None):
-    """Download all parquets for one month from GCS, upload batch to HF."""
+                 run_filter: str = None, skip_dates: dict[str, set[str]] = None):
+    """Download all parquets for one month from GCS, upload batch to HF.
+
+    skip_dates: if provided, {run_hour -> set of date_strs} already on HF.
+    """
     gcs_month_path = f"{GCS_BUCKET}/{GCS_PREFIX}/{year}/{month}"
 
     try:
         date_dirs = sorted(fs.ls(gcs_month_path))
     except FileNotFoundError:
         print(f"  {year}/{month}: not found on GCS, skipping")
-        return 0
+        return 0, 0
 
     total_files = 0
+    skipped_dates = 0
 
     for date_dir in date_dirs:
         date_name = date_dir.split("/")[-1]  # e.g. 20240301
@@ -69,6 +106,12 @@ def upload_month(fs, api, year: str, month: str, dry_run: bool = False,
             run_name = run_dir.split("/")[-1]  # e.g. 00z
             if run_filter and run_name != f"{run_filter}z":
                 continue
+
+            # Skip dates already on HF in sync mode
+            if skip_dates and date_name in skip_dates.get(run_name, set()):
+                skipped_dates += 1
+                continue
+
             parquets = [f for f in fs.ls(run_dir) if f.endswith(".parquet")]
 
             if not parquets:
@@ -77,7 +120,7 @@ def upload_month(fs, api, year: str, month: str, dry_run: bool = False,
             hf_path = f"{GCS_PREFIX}/{year}/{month}/{date_name}/{run_name}"
 
             if dry_run:
-                print(f"  {hf_path}: {len(parquets)} parquets")
+                print(f"  [MISSING] {hf_path}: {len(parquets)} parquets")
                 total_files += len(parquets)
                 continue
 
@@ -95,13 +138,14 @@ def upload_month(fs, api, year: str, month: str, dry_run: bool = False,
                     repo_type="dataset",
                 )
                 total_files += len(parquets)
-                print(f"  {hf_path}: {len(parquets)} parquets uploaded")
+                print(f"  {hf_path}: {len(parquets)} parquets uploaded",
+                      flush=True)
             except Exception as e:
                 print(f"  {hf_path}: FAILED — {e}")
             finally:
                 shutil.rmtree(tmpdir)
 
-    return total_files
+    return total_files, skipped_dates
 
 
 def main():
@@ -113,6 +157,8 @@ def main():
                         help="Single month MM to upload (requires --year)")
     parser.add_argument("--run", type=str, default=None,
                         help="Run hour filter: 00, 06, 12, 18 (default: all)")
+    parser.add_argument("--sync", action="store_true",
+                        help="Only upload dates missing from HF (diff-based)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List files without uploading")
     args = parser.parse_args()
@@ -136,12 +182,20 @@ def main():
         print(f"Month: {args.month}")
     if args.run:
         print(f"Run: {args.run}z")
+    if args.sync:
+        print("Mode: SYNC (upload missing dates only)")
     if args.dry_run:
         print("Mode: DRY RUN")
     print("=" * 70)
 
+    # In sync mode, scan HF first to find existing dates
+    skip_dates = None
+    if args.sync:
+        skip_dates = get_hf_dates(api, run_filter=args.run)
+
     overall_t0 = time.time()
     grand_total = 0
+    grand_skipped = 0
 
     for year in years:
         print(f"\n{'='*70}")
@@ -160,21 +214,32 @@ def main():
                 continue
 
         year_total = 0
+        year_skipped = 0
         for month in months:
             t0 = time.time()
-            n = upload_month(fs, api, year, month, dry_run=args.dry_run,
-                            run_filter=args.run)
+            n, skipped = upload_month(fs, api, year, month,
+                                      dry_run=args.dry_run,
+                                      run_filter=args.run,
+                                      skip_dates=skip_dates)
             elapsed = time.time() - t0
             year_total += n
+            year_skipped += skipped
             if not args.dry_run and n > 0:
                 print(f"  Month {month}: {n} files in {elapsed:.0f}s")
 
-        print(f"  Year {year} total: {year_total} parquets")
+        msg = f"  Year {year} total: {year_total} parquets"
+        if skip_dates:
+            msg += f" ({year_skipped} dates skipped — already on HF)"
+        print(msg)
         grand_total += year_total
+        grand_skipped += year_skipped
 
     total_time = time.time() - overall_t0
     print(f"\n{'='*70}")
-    print(f"COMPLETE: {grand_total} parquets in {total_time:.0f}s ({total_time/60:.1f} min)")
+    msg = f"COMPLETE: {grand_total} parquets in {total_time:.0f}s ({total_time/60:.1f} min)"
+    if skip_dates:
+        msg += f"\n  Skipped: {grand_skipped} dates already on HF"
+    print(msg)
     print(f"{'='*70}")
 
 

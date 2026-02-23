@@ -90,6 +90,9 @@ HF_REPO = "E4DRR/gik-ecmwf-par"
 HF_BASE_URL = (
     "https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/resolve/main/run_par_ecmwf"
 )
+HF_COMBINED_URL = (
+    "https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/resolve/main/combined"
+)
 
 # ECMWF forecast lead times (00z run): 0-144h @3h + 150-168h @6h
 LEAD_TIME_HOURS_3H = list(range(0, 145, 3))   # 49 steps
@@ -337,10 +340,14 @@ def fill_store(args):
 
     def read_member_tp_ea(date_str, member_id, lead_time_hours,
                           hf_base_url, grid_shape, lat_idx_start, lat_idx_end,
-                          lon_idx_start, lon_idx_end):
+                          lon_idx_start, lon_idx_end,
+                          hf_combined_url=None):
         """Process one (date, member): fetch 53 tp steps from S3.
 
         Returns dict with member data array of shape (53, n_lat, n_lon) ~4.6 MB.
+
+        Tries the combined parquet (with pyarrow predicate pushdown) first,
+        falls back to the per-member parquet URL.
         """
         import json
         import os
@@ -368,12 +375,41 @@ def fill_store(args):
         year = date_str[:4]
         month = date_str[4:6]
 
-        # Download parquet from HuggingFace
-        parquet_url = (
-            f"{hf_base_url}/{year}/{month}/{date_str}/00z/"
-            f"{date_str}00z-{member_id}.parquet"
-        )
-        df = pd.read_parquet(parquet_url)
+        # Try combined parquet with predicate pushdown first
+        df = None
+        if hf_combined_url:
+            try:
+                combined_url = f"{hf_combined_url}/ecmwf_gik_00z.parquet"
+                # Cache combined parquet locally on worker for reuse
+                cache_dir = os.path.join(tempfile.gettempdir(), "gik_combined_cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = os.path.join(cache_dir, "ecmwf_gik_00z.parquet")
+
+                if not os.path.exists(cache_path):
+                    import urllib.request
+                    urllib.request.urlretrieve(combined_url, cache_path)
+
+                import pyarrow.parquet as pq
+                table = pq.read_table(
+                    cache_path,
+                    filters=[
+                        ("date", "==", date_str),
+                        ("member", "==", member_id),
+                    ],
+                )
+                df = table.to_pandas()
+                del table
+            except Exception:
+                df = None
+
+        # Fallback: per-member parquet URL
+        if df is None or df.empty:
+            member_key = member_id.replace("_", "")
+            parquet_url = (
+                f"{hf_base_url}/{year}/{month}/{date_str}/00z/"
+                f"{date_str}00z-{member_key}.parquet"
+            )
+            df = pd.read_parquet(parquet_url)
 
         # Build zstore dict
         zstore = {}
@@ -506,6 +542,7 @@ def fill_store(args):
                     ECMWF_GRID_SHAPE,
                     lat_idx_start, lat_idx_end,
                     lon_idx_start, lon_idx_end,
+                    HF_COMBINED_URL,
                     key=f"d{date_idx}-m{m_idx:02d}",
                 )
                 futures[future] = (date_idx, date_str, m_idx)
