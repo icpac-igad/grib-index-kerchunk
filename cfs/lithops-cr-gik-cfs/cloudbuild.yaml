@@ -1,0 +1,19 @@
+# Cloud Build configuration for CFS Lithops runtime
+# ===================================================
+#
+# Build and push the CFS Lithops runtime image to GCR.
+#
+# Usage:
+#   gcloud builds submit \
+#     --config=cloudbuild.yaml \
+#     --project=e4drr-crafd \
+#     --service-account=projects/e4drr-crafd/serviceAccounts/cfs-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/e4drr-crafd/cfs-lithops-runtime', '.']
+
+images:
+  - 'gcr.io/e4drr-crafd/cfs-lithops-runtime'
+
+timeout: '1200s'

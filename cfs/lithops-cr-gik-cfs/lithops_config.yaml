@@ -1,0 +1,42 @@
+# Lithops Configuration for CFS Parquet Processing
+# ==================================================
+#
+# This config is auto-loaded by run_lithops_cfs.py when present
+# in the same directory. Alternatively set LITHOPS_CONFIG_FILE env var.
+#
+# One-time setup:
+#   1. Build runtime image via Cloud Build:
+#      gcloud builds submit \
+#        --config=cloudbuild.yaml \
+#        --project=e4drr-crafd \
+#        --service-account=projects/e4drr-crafd/serviceAccounts/cfs-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+#
+#   2. Deploy as Cloud Run service:
+#      lithops runtime deploy gcr.io/e4drr-crafd/cfs-lithops-runtime \
+#        -b gcp_cloudrun -s gcp_storage --config lithops_config.yaml
+#
+# Management:
+#   lithops runtime list -b gcp_cloudrun --config lithops_config.yaml
+#   lithops runtime delete gcr.io/e4drr-crafd/cfs-lithops-runtime -b gcp_cloudrun -s gcp_storage --config lithops_config.yaml
+
+lithops:
+    backend: gcp_cloudrun
+    storage: gcp_storage
+
+gcp:
+    project_name: e4drr-crafd
+    region: us-east1           # Near s3://noaa-cfs-pds (us-east-1)
+    credentials_path: service_account/cfs-lithops-deployer-key.json
+
+gcp_cloudrun:
+    runtime: gcr.io/e4drr-crafd/cfs-lithops-runtime
+    runtime_memory: 2048       # 2 GB (template-based, no scan_grib)
+    runtime_cpu: 2             # 2 vCPUs
+    runtime_timeout: 3600      # 1 hour (CFS has ~861 timesteps vs ECMWF's 85)
+    max_workers: 130           # 124 members + retry buffer
+    min_workers: 0
+    worker_processes: 1        # 1 process per container (pipeline is I/O-intensive)
+
+gcp_storage:
+    bucket: gik-cfs-aws-tf
+    region: us-east1           # Near noaa-cfs-pds
