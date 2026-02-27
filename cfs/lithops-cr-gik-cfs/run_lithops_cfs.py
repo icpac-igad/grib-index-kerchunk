@@ -140,8 +140,13 @@ CFS_VAR_FILTER = {
 # STAGE 1: LOAD ZARR STRUCTURE FROM TEMPLATE
 # ==============================================================================
 
-def ensure_template() -> str:
-    """Get template path (pre-baked in image or download to /tmp)."""
+def ensure_template(local_template: Optional[str] = None) -> str:
+    """Get template path (local file, pre-baked in image, or download to /tmp)."""
+    # Use local template if provided (for sequential testing)
+    if local_template and os.path.exists(local_template):
+        logger.info(f"Using local template: {local_template}")
+        return local_template
+
     # Check if template is baked into the Docker image (Cloud Run workers)
     baked_path = os.environ.get('CFS_TEMPLATE_PATH')
     if baked_path and os.path.exists(baked_path):
@@ -166,19 +171,44 @@ def ensure_template() -> str:
     return TEMPLATE_CACHE_PATH
 
 
+def _load_parquet_as_zstore(parquet_path: str) -> Dict:
+    """Load a parquet file with ['key', 'value'] columns into a zarr store dict."""
+    template_df = pd.read_parquet(parquet_path)
+
+    zstore = {}
+    for _, row in template_df.iterrows():
+        key = row['key']
+        value = row['value']
+        if isinstance(value, bytes):
+            value = value.decode('utf-8')
+        if isinstance(value, str):
+            if value.startswith('[') or value.startswith('{'):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    pass
+        zstore[key] = value
+
+    if 'version' in zstore:
+        del zstore['version']
+
+    return zstore
+
+
 def build_deflated_store_from_template(
-    template_tar_path: str,
+    template_path: str,
     init_date: str,
     run: str,
 ) -> Optional[Dict]:
     """
-    Load a single member's zarr store from the HuggingFace template archive.
+    Load zarr store from template.
 
-    The template archive contains per-member zarr store parquets at:
-        gik-fmrc/v2cfs_fmrc/{init_date}_{run}/cfs-{init_date}{run}-member01-rt000.par
+    Supports two formats:
+    1. Local parquet file (from run_cfs_template_creation.py --zarr-template)
+    2. tar.gz archive (HuggingFace template for Cloud Run)
 
     Parameters:
-        template_tar_path: Path to template tar.gz
+        template_path: Path to template parquet or tar.gz
         init_date: Init date YYYYMMDD
         run: Run hour (00, 06, 12, 18)
 
@@ -188,13 +218,21 @@ def build_deflated_store_from_template(
     logger.info(f"Stage 1: Loading zarr structure for {init_date} {run}z")
     start_time = time.time()
 
-    tar_member_path = (
-        f"gik-fmrc/v2cfs_fmrc/{init_date}_{run}/"
-        f"cfs-{init_date}{run}-member{CFS_MEMBER}-rt000.par"
-    )
-
     try:
-        with tarfile.open(template_tar_path, 'r:gz') as tar:
+        # Local parquet file (from --zarr-template)
+        if template_path.endswith('.parquet'):
+            zstore = _load_parquet_as_zstore(template_path)
+            elapsed = time.time() - start_time
+            logger.info(f"Stage 1 complete: {len(zstore)} keys from local parquet in {elapsed:.1f}s")
+            return zstore
+
+        # tar.gz archive (HuggingFace template)
+        tar_member_path = (
+            f"gik-fmrc/v2cfs_fmrc/{init_date}_{run}/"
+            f"cfs-{init_date}{run}-member{CFS_MEMBER}-rt000.par"
+        )
+
+        with tarfile.open(template_path, 'r:gz') as tar:
             try:
                 member_info = tar.getmember(tar_member_path)
             except KeyError:
@@ -247,12 +285,18 @@ def parse_cfs_idx(idx_url: str) -> List[Dict]:
     CFS .idx format:
         1:0:d=2025110100:PRATE:surface:6 hour fcst:
         2:2784924:d=2025110100:TMP:2 m above ground:6 hour fcst:
-        ...
+      36.1:1898885:d=2025110100:UGRD:10 m above ground:6 hour fcst:
+      36.2:1898885:d=2025110100:VGRD:10 m above ground:6 hour fcst:
 
     Fields: record:offset:d=YYYYMMDDHH:variable:level:forecast_info:
 
-    Byte length is calculated as offset[i+1] - offset[i]. For the last
-    entry, we use the GRIB file size from fs.info().
+    Note: CFS uses fractional record numbers (e.g. 36.1, 36.2) for
+    variables packed in a single GRIB message (e.g. UGRD+VGRD wind).
+    Both entries share the same byte offset.
+
+    Byte length is calculated as offset[i+1] - offset[i]. For entries
+    sharing an offset, they get the same byte_length (same GRIB message).
+    For the last entry, we use the GRIB file size from fs.info().
 
     Parameters:
         idx_url: S3 URL to the .idx file
@@ -282,7 +326,7 @@ def parse_cfs_idx(idx_url: str) -> List[Dict]:
                 continue
 
             try:
-                record = int(parts[0])
+                record = float(parts[0])  # float handles "36.1", "79.2" etc.
                 offset = int(parts[1])
                 date_info = parts[2]  # d=YYYYMMDDHH
                 variable = parts[3]
@@ -303,26 +347,44 @@ def parse_cfs_idx(idx_url: str) -> List[Dict]:
         if not raw_entries:
             return []
 
-        # Calculate byte_length from consecutive offsets
-        for i in range(len(raw_entries) - 1):
-            raw_entries[i]['byte_length'] = (
-                raw_entries[i + 1]['byte_offset'] - raw_entries[i]['byte_offset']
-            )
+        # Calculate byte_length from consecutive offsets.
+        # For entries sharing an offset (e.g. UGRD 36.1 + VGRD 36.2),
+        # find the next DIFFERENT offset to compute length.
+        # Get unique offsets in order for length calculation
+        unique_offsets = []
+        seen = set()
+        for e in raw_entries:
+            if e['byte_offset'] not in seen:
+                unique_offsets.append(e['byte_offset'])
+                seen.add(e['byte_offset'])
 
-        # For the last entry, get file size from the GRIB file
+        # Get file size for the last entry's length
         grib_url = idx_url.replace('.idx', '')
         grib_path = grib_url.replace("s3://", "")
         try:
             file_info = fs.info(grib_path)
             file_size = file_info.get('size', file_info.get('Size', 0))
-            raw_entries[-1]['byte_length'] = file_size - raw_entries[-1]['byte_offset']
         except Exception:
-            # Fallback: estimate last entry as 2x average of others
-            if len(raw_entries) > 1:
-                avg_len = sum(e['byte_length'] for e in raw_entries[:-1]) / (len(raw_entries) - 1)
-                raw_entries[-1]['byte_length'] = int(avg_len * 2)
+            file_size = None
+
+        # Build offset -> length map
+        offset_to_length = {}
+        for i in range(len(unique_offsets) - 1):
+            offset_to_length[unique_offsets[i]] = unique_offsets[i + 1] - unique_offsets[i]
+        # Last unique offset
+        if file_size and unique_offsets:
+            offset_to_length[unique_offsets[-1]] = file_size - unique_offsets[-1]
+        elif unique_offsets:
+            # Fallback: estimate from average
+            if len(offset_to_length) > 0:
+                avg_len = sum(offset_to_length.values()) / len(offset_to_length)
+                offset_to_length[unique_offsets[-1]] = int(avg_len * 2)
             else:
-                raw_entries[-1]['byte_length'] = 1000000  # 1MB fallback
+                offset_to_length[unique_offsets[-1]] = 1000000
+
+        # Assign byte_length to all entries (shared-offset entries get same length)
+        for entry in raw_entries:
+            entry['byte_length'] = offset_to_length.get(entry['byte_offset'], 0)
 
         return raw_entries
 
@@ -672,18 +734,22 @@ def process_cfs_member(
     run: str,
     target_month: str,
     max_forecast_hours: int = DEFAULT_MAX_FORECAST_HOURS,
+    local_template: Optional[str] = None,
+    output_dir_override: Optional[str] = None,
 ) -> Dict:
     """
     Process a single CFS member (init_date+run) through the three-stage pipeline.
 
     This function is serialized by Lithops (cloudpickle) and executed on
-    Cloud Run workers.
+    Cloud Run workers. Can also run locally with --sequential.
 
     Parameters:
         init_date: Init date YYYYMMDD
         run: Run hour (00, 06, 12, 18)
         target_month: Target forecast month YYYYMM (for GCS path)
         max_forecast_hours: Max forecast hours to process
+        local_template: Path to local template parquet (for sequential testing)
+        output_dir_override: Save output locally instead of GCS upload
 
     Returns:
         Dict with processing results
@@ -701,6 +767,7 @@ def process_cfs_member(
         "success": False,
         "message": "",
         "gcs_path": None,
+        "output_path": None,
         "total_time_seconds": 0,
     }
 
@@ -712,7 +779,7 @@ def process_cfs_member(
             return result
 
         # Ensure template is available
-        template_path = ensure_template()
+        template_path = ensure_template(local_template)
 
         # Stage 1: Load zarr structure from template
         deflated_store = build_deflated_store_from_template(
@@ -734,17 +801,20 @@ def process_cfs_member(
         final_store = merge_with_template(stage2_refs, deflated_store)
 
         # Stage 3: Create final parquet
-        output_dir = Path(f"/tmp/cfs_{init_date}_{run}z")
+        if output_dir_override:
+            output_dir = Path(output_dir_override)
+        else:
+            output_dir = Path(f"/tmp/cfs_{init_date}_{run}z")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         parquet_file = output_dir / f"{init_date}{run}z.parquet"
         create_parquet_simple(final_store, parquet_file)
 
-        # Upload to GCS
-        gcs_path = upload_to_gcs(output_dir, init_date, run, target_month)
-
-        # Cleanup /tmp
-        shutil.rmtree(output_dir, ignore_errors=True)
+        # Upload to GCS or keep locally
+        gcs_path = None
+        if not output_dir_override:
+            gcs_path = upload_to_gcs(output_dir, init_date, run, target_month)
+            shutil.rmtree(output_dir, ignore_errors=True)
 
         total_time = time.time() - pipeline_start
 
@@ -753,12 +823,15 @@ def process_cfs_member(
             "message": (f"Processed {init_date} {run}z in {total_time:.1f}s "
                         f"({len(stage2_refs)} refs)"),
             "gcs_path": gcs_path,
+            "output_path": str(parquet_file) if output_dir_override else None,
             "total_time_seconds": round(total_time, 1),
             "stage2_refs": len(stage2_refs),
             "final_keys": len(final_store),
         })
 
         logger.info(f"Pipeline complete: {result['message']}")
+        if output_dir_override:
+            logger.info(f"Output saved locally: {parquet_file}")
         return result
 
     except Exception as e:
@@ -816,9 +889,15 @@ def generate_ensemble_members(target_month: str) -> List[Tuple[str, str, str]]:
 def run_sequential(
     members: List[Tuple[str, str, str]],
     max_forecast_hours: int = DEFAULT_MAX_FORECAST_HOURS,
+    local_template: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> List[Dict]:
     """Run processing sequentially (no Lithops, for local testing)."""
     print(f"\nRunning sequential processing for {len(members)} members")
+    if local_template:
+        print(f"Using local template: {local_template}")
+    if output_dir:
+        print(f"Output directory: {output_dir}")
     print("=" * 70)
 
     results = []
@@ -828,7 +907,9 @@ def run_sequential(
         start_time = time.time()
 
         result = process_cfs_member(
-            init_date, run, target_month, max_forecast_hours
+            init_date, run, target_month, max_forecast_hours,
+            local_template=local_template,
+            output_dir_override=output_dir,
         )
 
         elapsed = time.time() - start_time
@@ -1108,6 +1189,11 @@ def main():
                         help='Max parallel workers for Lithops (default: 10)')
     parser.add_argument('--sequential', action='store_true',
                         help='Run sequentially without Lithops (local testing)')
+    parser.add_argument('--local-template',
+                        help='Path to local zarr template parquet (from '
+                             'run_cfs_template_creation.py --zarr-template)')
+    parser.add_argument('--output-dir',
+                        help='Save output locally instead of GCS upload')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show members without executing')
     parser.add_argument('--yes', '-y', action='store_true',
@@ -1137,7 +1223,12 @@ def main():
     print(f"Max forecast hours: {args.max_forecast_hours}")
     print(f"Execution mode: "
           f"{'Sequential (local)' if args.sequential else f'Lithops Cloud Run (max {args.max_workers} workers)'}")
-    print(f"GCS output: gs://{GCS_BUCKET}/{GCS_PARQUET_PREFIX}/")
+    if args.local_template:
+        print(f"Local template: {args.local_template}")
+    if args.output_dir:
+        print(f"Local output: {args.output_dir}")
+    else:
+        print(f"GCS output: gs://{GCS_BUCKET}/{GCS_PARQUET_PREFIX}/")
 
     if args.dry_run:
         print(f"\nDRY RUN — Members that would be processed:")
@@ -1158,7 +1249,11 @@ def main():
     start_time = time.time()
 
     if args.sequential:
-        results = run_sequential(members, args.max_forecast_hours)
+        results = run_sequential(
+            members, args.max_forecast_hours,
+            local_template=args.local_template,
+            output_dir=args.output_dir,
+        )
     else:
         results = run_with_lithops(
             members, args.max_forecast_hours, args.max_workers
