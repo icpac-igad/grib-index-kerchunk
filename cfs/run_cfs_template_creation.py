@@ -12,9 +12,14 @@
 #     "gcsfs",
 #     "requests",
 #     "google-cloud-storage",
-#     "kerchunk",
+#     "kerchunk==0.2.7",
 #     "h5py",
-#     "zarr",
+#     "zarr>=2.18,<3",
+#     "xarray==2024.10.0",
+#     "cfgrib",
+#     "eccodes",
+#     "numcodecs<0.13",
+#     "pandas<2.2",
 # ]
 # ///
 """
@@ -288,9 +293,31 @@ def process_cfs_time_idx_data(s3url: str, bucket_name: str) -> bool:
 
     logger.info(f"Processing CFS: {date_str} run {run} f{forecast_hour:04d}")
 
-    # Build mapping with anonymous S3 access
+    # CFS .idx files have non-integer idx values (e.g. "36.1") which causes
+    # kerchunk's parse_grib_idx line `result["idx"].astype(int)` to fail.
+    # Monkey-patch pandas Series.astype on the module to handle this.
+    import kerchunk._grib_idx as _grib_idx
+
+    if not getattr(_grib_idx, '_cfs_patched', False):
+        _orig_astype = pd.Series.astype
+
+        def _safe_astype(self, dtype, **kwargs):
+            if dtype == int or dtype is int:
+                try:
+                    return _orig_astype(self, dtype, **kwargs)
+                except (ValueError, TypeError):
+                    return pd.to_numeric(self, errors="coerce").fillna(0).astype(int)
+            return _orig_astype(self, dtype, **kwargs)
+
+        pd.Series.astype = _safe_astype
+        _grib_idx._cfs_patched = True
+
     storage_options = {"anon": True, "asynchronous": False}
-    mapping = build_idx_grib_mapping(s3url, storage_options=storage_options)
+    # validate=False because CFS has ~2 messages that kerchunk can't decode
+    # (unknown variables), causing offset mismatches on those messages only
+    mapping = build_idx_grib_mapping(
+        s3url, storage_options=storage_options, validate=False
+    )
 
     # Deduplicate on attrs
     deduped_mapping = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
