@@ -428,15 +428,18 @@ def generate_cfs_forecast_urls(
     return urls
 
 
-def create_references_from_idx(grib_url: str, idx_entries: List[Dict]) -> Dict[str, Any]:
+def create_references_from_idx(grib_url: str, idx_entries: List[Dict],
+                               var_filter: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
     Create kerchunk-style references from parsed .idx entries.
 
-    Filters to only CFS_VAR_FILTER variables.
+    By default captures ALL variables from the .idx file. If var_filter is
+    provided, only variables matching the filter are included.
 
     Parameters:
         grib_url: S3 URL to the GRIB file
         idx_entries: Parsed index entries from parse_cfs_idx
+        var_filter: Optional dict {variable: level} to filter. If None, all variables are included.
 
     Returns:
         Dict mapping reference keys to [url, offset, length] triplets
@@ -452,13 +455,13 @@ def create_references_from_idx(grib_url: str, idx_entries: List[Dict]) -> Dict[s
         if length <= 0:
             continue
 
-        # Filter: only include variables in our target set
-        if variable not in CFS_VAR_FILTER:
-            continue
-
-        expected_level = CFS_VAR_FILTER[variable]
-        if expected_level not in level:
-            continue
+        # Optional filter: only include variables in the target set
+        if var_filter is not None:
+            if variable not in var_filter:
+                continue
+            expected_level = var_filter[variable]
+            if expected_level not in level:
+                continue
 
         # Build reference key matching zarr convention
         var_lower = variable.lower()
@@ -708,16 +711,17 @@ def validate_cfs_availability(init_date: str, run: str) -> Tuple[bool, int, int]
 
         n_variables = len(variables)
 
-        # Check that we have our target variables
+        # Check that we have the core target variables
         target_vars = set(CFS_VAR_FILTER.keys())
         found_vars = target_vars.intersection(variables)
 
         if len(found_vars) < len(target_vars):
             missing = target_vars - found_vars
-            logger.warning(f"Missing variables: {missing}")
+            logger.warning(f"Missing core variables: {missing}")
 
         logger.info(f"Index validation: {n_messages} messages, "
-                    f"{n_variables} variables ({len(found_vars)}/{len(target_vars)} targets)")
+                    f"{n_variables} unique variables, "
+                    f"{len(found_vars)}/{len(target_vars)} core targets present")
         return True, n_messages, n_variables
 
     except Exception as e:
