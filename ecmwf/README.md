@@ -564,6 +564,67 @@ export AWS_NO_SIGN_REQUEST=YES
 - Reduce `--n-workers` to lower the concurrent task count
 - Peak memory on coordinator is ~245 MB per date (51 members x 4.6 MB, freed after each date commit)
 
+## HuggingFace Catalog & Data Access Testing
+
+The HuggingFace dataset (`E4DRR/gik-ecmwf-par`) includes a **catalog.parquet** (1.7 MB) at the repo root that indexes all 144,228+ parquet files. Two test scripts demonstrate how to use the catalog to access data.
+
+### Upload & Catalog Management
+
+```bash
+# Upload individual parquets from GCS to HuggingFace
+uv run upload_parquets_to_hf.py --sync --dry-run            # preview missing dates
+uv run upload_parquets_to_hf.py --sync                       # upload missing dates
+
+# Build/refresh the catalog index on HuggingFace
+uv run upload_parquets_to_hf.py --catalog                    # full catalog (all years)
+uv run upload_parquets_to_hf.py --catalog --year 2024 --dry-run  # preview
+```
+
+### Materialized Streaming: `test_catalog_xarray.py`
+
+Downloads parquets from HuggingFace, fetches GRIB bytes from S3 via byte-range reads, decodes with gribberish, and assembles a fully materialized xarray Dataset.
+
+```bash
+# Single member (control) — ~30s
+uv run test_catalog_xarray.py --date 20250101 --members 1
+
+# 5 members — ~2.5 min
+uv run test_catalog_xarray.py --date 20250101 --members 5
+
+# All 51 members — ~25 min
+uv run test_catalog_xarray.py --date 20250101 --members 51
+```
+
+**Output:** `xarray.Dataset` with dimensions `(member, step=53, latitude=721, longitude=1440)`, all data in memory.
+
+### Lazy / Virtual Streaming: `test_catalog_virtual.py`
+
+Builds a **dask-backed lazy xarray Dataset** — parquets are parsed instantly but no GRIB data is fetched from S3 until `.load()` is called on a slice. This lets you open all 51 members in seconds and selectively materialize only the data you need.
+
+```bash
+# Open 3 members lazily (no S3 reads) — ~5s
+uv run test_catalog_virtual.py --date 20250101 --members 3
+
+# Open all 51 members lazily — ~30s
+uv run test_catalog_virtual.py --date 20250101 --members 51
+
+# Open lazily + fetch one lead time to verify — ~15s
+uv run test_catalog_virtual.py --date 20250101 --members 3 --load-step 24
+
+# Different variable
+uv run test_catalog_virtual.py --date 20250101 --var 2t --load-step 0
+```
+
+**Output:** `xarray.Dataset` with `dask.array` (zero bytes in memory). Call `.load()` on any slice to trigger S3 byte-range reads (~2 MB per member per step).
+
+| Approach | 1 Member | 51 Members | Data in Memory |
+|----------|----------|------------|----------------|
+| Materialized (`test_catalog_xarray.py`) | ~30s | ~25 min | All steps, all data |
+| Lazy (`test_catalog_virtual.py`) | ~2s | ~30s | 0 bytes until `.load()` |
+| Lazy + `.sel(step=24).load()` | ~10s | ~30s + ~30s | 1 step only |
+
+---
+
 ## References
 
 - [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
