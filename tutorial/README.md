@@ -23,15 +23,13 @@ The **Grib-Index-Kerchunk** method creates zarr-compatible parquet reference fil
 cd gefs
 python run_gefs_data_streaming_v2.py
 
-# ECMWF (51 members, ~29 minutes)
+# ECMWF — lazy virtual dataset (no S3 reads until .load())
 cd ecmwf
-python run_ecmwf_data_streaming_20260106.py
-```
+uv run process2_open_virtual_dataset.py --members 3 --load-step 24
 
-Both scripts will:
-1. Stream precipitation data from AWS S3
-2. Calculate 24-hour exceedance probabilities
-3. Generate multi-panel probability plots
+# ECMWF — materialized dataset (parallel S3 fetch + gribberish)
+uv run process3_open_materialized_dataset.py --members 3
+```
 
 ## Performance Summary
 
@@ -127,8 +125,9 @@ output_plots/ecmwf_24h_probability_20260106_00z_all_thresholds.png
 |--------|---------|---------|
 | `gefs/run_gefs_tutorial.py` | Create GEFS parquet files | ~5 min |
 | `gefs/run_gefs_data_streaming_v2.py` | Stream GEFS data + plot | ~14 min |
-| `ecmwf/run_ecmwf_tutorial.py` | Create ECMWF parquet files | ~5-30 min |
-| `ecmwf/run_ecmwf_data_streaming_20260106.py` | Stream ECMWF data + plot | ~29 min |
+| `ecmwf/process1_make_virtual_manifest.py` | Create ECMWF parquet reference files | ~5-15 min |
+| `ecmwf/process2_open_virtual_dataset.py` | Open ECMWF parquets as lazy xarray | ~10s setup |
+| `ecmwf/process3_open_materialized_dataset.py` | Open ECMWF parquets as in-memory xarray | ~30s/member |
 
 ## Memory Efficiency
 
@@ -157,11 +156,10 @@ tutorial/
 │   └── output_plots/           # Generated plots
 └── ecmwf/
     ├── README.md               # ECMWF deep dive
-    ├── run_ecmwf_tutorial.py   # Create parquet files
-    ├── run_ecmwf_data_streaming_20260106.py  # Stream + plot
-    ├── ea_ghcf_simple.geojson  # East Africa boundaries
-    ├── ecmwf_three_stage_20260106_00z/  # Parquet files
-    └── output_plots/           # Generated plots
+    ├── process1_make_virtual_manifest.py   # Create parquet reference files
+    ├── process2_open_virtual_dataset.py    # Lazy xarray (dask.delayed)
+    ├── process3_open_materialized_dataset.py  # Eager xarray (parallel S3)
+    └── output_parquet/         # Generated parquet files
 ```
 
 ## Comparison: Traditional vs GIK

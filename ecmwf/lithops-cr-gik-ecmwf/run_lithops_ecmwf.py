@@ -111,7 +111,7 @@ PARALLEL_WORKERS = int(os.environ.get('PARALLEL_WORKERS', '4'))
 
 TEMPLATE_URL = os.environ.get(
     'TEMPLATE_URL',
-    'https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz'
+    'https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz'
 )
 
 # ECMWF forecast hours
