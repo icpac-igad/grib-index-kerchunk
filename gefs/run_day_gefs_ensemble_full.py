@@ -21,6 +21,7 @@ import time
 # Import from gefs_util
 from gefs_util import generate_axes
 from gefs_util import filter_build_grib_tree
+from gefs_util import build_gefs_deflated_store_from_template
 from gefs_util import calculate_time_dimensions
 from gefs_util import cs_create_mapped_index
 from gefs_util import cs_create_mapped_index_local
@@ -65,6 +66,12 @@ STREAM_AFTER_CREATION = True  # Creates parquet files (works with Zarr v3)
 # Choose between GCS bucket (requires service account) or local tar.gz file
 # Set USE_LOCAL_TARBALL = True to use local tar.gz file instead of GCS bucket
 USE_LOCAL_TARBALL = False  # Set to True to use local tar.gz file
+
+# Skip scan_grib by loading deflated store from a pre-built template parquet.
+# Set to the path of the template file, or None to use scan_grib (original).
+# The template is identical across all 30 members, so it loads once (~0.05s)
+# instead of running scan_grib per member (~5s each = ~150s total).
+DEFLATED_STORE_TEMPLATE = 'gefs-deflated-store-template-20241112.parquet'
 
 # Path to local tar.gz file containing parquet mappings
 # Only used when USE_LOCAL_TARBALL = True
@@ -187,7 +194,7 @@ def read_parquet_fixed(parquet_path):
 
 def process_single_ensemble_member(member, target_date_str, target_run, reference_date_str,
                                  axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
-                                 mapping_manager=None):
+                                 mapping_manager=None, deflated_store=None):
     """Process a single ensemble member and return its zarr store.
 
     Args:
@@ -199,22 +206,25 @@ def process_single_ensemble_member(member, target_date_str, target_run, referenc
         forecast_dict: Dictionary of variables to process
         time_dims, time_coords, times, valid_times, steps: Time dimension info
         mapping_manager: Optional LocalTarGzMappingManager for local tar.gz usage
+        deflated_store: Optional pre-loaded deflated store (skips scan_grib if provided)
     """
     print(f"\n🎯 Processing ensemble member: {member}")
 
-    # Define GEFS files for this member
-    gefs_files = []
-    for hour in [0, 3]:  # Only initial timesteps needed
-        gefs_files.append(
-            f"s3://noaa-gefs-pds/gefs.{target_date_str}/{target_run}/atmos/pgrb2sp25/"
-            f"{member}.t{target_run}z.pgrb2s.0p25.f{hour:03d}"
-        )
-
     try:
-        # Build GRIB tree from files
-        print(f"🔨 Building GRIB tree for {member}...")
-        _, deflated_gefs_grib_tree_store = filter_build_grib_tree(gefs_files, forecast_dict)
-        print(f"✅ GRIB tree built successfully for {member}")
+        # Stage 1: Use pre-loaded template or fall back to scan_grib
+        if deflated_store is not None:
+            deflated_gefs_grib_tree_store = deflated_store
+            print(f"✅ Using pre-loaded template for {member} (scan_grib skipped)")
+        else:
+            gefs_files = []
+            for hour in [0, 3]:
+                gefs_files.append(
+                    f"s3://noaa-gefs-pds/gefs.{target_date_str}/{target_run}/atmos/pgrb2sp25/"
+                    f"{member}.t{target_run}z.pgrb2s.0p25.f{hour:03d}"
+                )
+            print(f"🔨 Building GRIB tree for {member}...")
+            _, deflated_gefs_grib_tree_store = filter_build_grib_tree(gefs_files, forecast_dict)
+            print(f"✅ GRIB tree built successfully for {member}")
 
         # Create zarr store using reference mappings
         print(f"🗃️ Creating zarr store for {member}...")
@@ -258,7 +268,7 @@ def process_single_ensemble_member(member, target_date_str, target_run, referenc
 
 def process_ensemble_members_batch(members_batch, target_date_str, target_run, reference_date_str,
                                   axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
-                                  mapping_manager=None):
+                                  mapping_manager=None, deflated_store=None):
     """Process a batch of ensemble members.
 
     Args:
@@ -270,6 +280,7 @@ def process_ensemble_members_batch(members_batch, target_date_str, target_run, r
         forecast_dict: Dictionary of variables to process
         time_dims, time_coords, times, valid_times, steps: Time dimension info
         mapping_manager: Optional LocalTarGzMappingManager for local tar.gz usage
+        deflated_store: Optional pre-loaded deflated store (skips scan_grib if provided)
     """
     results = {}
 
@@ -277,7 +288,8 @@ def process_ensemble_members_batch(members_batch, target_date_str, target_run, r
         member_name, member_store, success = process_single_ensemble_member(
             member, target_date_str, target_run, reference_date_str,
             axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
-            mapping_manager=mapping_manager
+            mapping_manager=mapping_manager,
+            deflated_store=deflated_store
         )
 
         if member_store is not None:
@@ -391,13 +403,27 @@ def main():
         "Total Precipitation": "APCP:surface",
     }
 
-    # 3. Calculate time dimensions (same for all members)
-    print(f"\n⏰ Calculating time dimensions...")
-    time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
-    print(f"✅ Time dimensions: {len(times)} timesteps")
+    # 3. Load deflated store template (Stage 1 — replaces per-member scan_grib)
+    deflated_store = None
+    if DEFLATED_STORE_TEMPLATE and os.path.exists(DEFLATED_STORE_TEMPLATE):
+        print(f"\n Loading deflated store from template: {DEFLATED_STORE_TEMPLATE}")
+        deflated_store = build_gefs_deflated_store_from_template(
+            DEFLATED_STORE_TEMPLATE,
+            filter_vars=forecast_dict
+        )
+        print(f"  Loaded {len(deflated_store['refs'])} zarr refs (scan_grib skipped for all members)")
+    elif DEFLATED_STORE_TEMPLATE:
+        print(f"\n  Template not found: {DEFLATED_STORE_TEMPLATE}, falling back to scan_grib")
+    else:
+        print(f"\n  DEFLATED_STORE_TEMPLATE not set, using scan_grib per member")
 
-    # 4. Process ensemble members in batches
-    print(f"\n🚀 Processing {len(ENSEMBLE_MEMBERS)} ensemble members...")
+    # 4. Calculate time dimensions (same for all members)
+    print(f"\n  Calculating time dimensions...")
+    time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
+    print(f"  Time dimensions: {len(times)} timesteps")
+
+    # 5. Process ensemble members in batches
+    print(f"\n  Processing {len(ENSEMBLE_MEMBERS)} ensemble members...")
 
     # Process in batches of 5 to manage resources
     batch_size = 5
@@ -414,7 +440,8 @@ def main():
             batch_results = process_ensemble_members_batch(
                 batch, TARGET_DATE_STR, TARGET_RUN, REFERENCE_DATE_STR,
                 axes, forecast_dict, time_dims, time_coords, times, valid_times, steps,
-                mapping_manager=mapping_manager
+                mapping_manager=mapping_manager,
+                deflated_store=deflated_store
             )
 
             all_results.update(batch_results)

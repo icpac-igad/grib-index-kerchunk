@@ -279,6 +279,136 @@ def build_gefs_grib_tree(gefs_files: List[str]) -> Tuple[dict, dict]:
     return gefs_grib_tree_store, deflated_gefs_grib_tree_store
 
 
+def build_gefs_deflated_store_from_template(
+    template_path: str,
+    filter_vars: Optional[Dict[str, str]] = None
+) -> dict:
+    """
+    Load the GEFS deflated store from a pre-built parquet template instead of
+    running scan_grib. This replaces the ~30s-per-member scan_grib call with a
+    <1s template load. The deflated store is identical across all 30 ensemble
+    members, so it only needs to be loaded once.
+
+    The template parquet is a key/value DataFrame with zarr metadata entries
+    (.zarray, .zattrs, .zgroup) and base64-encoded coordinate data, generated
+    by running scan_grib + grib_tree + strip_datavar_chunks on the reference
+    date (20241112) and serializing the result.
+
+    Parameters:
+    - template_path: Path to the deflated store parquet template file, or path
+      to a tar.gz archive containing 'gefs-deflated-store-template.parquet'.
+    - filter_vars: Optional dict of variables to keep (same format as
+      tofilter_gefs_var_dict used in filter_build_grib_tree). Keys are display
+      names, values are "VAR:level" strings. If None, all variables are kept.
+
+    Returns:
+    - dict: Deflated GRIB tree store with 'version' and 'refs' keys,
+      compatible with prepare_zarr_store().
+    """
+    print("Loading GEFS deflated store from template (skipping scan_grib)")
+    start = time.time()
+
+    # Load from parquet (may be inside a tar.gz)
+    if template_path.endswith('.tar.gz'):
+        template_df = _load_deflated_parquet_from_tar(template_path)
+    else:
+        template_df = pd.read_parquet(template_path)
+
+    # Convert DataFrame to zarr store dict
+    refs = {}
+    for _, row in template_df.iterrows():
+        key = row['key']
+        value = row['value']
+        if isinstance(value, bytes):
+            try:
+                decoded = value.decode('utf-8')
+            except UnicodeDecodeError:
+                refs[key] = value
+                continue
+            value = decoded
+        if isinstance(value, str):
+            if value.startswith('[') or value.startswith('{'):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    pass
+        refs[key] = value
+
+    total_refs = len(refs)
+
+    # Optionally filter to requested variables
+    if filter_vars is not None:
+        refs = _filter_deflated_refs(refs, filter_vars)
+
+    elapsed = time.time() - start
+    print(f"  Template loaded in {elapsed:.2f}s: {total_refs} total refs"
+          + (f", filtered to {len(refs)}" if filter_vars else ""))
+
+    return {'version': 1, 'refs': refs}
+
+
+def _load_deflated_parquet_from_tar(tar_path: str) -> pd.DataFrame:
+    """Load the deflated store parquet from inside a tar.gz archive."""
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        # Look for the deflated store template file
+        for member in tar.getnames():
+            if 'deflated-store-template' in member and member.endswith('.parquet'):
+                f = tar.extractfile(member)
+                return pd.read_parquet(io.BytesIO(f.read()))
+        raise FileNotFoundError(
+            f"No deflated store template parquet found in {tar_path}. "
+            "Expected a file matching '*deflated-store-template*.parquet'."
+        )
+
+
+def _filter_deflated_refs(refs: dict, filter_vars: Dict[str, str]) -> dict:
+    """
+    Filter deflated store refs to only include the requested variables.
+
+    Keeps the root .zgroup and all entries under wanted variable prefixes.
+    Removes everything for variables not in filter_vars.
+
+    Parameters:
+    - refs: Full deflated store refs dict.
+    - filter_vars: Dict mapping display names to "VAR:level" strings,
+      e.g. {"2 metre temperature": "TMP:2 m above ground"}.
+
+    Returns:
+    - dict: Filtered refs containing only the requested variable paths.
+    """
+    # GRIB .idx abbreviation -> cfgrib short name (zarr path prefix).
+    # Built from the GEFS mapping parquets which contain both representations.
+    GRIB_TO_CFGRIB = {
+        'tmp': 't2m', 'dpt': 'd2m', 'rh': 'r2', 'ugrd': 'u10', 'vgrd': 'v10',
+        'apcp': 'tp', 'pres': 'sp', 'hgt': 'gh', 'tsoil': 'st',
+        'soilw': 'soilw', 'weasd': 'sdwe', 'snod': 'sde', 'icetk': 'sithick',
+        'gust': 'gust', 'vis': 'vis', 'mslet': 'mslet', 'prmsl': 'prmsl',
+        'cpofp': 'cpofp', 'cape': 'cape', 'cin': 'cin', 'pwat': 'pwat',
+        'tcdc': 'tcc', 'hlcy': 'hlcy', 'tmax': 'tmax', 'tmin': 'tmin',
+        'csnow': 'csnow', 'cicep': 'cicep', 'cfrzr': 'cfrzr', 'crain': 'crain',
+        'lhtfl': 'avg_slhtf', 'shtfl': 'avg_ishf',
+        'dswrf': 'sdswrf', 'dlwrf': 'sdlwrf', 'uswrf': 'suswrf', 'ulwrf': 'sulwrf',
+    }
+
+    # Resolve filter_vars to zarr path prefixes
+    wanted_prefixes = set()
+    for var_level in filter_vars.values():
+        abbrev = var_level.split(':')[0].strip().lower()
+        cfgrib_name = GRIB_TO_CFGRIB.get(abbrev, abbrev)
+        wanted_prefixes.add(cfgrib_name)
+
+    # Keep root .zgroup + all entries under wanted prefixes
+    filtered = {}
+    for key, value in refs.items():
+        prefix = key.split('/')[0]
+        if prefix.startswith('.'):
+            filtered[key] = value
+        elif prefix in wanted_prefixes:
+            filtered[key] = value
+
+    return filtered
+
+
 def calculate_time_dimensions(axes: List[pd.Index]) -> Tuple[Dict, Dict, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate time-related dimensions and coordinates based on input axes for GEFS.

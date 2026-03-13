@@ -139,6 +139,7 @@ def setup_gefs_imports():
         from gefs_util import (
             generate_axes,
             filter_build_grib_tree,
+            build_gefs_deflated_store_from_template,
             calculate_time_dimensions,
             cs_create_mapped_index_local,
             prepare_zarr_store,
@@ -148,6 +149,7 @@ def setup_gefs_imports():
         return {
             'generate_axes': generate_axes,
             'filter_build_grib_tree': filter_build_grib_tree,
+            'build_gefs_deflated_store_from_template': build_gefs_deflated_store_from_template,
             'calculate_time_dimensions': calculate_time_dimensions,
             'cs_create_mapped_index_local': cs_create_mapped_index_local,
             'prepare_zarr_store': prepare_zarr_store,
@@ -170,26 +172,32 @@ def process_ensemble_member(
     target_run: str,
     mapping_manager,  # LocalTarGzMappingManager instance
     utils: Dict,
-    forecast_dict: Dict
+    forecast_dict: Dict,
+    deflated_store: Optional[Dict] = None
 ) -> Optional[Dict]:
-    """Process a single GEFS ensemble member using local templates."""
+    """Process a single GEFS ensemble member using local templates.
+
+    If deflated_store is provided, skips the scan_grib Stage 1 entirely
+    (template-based, <0.05s). Otherwise falls back to scan_grib (~5s).
+    """
 
     print(f"\n  Processing ensemble member: {member}")
 
     # Generate time axes
     axes = utils['generate_axes'](target_date)
 
-    # Build GRIB URLs (only need first 2 files for structure)
-    gefs_files = []
-    for hour in [0, 3]:
-        url = (f"s3://noaa-gefs-pds/gefs.{target_date}/{target_run}/atmos/pgrb2sp25/"
-               f"{member}.t{target_run}z.pgrb2s.0p25.f{hour:03d}")
-        gefs_files.append(url)
-
     try:
-        # Stage 1: Scan GRIB files to build tree structure
-        print(f"    Stage 1: Scanning GRIB structure...")
-        _, deflated_store = utils['filter_build_grib_tree'](gefs_files, forecast_dict)
+        # Stage 1: Use pre-loaded template or fall back to scan_grib
+        if deflated_store is not None:
+            print(f"    Stage 1: Using pre-loaded template (skipping scan_grib)")
+        else:
+            print(f"    Stage 1: Scanning GRIB structure (no template provided)...")
+            gefs_files = []
+            for hour in [0, 3]:
+                url = (f"s3://noaa-gefs-pds/gefs.{target_date}/{target_run}/atmos/pgrb2sp25/"
+                       f"{member}.t{target_run}z.pgrb2s.0p25.f{hour:03d}")
+                gefs_files.append(url)
+            _, deflated_store = utils['filter_build_grib_tree'](gefs_files, forecast_dict)
 
         # Stage 2: Create mapped index using local templates
         print(f"    Stage 2: Creating mapped index from templates...")
@@ -341,13 +349,28 @@ def main():
         if member not in available_members:
             print(f"  Warning: {member} not found in templates")
 
-    # Step 4: Create output directory
-    print("\n[Step 4] Creating output directory...")
+    # Step 4: Load deflated store template (Stage 1 — replaces scan_grib)
+    print("\n[Step 4] Loading deflated store template (Stage 1)...")
+    deflated_store_template_path = (
+        Path(__file__).parent.parent.parent / 'gefs' / 'gefs-deflated-store-template-20241112.parquet'
+    )
+    if deflated_store_template_path.exists():
+        deflated_store = utils['build_gefs_deflated_store_from_template'](
+            str(deflated_store_template_path),
+            filter_vars=FORECAST_VARIABLES
+        )
+        print(f"  Loaded {len(deflated_store['refs'])} zarr refs from template (skipping scan_grib)")
+    else:
+        print(f"  Template not found at {deflated_store_template_path}, will use scan_grib fallback")
+        deflated_store = None
+
+    # Step 5: Create output directory
+    print("\n[Step 5] Creating output directory...")
     OUTPUT_DIR.mkdir(exist_ok=True)
     print(f"  Output directory: {OUTPUT_DIR}")
 
-    # Step 5: Process ensemble members
-    print("\n[Step 5] Processing ensemble members...")
+    # Step 6: Process ensemble members
+    print("\n[Step 6] Processing ensemble members...")
     print("="*70)
 
     successful = []
@@ -361,7 +384,8 @@ def main():
                 target_run=TARGET_RUN,
                 mapping_manager=mapping_manager,
                 utils=utils,
-                forecast_dict=FORECAST_VARIABLES
+                forecast_dict=FORECAST_VARIABLES,
+                deflated_store=deflated_store
             )
 
             if zstore:
@@ -376,13 +400,13 @@ def main():
             print(f"  Error processing {member}: {e}")
             failed.append(member)
 
-    # Step 6: Cleanup
-    print("\n[Step 6] Cleaning up temporary files...")
+    # Step 7: Cleanup
+    print("\n[Step 7] Cleaning up temporary files...")
     mapping_manager.cleanup()
     print("  Cleanup complete")
 
-    # Step 7: Validate outputs
-    print("\n[Step 7] Validating output files...")
+    # Step 8: Validate outputs
+    print("\n[Step 8] Validating output files...")
     print("="*70)
 
     if successful:
