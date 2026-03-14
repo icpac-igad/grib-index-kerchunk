@@ -82,8 +82,8 @@ LON_INDICES = np.where(_lon_mask)[0]
 ICPAC_LATS = GEFS_LATS[LAT_INDICES[0]:LAT_INDICES[-1] + 1]
 ICPAC_LONS = GEFS_LONS[LON_INDICES[0]:LON_INDICES[-1] + 1]
 
-# Target forecast steps (match Herbie script)
-TARGET_STEPS_HOURS = [0, 3, 6, 12, 24, 48, 72, 120, 168, 240]
+# Target forecast steps (match Herbie script — skip T+0h, no APCP at init)
+TARGET_STEPS_HOURS = [3, 6, 12, 24, 48, 72, 120, 168, 240]
 
 # Try gribberish
 try:
