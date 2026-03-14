@@ -1,0 +1,33 @@
+[
+  {
+    "date": "20250106",
+    "mean_corr": 0.35855767130851746,
+    "mean_corr_p": 0.0,
+    "mean_rmse": 1.0423556566238403,
+    "mean_mae": 0.3423112630844116,
+    "mean_max_abs_diff": 15.100001335144043,
+    "mean_rel_diff_pct": 199.0570068359375,
+    "mean_gik_range": [
+      0.0,
+      7.566667079925537
+    ],
+    "mean_herbie_range": [
+      0.0,
+      15.566665649414062
+    ],
+    "spread_corr": 0.29579395055770874,
+    "spread_corr_p": 0.0,
+    "spread_rmse": 0.9319844245910645,
+    "spread_mae": 0.3095867931842804,
+    "spread_max_abs_diff": 13.225211143493652,
+    "spread_rel_diff_pct": 213.36614990234375,
+    "spread_gik_range": [
+      0.0,
+      9.289898872375488
+    ],
+    "spread_herbie_range": [
+      0.0,
+      13.581113815307617
+    ]
+  }
+]

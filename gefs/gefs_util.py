@@ -326,12 +326,8 @@ def build_gefs_deflated_store_from_template(
                 refs[key] = value
                 continue
             value = decoded
-        if isinstance(value, str):
-            if value.startswith('[') or value.startswith('{'):
-                try:
-                    value = json.loads(value)
-                except Exception:
-                    pass
+        # Keep values as strings — kerchunk's store_coord_var/store_data_var
+        # expect JSON strings in .zattrs/.zarray, not parsed dicts.
         refs[key] = value
 
     total_refs = len(refs)
