@@ -36,6 +36,46 @@ index files support it.
 
 ---
 
+## How Herbie Actually Works (Not wgrib2)
+
+A common assumption is that Herbie uses **wgrib2** (the C command-line tool)
+to subset GRIB files on a remote server. **It does not.** Herbie uses the
+exact same `.idx` byte-range mechanism as GIK:
+
+```
+Herbie().xarray(":APCP:surface:") — what actually happens:
+
+1. Fetch .idx file from S3
+   GET https://noaa-gefs-pds.s3.amazonaws.com/.../gep01.t00z.pgrb2s.0p25.f048.idx
+   Response (text):  "1:0:d=2025010600:PRES:..."
+                     "42:8391420:d=2025010600:APCP:surface:..."   ← found
+                     "43:10488572:d=2025010600:..."
+
+2. Parse .idx to find APCP byte offset → offset=8391420, length=2097152
+
+3. HTTP Range request for just those bytes
+   GET https://noaa-gefs-pds.s3.amazonaws.com/.../gep01.t00z.pgrb2s.0p25.f048
+   Header: Range: bytes=8391420-10488571
+
+4. Write downloaded bytes to a temp file on disk (!)
+
+5. Decode with cfgrib (eccodes C library) → xarray Dataset
+
+6. Delete temp file
+```
+
+You can see this in the validation output:
+```
+✅ Found ┊ model=gefs ┊ product=atmos.25 ┊ 2025-Jan-06 00:00 UTC F048 ┊ GRIB2 @ aws ┊ IDX @ aws
+Downloading inventory file from self.idx='https://noaa-gefs-pds.s3.amazonaws.com/...'
+```
+
+**Key insight**: GIK and Herbie parse the same `.idx` files and fetch the same
+bytes from S3. No wgrib2, no server-side processing, no OPeNDAP. The difference
+is entirely in what happens *after* the bytes arrive.
+
+---
+
 ## What Each Method Actually Downloads
 
 ### Per variable, per member, per timestep
@@ -45,10 +85,12 @@ index files support it.
 | Downloads from S3 | Single GRIB message via byte-range read | Single GRIB message via byte-range read |
 | Bytes per request | ~2 MB | ~2 MB |
 | Uses .idx file? | Yes (to build byte-range references) | Yes (internally, same mechanism) |
+| Uses wgrib2? | No | No |
 | Server-side filtering? | No | No |
 
 **At the single-request level, GIK and Herbie transfer the same data.**
-Herbie uses `.idx` files internally to make byte-range reads, just like GIK.
+Both use `.idx` files to locate GRIB messages and HTTP Range requests to
+fetch only those bytes — the identical mechanism under the hood.
 
 ---
 
@@ -88,11 +130,14 @@ Herbie workflow for same 3,240 chunks:
 
 ### 2. Decoder Speed (~80× faster)
 
-| Decoder | Time per chunk | Method |
-|---------|---------------|--------|
-| **gribberish** (GIK) | ~25 ms | Rust, in-memory, no temp files |
-| **cfgrib** (Herbie) | ~2,000 ms | Python/eccodes, writes temp file |
-| **Speedup** | **~80×** | |
+After downloading the same ~2 MB GRIB message, the two methods diverge:
+
+| | GIK (gribberish) | Herbie (cfgrib) |
+|--|-------------------|-----------------|
+| **Language** | Rust | Python + eccodes C library |
+| **Temp file?** | No — decodes byte buffer in memory | Yes — writes to disk, reads back |
+| **Time per chunk** | ~25 ms | ~2,000 ms |
+| **Disk I/O** | None | 2 × write/read/delete per chunk |
 
 For 3,240 chunks:
 - GIK: 3,240 × 25ms = **81 seconds** decode time
@@ -171,60 +216,55 @@ pipelines), use GIK.
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        GIK Method                               │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-│  │ Template  │───▶│ 3-Stage      │───▶│ Parquet Reference     │  │
-│  │ (once)    │    │ Pipeline     │    │ File (reusable)       │  │
-│  └──────────┘    │              │    │                       │  │
-│                  │ Stage 1: zarr│    │ key: tp/accum/.../0.0 │  │
-│  ┌──────────┐    │   skeleton   │    │ val: [url, 48291, 2MB]│  │
-│  │ .idx file│───▶│ Stage 2: read│    └───────────┬───────────┘  │
-│  │ from S3  │    │   .idx refs  │                │              │
-│  └──────────┘    │ Stage 3: merge│    ┌──────────▼──────────┐   │
-│                  └──────────────┘    │ Byte-Range Read      │   │
-│                                     │ S3: GET 2MB at offset │   │
-│                                     └──────────┬──────────┘   │
-│                                     ┌──────────▼──────────┐   │
-│                                     │ gribberish decode   │   │
-│                                     │ 25ms, in-memory     │   │
-│                                     └──────────┬──────────┘   │
-│                                     ┌──────────▼──────────┐   │
-│                                     │ Client-side subset  │   │
-│                                     │ (721,1440)→(28,108) │   │
-│                                     └─────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+Both methods share the same core: `.idx` parse → byte-range read → decode → subset.
+The difference is GIK caches the `.idx` results and uses a faster decoder.
 
-┌─────────────────────────────────────────────────────────────────┐
-│                       Herbie Method                             │
-│                                                                 │
-│  For EACH variable × member × timestep:                         │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-│  │ Herbie() │───▶│ Fetch .idx   │───▶│ Parse .idx, find      │  │
-│  │ init     │    │ from S3      │    │ APCP byte offset      │  │
-│  └──────────┘    └──────────────┘    └───────────┬───────────┘  │
-│                                      ┌───────────▼───────────┐  │
-│                                      │ Download GRIB message │  │
-│                                      │ ~2 MB from S3         │  │
-│                                      └───────────┬───────────┘  │
-│                                      ┌───────────▼───────────┐  │
-│                                      │ Write temp file       │  │
-│                                      │ to disk               │  │
-│                                      └───────────┬───────────┘  │
-│                                      ┌───────────▼───────────┐  │
-│                                      │ cfgrib decode         │  │
-│                                      │ 2000ms, disk-based    │  │
-│                                      └───────────┬───────────┘  │
-│                                      ┌───────────▼───────────┐  │
-│                                      │ Client-side subset    │  │
-│                                      │ xarray .sel()         │  │
-│                                      └───────────────────────┘  │
-│                                                                 │
-│  (repeat entire flow for next variable/member/step)             │
-└─────────────────────────────────────────────────────────────────┘
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     SHARED: .idx byte-range mechanism               │
+│                     (identical in both GIK and Herbie)              │
+│                                                                     │
+│   .idx file on S3                  GRIB file on S3                  │
+│   ┌─────────────────────┐          ┌──────────────────────────┐     │
+│   │ 1:0:PRES:surface    │          │ ████████████████████████ │     │
+│   │ 42:8391420:APCP:sfc │──offset─▶│ ░░░░APCP message░░░░░░ │     │
+│   │ 43:10488572:TMP:2m  │          │ ████████████████████████ │     │
+│   └─────────────────────┘          └──────────────────────────┘     │
+│          ▲                                    │                     │
+│          │ HTTP GET (text)       HTTP Range GET (2 MB)              │
+│          │                                    ▼                     │
+│          │                         Raw GRIB bytes (~2 MB)           │
+└──────────┼────────────────────────────────────┼─────────────────────┘
+           │                                    │
+     ┌─────┴────────────────┐    ┌──────────────┴──────────────────┐
+     │                      │    │                                 │
+     ▼                      ▼    ▼                                 ▼
+ GIK Method              Herbie Method
+
+ ┌────────────────────┐  ┌──────────────────────────────────────┐
+ │ Stage 2: read .idx │  │ Herbie(): fetch .idx EVERY call      │
+ │ ONCE per timestep, │  │ (re-parses for each variable/member) │
+ │ cache in parquet   │  └──────────────┬───────────────────────┘
+ └────────┬───────────┘                 │
+          │                             ▼
+          ▼                  ┌──────────────────────────┐
+ ┌────────────────────┐      │ Write temp file to disk   │
+ │ Parquet ref file   │      │ cfgrib decode (2000 ms)   │
+ │ (reusable, ~200KB) │      │ Delete temp file          │
+ │ [url, offset, len] │      └──────────────┬────────────┘
+ └────────┬───────────┘                     │
+          │                                 ▼
+          ▼                  ┌──────────────────────────┐
+ ┌────────────────────┐      │ xarray .sel() subset     │
+ │ gribberish decode  │      │ (721,1440) → (28,108)    │
+ │ 25ms, in-memory    │      └──────────────────────────┘
+ └────────┬───────────┘
+          │               (repeat for EVERY variable/member/step)
+          ▼
+ ┌────────────────────┐
+ │ numpy slice subset │
+ │ (721,1440)→(28,108)│
+ └────────────────────┘
 ```
 
 ---
