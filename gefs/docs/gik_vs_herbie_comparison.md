@@ -116,16 +116,16 @@ variable is a single S3 byte-range read — no index parsing, no repeated setup.
 ```
 GIK workflow for 12 variables × 30 members × 9 steps = 3,240 chunks:
   Stage 1: Load template           →  5 seconds (once)
-  Stage 2: Read 81 .idx files      →  ~90 seconds per member (once)
-  Stage 3: Build parquet refs       →  ~2 seconds per member (once)
-  Streaming: 3,240 byte-range reads →  parallel, 25ms decode each
+  Stage 2: Read 81 .idx files      →  84.4 seconds per member (measured)
+  Stage 3: Build zarr refs         →  8.4 seconds per member (measured)
+  Streaming: 3,240 byte-range reads →  1.9s per member (measured), parallel
 
 Herbie workflow for same 3,240 chunks:
   3,240 × fetch .idx from S3       →  3,240 HTTP requests (redundant!)
   3,240 × parse .idx               →  repeated for each call
   3,240 × download GRIB message    →  same bytes as GIK
   3,240 × write temp file to disk  →  disk I/O overhead
-  3,240 × cfgrib decode            →  2000ms each (vs 25ms)
+  3,240 × cfgrib decode            →  0.85s each (measured, includes .idx + download)
 ```
 
 ### 2. Decoder Speed (~80× faster)
@@ -136,12 +136,12 @@ After downloading the same ~2 MB GRIB message, the two methods diverge:
 |--|-------------------|-----------------|
 | **Language** | Rust | Python + eccodes C library |
 | **Temp file?** | No — decodes byte buffer in memory | Yes — writes to disk, reads back |
-| **Time per chunk** | ~25 ms | ~2,000 ms |
+| **Time per chunk** | ~25 ms | ~850 ms (measured end-to-end per fetch) |
 | **Disk I/O** | None | 2 × write/read/delete per chunk |
 
-For 3,240 chunks:
-- GIK: 3,240 × 25ms = **81 seconds** decode time
-- Herbie: 3,240 × 2,000ms = **108 minutes** decode time
+Measured on 2025-01-06 with 3 members × 9 steps:
+- GIK streaming (fetch + decode + subset): **1.9s per member** for 9 chunks
+- Herbie (fetch .idx + download + cfgrib + subset): **0.85s per fetch**, but sequential
 
 ### 3. Parallel Execution (8× throughput)
 
@@ -174,25 +174,44 @@ byte offsets from scratch.
 
 ---
 
-## End-to-End Benchmark: 30 Members × 9 Steps × TP Variable
+## Measured End-to-End Timing (2025-01-06, 3 members, 9 steps, TP only)
 
-| Metric | GIK | Herbie |
-|--------|-----|--------|
-| **Total S3 data transferred** | ~540 MB | ~540 MB |
-| **S3 requests** | 2,700 (2,430 .idx + 270 data) | 540 (270 .idx + 270 data) |
-| **Decode time** | ~7 seconds | ~9 minutes |
-| **Wall-clock time** | ~3-5 minutes | ~14+ minutes |
-| **Temp disk I/O** | None | 270 temp files written/deleted |
-| **Parallelism** | 8 concurrent streams | Sequential |
+Actual measurements from `validate_gik_vs_herbie_2022_2026.py`:
 
-### Scaling to Full cGAN Input (12 variables × 51 members × 9 steps)
+### GIK: 284 seconds total
 
-| Metric | GIK | Herbie |
-|--------|-----|--------|
-| **Total chunks** | 5,508 | 5,508 |
-| **S3 data** | ~11 GB | ~11 GB |
-| **Decode time** | ~2.3 minutes | ~3.1 hours |
-| **Wall-clock time** | ~24 minutes | ~4+ hours |
+| Stage | What | Per member | Total (3 members) | % of time |
+|-------|------|-----------|-------------------|-----------|
+| Stage 2 | Read 81 `.idx` files from S3, merge with template | 84.4s | 253.2s | **89%** |
+| Stage 3 | Build zarr store with byte-range refs | 8.4s | 25.1s | **9%** |
+| Streaming | Fetch 9 chunks (2 MB each) + gribberish decode | 1.9s | 5.7s | **2%** |
+
+### Herbie: 24 seconds total
+
+| Stage | What | Per fetch | Total (27 fetches) |
+|-------|------|----------|-------------------|
+| Full cycle | Fetch `.idx` + byte-range read + cfgrib decode | 0.85s | 23.4s |
+
+### Why GIK Appears Slower for Single-Variable Validation
+
+GIK builds references for **ALL 36 variables × 81 timesteps** even though
+we only stream 1 variable at 9 steps. The `.idx` reading (Stage 2) dominates
+at 89% of time. Herbie fetches only what you ask for.
+
+### Where GIK Wins: Multi-Variable and Pre-Built Refs
+
+Once Stage 2 is done, streaming additional variables costs only ~1.9s/member.
+With pre-built parquet refs (the Lithops production path), Stage 2 is skipped
+entirely.
+
+| Scenario | GIK | Herbie | Winner |
+|----------|-----|--------|--------|
+| 1 var, 3 members (this test) | 284s | 24s | **Herbie 12×** |
+| 1 var, 30 members | ~2,840s | ~240s | **Herbie 12×** |
+| 12 vars, 3 members | 284 + 11×6 = **350s** | 12×24 = **288s** | Herbie 1.2× |
+| 12 vars, 30 members | ~2,840 + 11×57 = **3,467s** | 12×240 = **2,880s** | Herbie 1.2× |
+| 12 vars, 30 members (pre-built refs) | 12×57 = **684s** | 12×240 = **2,880s** | **GIK 4.2×** |
+| Daily operations (refs cached) | Stream only | Full pipeline each time | **GIK** |
 
 ---
 
@@ -291,8 +310,11 @@ gribberish and cfgrib decoders — not data differences.
 |--|-----|--------|
 | **Best for** | Operational pipelines, ensemble processing | Exploration, prototyping |
 | **Spatial subsetting** | Client-side | Client-side |
-| **Decode speed** | 25 ms (gribberish) | 2000 ms (cfgrib) |
+| **Streaming speed (measured)** | 1.9s / member (9 steps) | 7.7s / member (9 × 0.85s, sequential) |
+| **Pipeline overhead (measured)** | 84.4s / member (Stage 2 .idx) | None |
+| **Decode method** | gribberish (Rust, in-memory) | cfgrib (eccodes, temp file) |
 | **Reference reuse** | Yes (parquet files) | No (re-discovers each time) |
 | **Parallelism** | Built-in (ThreadPoolExecutor) | Manual |
 | **Setup complexity** | Higher (templates, pipeline) | One-liner |
-| **Data accuracy** | Identical (r ≈ 1.0 across 4 years) | Identical |
+| **Break-even point** | Pre-built refs or >12 variables | < 50 GRIB messages |
+| **Data accuracy** | Identical (r ≈ 1.0 across 4 years, 50 dates) | Identical |
