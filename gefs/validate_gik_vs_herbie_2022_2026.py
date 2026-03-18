@@ -196,8 +196,11 @@ def subset_icpac(data: np.ndarray) -> np.ndarray:
 # ── GIK pipeline (3-stage, on-the-fly) ──────────────────────────────
 
 def run_gik_pipeline(date_str: str, member: str, deflated_store: dict,
-                     mapping_manager, logger=None) -> Optional[dict]:
-    """Run 3-stage GIK pipeline for one member. Returns zarr store dict or None."""
+                     mapping_manager, logger=None) -> Tuple[Optional[dict], dict]:
+    """Run 3-stage GIK pipeline for one member.
+
+    Returns (zarr_store_dict, timing_dict) where timing_dict has per-stage seconds.
+    """
     from gefs_util import (
         generate_axes, calculate_time_dimensions,
         cs_create_mapped_index_local, prepare_zarr_store,
@@ -205,34 +208,45 @@ def run_gik_pipeline(date_str: str, member: str, deflated_store: dict,
     )
 
     log = logger.debug if logger else lambda x: None
-    t0 = time.time()
+    timings = {}
 
     try:
+        t0 = time.time()
         axes = generate_axes(date_str)
+        timings["axes"] = time.time() - t0
+
+        t0 = time.time()
         gefs_kind = cs_create_mapped_index_local(
             axes, date_str, member,
             tar_gz_path=str(TEMPLATE_TAR_GZ),
             mapping_manager=mapping_manager,
         )
+        timings["stage2_idx"] = time.time() - t0
+
+        t0 = time.time()
         time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
         zstore, chunk_index = prepare_zarr_store(deflated_store, gefs_kind)
         updated_zstore = process_unique_groups(
             zstore, chunk_index, time_dims, time_coords,
             times, valid_times, steps,
         )
-        elapsed = time.time() - t0
-        log(f"    [{member}] Pipeline done in {elapsed:.1f}s: {len(updated_zstore)} zarr refs")
-        return updated_zstore
+        timings["stage3_zarr"] = time.time() - t0
+
+        total = sum(timings.values())
+        log(f"    [{member}] Pipeline {total:.1f}s "
+            f"(idx={timings['stage2_idx']:.1f}s zarr={timings['stage3_zarr']:.1f}s)")
+        return updated_zstore, timings
     except Exception as e:
         log(f"    [{member}] Pipeline FAILED: {e}")
-        return None
+        return None, timings
 
 
-def stream_tp_from_zstore(zstore: dict, target_step_hours: List[int]) -> np.ndarray:
+def stream_tp_from_zstore(zstore: dict, target_step_hours: List[int]) -> Tuple[np.ndarray, float]:
     """Stream TP data from zarr store refs using gribberish.
 
-    Returns: (n_steps, lat, lon) array for target steps.
+    Returns: ((n_steps, lat, lon) array, streaming_seconds).
     """
+    t_stream_start = time.time()
     fs = fsspec.filesystem("s3", anon=True)
 
     # Find TP data chunk keys — format: tp/accum/surface/tp/{step_idx}.0.0
@@ -285,7 +299,7 @@ def stream_tp_from_zstore(zstore: dict, target_step_hours: List[int]) -> np.ndar
                 tasks.append((out_idx, step_idx, tp_chunk_refs[step_idx]))
 
     if not tasks:
-        return result
+        return result, time.time() - t_stream_start
 
     with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as pool:
         futs = {pool.submit(_fetch_one, oi, si, r): oi for oi, si, r in tasks}
@@ -294,7 +308,7 @@ def stream_tp_from_zstore(zstore: dict, target_step_hours: List[int]) -> np.ndar
             if arr is not None:
                 result[out_idx] = arr
 
-    return result
+    return result, time.time() - t_stream_start
 
 
 # ── GIK ensemble streaming ──────────────────────────────────────────
@@ -302,10 +316,10 @@ def stream_tp_from_zstore(zstore: dict, target_step_hours: List[int]) -> np.ndar
 def stream_gik_tp(date_str: str, step_hours: List[int],
                   deflated_store: dict, mapping_manager,
                   max_members: int = 30,
-                  logger=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
+                  logger=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int, dict]:
     """Stream TP ensemble from GIK (3-stage pipeline + gribberish).
 
-    Returns (mean, std, n_members) arrays of shape (n_steps, lat, lon).
+    Returns (mean, std, n_members, stage_timings) arrays of shape (n_steps, lat, lon).
     """
     log = logger.info if logger else print
 
@@ -313,14 +327,24 @@ def stream_gik_tp(date_str: str, step_hours: List[int],
     n_steps = len(step_hours)
     n_lats, n_lons = len(ICPAC_LATS), len(ICPAC_LONS)
 
+    # Collect per-stage timings across all members
+    all_stage2 = []
+    all_stage3 = []
+    all_stream = []
+
     member_data = []
     for i, member in enumerate(members, 1):
-        zstore = run_gik_pipeline(date_str, member, deflated_store, mapping_manager, logger)
+        zstore, timings = run_gik_pipeline(date_str, member, deflated_store, mapping_manager, logger)
         if zstore is None:
             log(f"    GIK: {member} pipeline failed, skipping")
             continue
 
-        tp = stream_tp_from_zstore(zstore, step_hours)
+        all_stage2.append(timings.get("stage2_idx", 0))
+        all_stage3.append(timings.get("stage3_zarr", 0))
+
+        tp, stream_secs = stream_tp_from_zstore(zstore, step_hours)
+        all_stream.append(stream_secs)
+
         valid_count = np.count_nonzero(~np.isnan(tp))
         if valid_count == 0:
             log(f"    GIK: {member} no valid TP data, skipping")
@@ -331,7 +355,7 @@ def stream_gik_tp(date_str: str, step_hours: List[int],
             log(f"    GIK: {i}/{len(members)} members done")
 
     if not member_data:
-        return None, None, 0
+        return None, None, 0, {}
 
     stacked = np.stack(member_data, axis=0)  # (n_members, n_steps, lat, lon)
     with warnings.catch_warnings():
@@ -339,8 +363,24 @@ def stream_gik_tp(date_str: str, step_hours: List[int],
         mean = np.nanmean(stacked, axis=0)
         std = np.nanstd(stacked, axis=0)
 
+    stage_timings = {
+        "stage2_idx_total": sum(all_stage2),
+        "stage2_idx_per_member": np.mean(all_stage2) if all_stage2 else 0,
+        "stage3_zarr_total": sum(all_stage3),
+        "stage3_zarr_per_member": np.mean(all_stage3) if all_stage3 else 0,
+        "stream_total": sum(all_stream),
+        "stream_per_member": np.mean(all_stream) if all_stream else 0,
+    }
+
+    log(f"    GIK timing: Stage2={stage_timings['stage2_idx_total']:.1f}s "
+        f"Stage3={stage_timings['stage3_zarr_total']:.1f}s "
+        f"Stream={stage_timings['stream_total']:.1f}s "
+        f"(per member: idx={stage_timings['stage2_idx_per_member']:.1f}s "
+        f"zarr={stage_timings['stage3_zarr_per_member']:.1f}s "
+        f"stream={stage_timings['stream_per_member']:.1f}s)")
+
     gc.collect()
-    return mean, std, len(member_data)
+    return mean, std, len(member_data), stage_timings
 
 
 # ── Herbie fetching ─────────────────────────────────────────────────
@@ -371,8 +411,8 @@ def subset_ea(ds: xr.Dataset) -> xr.Dataset:
 
 def fetch_herbie_tp(date_str: str, step_hours: List[int],
                     max_members: int = 30,
-                    logger=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
-    """Fetch APCP ensemble via Herbie. Returns (mean, std, n_members)."""
+                    logger=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int, dict]:
+    """Fetch APCP ensemble via Herbie. Returns (mean, std, n_members, timings)."""
     from herbie import Herbie
 
     log = logger.info if logger else print
@@ -382,12 +422,18 @@ def fetch_herbie_tp(date_str: str, step_hours: List[int],
     ea_lats = None
     ea_lons = None
 
+    # Timing: per-step and per-member breakdown
+    step_times = []  # seconds per step (all members)
+    member_times = []  # seconds per individual member fetch
+
     for fxx in step_hours:
         log(f"    Herbie: step T+{fxx}h ...")
+        t_step = time.time()
         member_data = []
 
         for mem_num in range(1, max_members + 1):
             try:
+                t_mem = time.time()
                 H = Herbie(
                     f"{date_str} 00:00",
                     model="gefs",
@@ -396,6 +442,8 @@ def fetch_herbie_tp(date_str: str, step_hours: List[int],
                     fxx=fxx,
                 )
                 ds = H.xarray(":APCP:surface:", verbose=False)
+                member_times.append(time.time() - t_mem)
+
                 if isinstance(ds, list):
                     ds = ds[0]
 
@@ -428,15 +476,16 @@ def fetch_herbie_tp(date_str: str, step_hours: List[int],
                     log_warn(f"      member {mem_num} FAILED: {e}")
                 continue
 
+        step_times.append(time.time() - t_step)
         if member_data:
             arr = np.stack(member_data, axis=0)
             step_arrays[fxx] = arr
-            log(f"      OK — {arr.shape[0]} members")
+            log(f"      OK — {arr.shape[0]} members ({step_times[-1]:.1f}s)")
         else:
             log_warn(f"      FAILED — no members for T+{fxx}h")
 
     if not step_arrays:
-        return None, None, 0
+        return None, None, 0, {}
 
     ordered = [s for s in step_hours if s in step_arrays]
     n_members = step_arrays[ordered[0]].shape[0]
@@ -449,7 +498,18 @@ def fetch_herbie_tp(date_str: str, step_hours: List[int],
         mean[i] = np.nanmean(step_arrays[fxx], axis=0)
         std[i] = np.nanstd(step_arrays[fxx], axis=0)
 
-    return mean, std, n_members
+    herbie_timings = {
+        "total": sum(step_times),
+        "per_step_avg": np.mean(step_times) if step_times else 0,
+        "per_member_avg": np.mean(member_times) if member_times else 0,
+        "n_fetches": len(member_times),
+    }
+    log(f"    Herbie timing: total={herbie_timings['total']:.1f}s "
+        f"per_step={herbie_timings['per_step_avg']:.2f}s "
+        f"per_member={herbie_timings['per_member_avg']:.2f}s "
+        f"({herbie_timings['n_fetches']} fetches)")
+
+    return mean, std, n_members, herbie_timings
 
 
 # ── Comparison metrics ──────────────────────────────────────────────
@@ -770,7 +830,7 @@ def main():
                 gik_n = int(ds_g.attrs.get("n_ensemble_members", 0))
         elif not args.skip_gik:
             t0 = time.time()
-            gik_mean, gik_std, gik_n = stream_gik_tp(
+            gik_mean, gik_std, gik_n, gik_timings = stream_gik_tp(
                 ds, TARGET_STEPS,
                 deflated_store=deflated_store,
                 mapping_manager=mapping_manager,
@@ -779,6 +839,11 @@ def main():
             )
             elapsed = time.time() - t0
             logger.info(f"  GIK done: {gik_n} members in {elapsed:.1f}s")
+            if gik_timings:
+                result["gik_stage2_total_s"] = round(gik_timings["stage2_idx_total"], 1)
+                result["gik_stage3_total_s"] = round(gik_timings["stage3_zarr_total"], 1)
+                result["gik_stream_total_s"] = round(gik_timings["stream_total"], 1)
+                result["gik_total_s"] = round(elapsed, 1)
 
             if gik_mean is not None:
                 save_tp_netcdf(gik_nc, gik_mean, gik_std, TARGET_STEPS,
@@ -800,13 +865,17 @@ def main():
                 herbie_n = int(ds_h.attrs.get("n_ensemble_members", 0))
         elif not args.skip_herbie:
             t0 = time.time()
-            herbie_mean, herbie_std, herbie_n = fetch_herbie_tp(
+            herbie_mean, herbie_std, herbie_n, herbie_timings = fetch_herbie_tp(
                 ds, TARGET_STEPS,
                 max_members=max_members,
                 logger=logger,
             )
             elapsed = time.time() - t0
             logger.info(f"  Herbie done: {herbie_n} members in {elapsed:.1f}s")
+            if herbie_timings:
+                result["herbie_total_s"] = round(herbie_timings["total"], 1)
+                result["herbie_per_member_avg_s"] = round(herbie_timings["per_member_avg"], 2)
+                result["herbie_n_fetches"] = herbie_timings["n_fetches"]
 
             if herbie_mean is not None:
                 save_tp_netcdf(herbie_nc, herbie_mean, herbie_std, TARGET_STEPS,

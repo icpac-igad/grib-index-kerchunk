@@ -167,6 +167,72 @@ At T+48h for each date, compare GIK vs Herbie arrays (108×108 grid):
 
 ---
 
+## Measured Timing Breakdown (3 members, 9 steps, 1 variable)
+
+Measured on a single date (2025-01-06) with `--max-members 3`:
+
+### GIK: 284 seconds total
+
+| Stage | What it does | Total (3 members) | Per member |
+|-------|-------------|-------------------|------------|
+| **Stage 2: .idx reading** | Read 81 `.idx` files from S3 per member, merge with template parquets | 253.2s | 84.4s |
+| **Stage 3: zarr assembly** | Build zarr store dict with `[url, offset, length]` refs | 25.1s | 8.4s |
+| **Streaming: byte-range + decode** | Fetch 9 GRIB chunks from S3 (2 MB each), decode with gribberish | 5.7s | 1.9s |
+
+```
+GIK time budget (per member):
+┌──────────────────────────────────────────────────────────┐
+│ Stage 2: .idx reading (84.4s, 89%)  ██████████████████░░ │
+│ Stage 3: zarr assembly (8.4s, 9%)   ██░░░░░░░░░░░░░░░░░ │
+│ Streaming + decode (1.9s, 2%)       ░░░░░░░░░░░░░░░░░░░ │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Key insight**: 89% of GIK time is spent in Stage 2 reading `.idx` files from
+S3 (81 HTTP requests per member). The actual data streaming with gribberish is
+only 2% of the time — the pipeline overhead dominates.
+
+### Herbie: 24 seconds total
+
+| Stage | What it does | Total | Per fetch |
+|-------|-------------|-------|-----------|
+| **Fetch + decode** | Fetch `.idx`, byte-range read GRIB message, cfgrib decode | 23.4s | 0.85s |
+
+```
+Herbie time budget (27 fetches = 3 members × 9 steps):
+  Per fetch: .idx download + parse + byte-range read + cfgrib decode = 0.85s
+  Total: 27 × 0.85s = 23.4s (sequential)
+```
+
+### Why Herbie Appears Faster Here
+
+**GIK is slower in this validation scenario because it builds references for
+ALL 36 variables and ALL 81 timesteps** — even though we only stream 1 variable
+(TP) at 9 timesteps. The 3-stage pipeline is designed for operational use where
+you stream many variables after building refs once.
+
+**Herbie fetches only exactly what you ask for** — 1 variable, 1 member, 1 step
+per request. For a single-variable validation test, this is more efficient.
+
+### Where GIK Wins: Multi-Variable Streaming
+
+Once the parquet reference is built (the slow part), streaming additional
+variables is nearly free — just more byte-range reads at 1.9s per member.
+
+| Scenario | GIK | Herbie |
+|----------|-----|--------|
+| **1 variable, 3 members** | 284s (pipeline dominates) | 24s |
+| **12 variables, 3 members** | 284s + 11 × 5.7s = **347s** | 12 × 24s = **288s** |
+| **12 variables, 30 members** | ~2,840s + 11 × 57s = **3,467s** | 12 × 240s = **2,880s** |
+| **12 variables, 30 members (pre-built refs)** | 12 × 57s = **684s** | 12 × 240s = **2,880s** |
+
+**With pre-built parquet references** (the Lithops production path), GIK
+streams 12 variables for 30 members in ~11 minutes vs Herbie's ~48 minutes.
+The decode speed advantage (gribberish 25ms vs cfgrib 2000ms) becomes dominant
+at this scale.
+
+---
+
 ## Results: All 50 Dates
 
 | Date | Mean r | Mean RMSE | Spread r | Spread RMSE |
