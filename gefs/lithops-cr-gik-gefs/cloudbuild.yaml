@@ -1,0 +1,43 @@
+# Cloud Build configuration for Lithops GEFS Runtime
+#
+# Build and push Docker image to GCR for use as Lithops Cloud Run runtime.
+#
+# Usage:
+#   gcloud builds submit \
+#     --config=cloudbuild.yaml \
+#     --project=e4drr-crafd \
+#     --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+
+steps:
+  # Build the Lithops runtime image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:$BUILD_ID'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:latest'
+      - '.'
+    timeout: 1200s  # 20 minutes for build
+
+  # Push versioned tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:$BUILD_ID'
+
+  # Push latest tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:latest'
+
+images:
+  - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:$BUILD_ID'
+  - 'gcr.io/$PROJECT_ID/gefs-lithops-runtime:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 100
+timeout: 1800s  # 30 minutes total
