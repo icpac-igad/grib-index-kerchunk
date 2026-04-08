@@ -497,11 +497,11 @@ def fill_store(args):
                 df = None
 
         # Fallback: per-member parquet URL
+        # HF filenames use the member_id directly (e.g. ens_01, control)
         if df is None or df.empty:
-            member_key = member_id.replace("_", "")
             parquet_url = (
                 f"{hf_base_url}/{year}/{month}/{date_str}/00z/"
-                f"{date_str}00z-{member_key}.parquet"
+                f"{date_str}00z-{member_id}.parquet"
             )
             df = pd.read_parquet(parquet_url)
 

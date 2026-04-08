@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "lithops",
+#     "lithops==3.6.3",
 #     "google-cloud-storage",
 #     "google-cloud-pubsub",
 #     "google-api-python-client",
