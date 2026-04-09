@@ -117,11 +117,11 @@ GCS_BUCKET = os.environ.get('GCS_BUCKET', 'gik-gefs-aws-tf')
 GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', 'run_par_gefs')
 
 TEMPLATE_TAR_GZ_URL = (
-    "https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/"
+    "https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main/"
     "gik-fmrc-gefs-20241112.tar.gz"
 )
 TEMPLATE_PARQUET_URL = (
-    "https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/"
+    "https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main/"
     "gefs-deflated-store-template-20241112.parquet"
 )
 
