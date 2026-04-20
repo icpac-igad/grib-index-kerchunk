@@ -1,12 +1,16 @@
-# Cloud Build configuration for Lithops GEFS Runtime
+# Cloud Build configuration for Lithops GEFS Runtime — e4drr-crafd
 #
-# Build and push Docker image to GCR for use as Lithops Cloud Run runtime.
+# Standalone GEFS deployment. Uses its own dedicated service account
+# (gefs-lithops-deployer), NOT the ecmwf-lithops-deployer SA from
+# lithops_cr_ecmwf_gik. See DEPLOYMENT_GUIDE.md.
 #
 # Usage:
+#   gcloud auth activate-service-account \
+#     --key-file=service_account/gefs-lithops-deployer-key.json
 #   gcloud builds submit \
 #     --config=cloudbuild.yaml \
 #     --project=e4drr-crafd \
-#     --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+#     --service-account=projects/e4drr-crafd/serviceAccounts/gefs-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
 
 steps:
   # Build the Lithops runtime image

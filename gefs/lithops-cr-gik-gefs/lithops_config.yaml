@@ -1,17 +1,22 @@
-# Lithops Configuration for GEFS Parquet Processing
-# ==================================================
+# Lithops Configuration for GEFS Parquet Processing — e4drr-crafd
+# ================================================================
+#
+# Standalone GEFS deployment. Does NOT share IAM, keys, or buckets
+# with lithops_cr_ecmwf_gik. See DEPLOYMENT_GUIDE.md.
 #
 # This config is auto-loaded by run_lithops_gefs.py when present
 # in the same directory. Alternatively set LITHOPS_CONFIG_FILE env var.
 #
 # One-time setup:
-#   1. Build runtime image via Cloud Build:
+#   1. terraform apply (creates dedicated gefs-lithops-deployer SA + buckets)
+#   2. Generate SA key into service_account/gefs-lithops-deployer-key.json
+#   3. Build runtime image via Cloud Build:
 #      gcloud builds submit \
 #        --config=cloudbuild.yaml \
 #        --project=e4drr-crafd \
-#        --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+#        --service-account=projects/e4drr-crafd/serviceAccounts/gefs-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
 #
-#   2. Deploy as Cloud Run service:
+#   4. Deploy as Cloud Run service:
 #      lithops runtime deploy gcr.io/e4drr-crafd/gefs-lithops-runtime \
 #        -b gcp_cloudrun -s gcp_storage --config lithops_config.yaml
 #
@@ -25,18 +30,18 @@ lithops:
 
 gcp:
     project_name: e4drr-crafd
-    region: us-east-1              # Closest GCP region to AWS us-east-1 (NOAA GEFS S3)
-    credentials_path: service_account/ecmwf-lithops-deployer-key.json
+    region: us-east1             # Co-located with NOAA GEFS S3 (AWS us-east-1)
+    credentials_path: service_account/gefs-lithops-deployer-key.json
 
 gcp_cloudrun:
     runtime: gcr.io/e4drr-crafd/gefs-lithops-runtime
-    runtime_memory: 2048           # 2 GB
-    runtime_cpu: 2                 # 2 vCPUs
-    runtime_timeout: 3600          # 1 hour
-    max_workers: 35                # 31 dates/month max + 4 buffer
-    min_workers: 0
-    worker_processes: 1            # 1 process per container (pipeline is resource-intensive)
+    runtime_memory: 2048         # 2 GB
+    runtime_cpu: 2               # 2 vCPUs
+    runtime_timeout: 3600        # 1 hour
+    max_workers: 50              # 50 instances; dispatch ≤37 at once (75%) to avoid HTTP 500 cold-start race
+    min_workers: 1               # keeps one instance warm; eliminates cold-start HTTP 500/429 on burst dispatch
+    worker_processes: 1          # 1 process per container (pipeline is resource-intensive)
 
 gcp_storage:
     bucket: gik-gefs-aws-tf
-    region: us-east-1
+    region: us-east1             # South Carolina - existing bucket location

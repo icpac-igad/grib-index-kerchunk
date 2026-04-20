@@ -58,7 +58,7 @@ Usage:
     gcloud builds submit \\
       --config=cloudbuild.yaml \\
       --project=e4drr-crafd \\
-      --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+      --service-account=projects/e4drr-crafd/serviceAccounts/gefs-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
 
     # Single date
     uv run run_lithops_gefs.py --date 20250106
@@ -102,6 +102,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -151,6 +152,11 @@ TEMPLATE_PARQUET_PATH = os.environ.get(
 
 # GEFS ensemble members
 ALL_MEMBERS = [f'gep{i:02d}' for i in range(1, 31)]  # gep01-gep30
+
+# Number of threads for Stage 2 (S3 idx fetch) inside a Cloud Run worker.
+# Set to 2 to match the 2-vCPU / 2 GiB worker: each thread owns a 120 MB
+# LocalTarGzMappingManager instance (2 × 120 MB = 240 MB), well within 2 GiB.
+PARALLEL_WORKERS = int(os.environ.get('PARALLEL_WORKERS', '2'))
 
 
 # ==============================================================================
@@ -897,9 +903,27 @@ def _download_if_missing(url: str, local_path: str) -> str:
 
 
 def ensure_templates() -> Tuple[str, str]:
-    """Ensure both GEFS templates are available (baked-in or downloaded)."""
-    tar_gz = _download_if_missing(TEMPLATE_TAR_GZ_URL, TEMPLATE_TAR_GZ_PATH)
-    parquet = _download_if_missing(TEMPLATE_PARQUET_URL, TEMPLATE_PARQUET_PATH)
+    """Ensure both GEFS templates are available (baked-in or downloaded).
+
+    Env vars are read at call time (not module load) so that Docker-baked
+    values survive cloudpickle serialization from the orchestrator.
+    """
+    tar_gz_path = os.environ.get('GEFS_TEMPLATE_TAR_GZ', TEMPLATE_TAR_GZ_PATH)
+    parquet_path = os.environ.get('GEFS_TEMPLATE_PARQUET', TEMPLATE_PARQUET_PATH)
+
+    tar_gz = _download_if_missing(TEMPLATE_TAR_GZ_URL, tar_gz_path)
+    # If the standalone parquet doesn't exist but tar.gz does, use tar.gz
+    # (build_gefs_deflated_store_from_template handles .tar.gz natively)
+    if os.path.exists(parquet_path):
+        parquet = parquet_path
+    elif parquet_path.endswith('.tar.gz'):
+        parquet = parquet_path
+    else:
+        try:
+            parquet = _download_if_missing(TEMPLATE_PARQUET_URL, parquet_path)
+        except Exception:
+            logger.info(f"Standalone parquet unavailable, falling back to tar.gz: {tar_gz}")
+            parquet = tar_gz
     return tar_gz, parquet
 
 
@@ -931,6 +955,31 @@ def validate_idx_availability(date_str: str, run: str = "00") -> Tuple[bool, int
     except Exception as e:
         logger.error(f"IDX validation failed: {e}")
         return False, 0
+
+
+# ==============================================================================
+# STAGE 2 THREAD WORKER  (one thread per member, runs inside Cloud Run worker)
+# ==============================================================================
+
+def _stage2_worker(args: tuple) -> tuple:
+    """
+    Fetch .idx files and build a mapped index for one GEFS ensemble member.
+    Each thread creates its own LocalTarGzMappingManager so concurrent access
+    to the tar.gz is safe.  Returns (member, gefs_kind) or (member, None, err).
+    """
+    member, date_str, run, tar_gz_path = args
+    try:
+        axes = generate_axes(date_str)
+        mapping_manager = LocalTarGzMappingManager(tar_gz_path)
+        gefs_kind = cs_create_mapped_index_local(
+            axes, date_str, member,
+            tar_gz_path=tar_gz_path,
+            mapping_manager=mapping_manager,
+        )
+        mapping_manager.cleanup()
+        return (member, gefs_kind)
+    except Exception as e:
+        return (member, None, str(e))
 
 
 # ==============================================================================
@@ -993,55 +1042,66 @@ def process_gefs_date(
         stage1_time = time.time() - stage1_start
         logger.info(f"Stage 1: {len(deflated_store['refs'])} refs in {stage1_time:.1f}s")
 
-        # Initialize mapping manager (reused across members)
-        mapping_manager = LocalTarGzMappingManager(tar_gz_path)
+        # -- Stage 2: Fetch .idx files in parallel (one thread per member) --
+        # Each thread owns its own LocalTarGzMappingManager (not thread-safe).
+        # PARALLEL_WORKERS=2 keeps peak memory at ~2×120 MB = 240 MB within 2 GiB.
+        stage2_start = time.time()
+        task_args = [(m, date_str, run, tar_gz_path) for m in members]
+        stage2_results: Dict = {}  # member -> gefs_kind
 
-        # -- Stage 2 + 3: Process each member --
+        n_workers = min(PARALLEL_WORKERS, len(members))
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_member = {
+                executor.submit(_stage2_worker, args): args[0]
+                for args in task_args
+            }
+            completed = 0
+            for future in as_completed(future_to_member):
+                member_name = future_to_member[future]
+                completed += 1
+                fut_result = future.result()
+                if len(fut_result) == 2:
+                    _, gefs_kind = fut_result
+                    if gefs_kind is not None:
+                        stage2_results[member_name] = gefs_kind
+                        logger.info(f"  Stage2 [{completed}/{len(members)}] {member_name} ok")
+                else:
+                    _, _, err = fut_result
+                    logger.warning(f"  Stage2 [{completed}/{len(members)}] {member_name} FAILED: {err}")
+
+        stage2_time = time.time() - stage2_start
+        logger.info(f"Stage 2 complete: {len(stage2_results)}/{len(members)} members in {stage2_time:.1f}s")
+
+        # -- Stage 3: Build zarr store + parquet for each member (serial) --
         output_dir = Path(f"/tmp/gefs_{date_str}_{run}z")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        stage2_total = 0
         stage3_total = 0
         members_ok = 0
+        axes = generate_axes(date_str)
+        time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
 
         for i, member in enumerate(members, 1):
+            if member not in stage2_results:
+                logger.warning(f"  [{i}/{len(members)}] {member} skipped (Stage 2 failed)")
+                continue
             try:
-                # Stage 2: Read .idx files, create mapped index
-                s2_start = time.time()
-                axes = generate_axes(date_str)
-                gefs_kind = cs_create_mapped_index_local(
-                    axes, date_str, member,
-                    tar_gz_path=tar_gz_path,
-                    mapping_manager=mapping_manager,
-                )
-                s2_time = time.time() - s2_start
-                stage2_total += s2_time
-
-                # Stage 3: Build zarr store, create parquet
                 s3_start = time.time()
-                time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
+                gefs_kind = stage2_results[member]
                 zstore, chunk_index = prepare_zarr_store(deflated_store, gefs_kind)
                 updated_zstore = process_unique_groups(
                     zstore, chunk_index, time_dims, time_coords,
                     times, valid_times, steps,
                 )
-
-                # Save parquet
                 out_file = str(output_dir / f"{date_str}{run}z-{member}.parquet")
                 create_parquet_file(updated_zstore, out_file)
                 s3_time = time.time() - s3_start
                 stage3_total += s3_time
-
                 members_ok += 1
                 if i % 5 == 0 or i == len(members):
-                    logger.info(f"  [{i}/{len(members)}] {member} done "
-                                f"(s2={s2_time:.1f}s s3={s3_time:.1f}s)")
-
+                    logger.info(f"  [{i}/{len(members)}] {member} done (s3={s3_time:.1f}s)")
             except Exception as e:
-                logger.warning(f"  [{i}/{len(members)}] {member} FAILED: {e}")
-
-        # Cleanup mapping manager
-        mapping_manager.cleanup()
+                logger.warning(f"  [{i}/{len(members)}] {member} Stage3 FAILED: {e}")
 
         if members_ok == 0:
             result["message"] = "No members processed successfully"
@@ -1058,13 +1118,13 @@ def process_gefs_date(
         result.update({
             "success": True,
             "message": (f"{members_ok}/{len(members)} members in {total_time:.1f}s "
-                        f"(s1={stage1_time:.1f}s s2={stage2_total:.1f}s s3={stage3_total:.1f}s)"),
+                        f"(s1={stage1_time:.1f}s s2={stage2_time:.1f}s s3={stage3_total:.1f}s)"),
             "gcs_path": gcs_path,
             "files_count": members_ok,
             "total_time_seconds": round(total_time, 1),
             "members_processed": members_ok,
             "stage1_time": round(stage1_time, 1),
-            "stage2_time": round(stage2_total, 1),
+            "stage2_time": round(stage2_time, 1),
             "stage3_time": round(stage3_total, 1),
         })
 

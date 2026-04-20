@@ -1,0 +1,42 @@
+# Service account keys
+*.json
+!terraform.tfvars.example
+!cost_test_random_dates.json
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.auto.tfvars
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output data
+output_parquet/
+ecmwf_*/
+cgan_output/
+test_output/
+*.nc
+*.parquet
+!gefs-deflated-store-template-20241112.parquet
