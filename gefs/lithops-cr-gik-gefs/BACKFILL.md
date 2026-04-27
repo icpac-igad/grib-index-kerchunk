@@ -43,6 +43,22 @@ Edit the `run_range` calls in `run_backfill_chain.sh`, or call
 bash run_backfill_single_run.sh --run 00 --start 20240101 --end 20241231 --workers 20
 ```
 
+### Publish to HuggingFace
+
+Once the GCS backfill is complete, mirror the parquets to a public
+HuggingFace dataset using `../upload_parquets_to_hf.py`:
+
+```bash
+export GCS_BUCKET=<your-bucket-name>
+export HF_TOKEN=hf_xxx
+cd ..   # into gefs/
+uv run upload_parquets_to_hf.py --sync             # incremental (skip dates already on HF)
+uv run upload_parquets_to_hf.py --catalog          # build catalog/index parquet
+uv run upload_parquets_to_hf.py --aggregate --year 2024  # monthly aggregates
+```
+
+Default HF target is `E4DRR/gik-gefs-par`; override with `HF_REPO` env var.
+
 ---
 
 ## Scripts
