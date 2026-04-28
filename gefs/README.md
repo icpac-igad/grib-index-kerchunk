@@ -125,6 +125,91 @@ Output in `gik_vs_herbie_gefs/`:
 | gribberish decode | ~25ms per chunk | vs ~2000ms for cfgrib (80x faster) |
 | Full 30-member ensemble | ~3-5 min | Template-based, single machine |
 
+## Public HuggingFace Dataset
+
+The full 00z backfill (2020-09-25 → 2025-12-31, ~57,780 per-member parquets,
+30 members) is mirrored to **[`E4DRR/gik-gefs-par`](https://huggingface.co/datasets/E4DRR/gik-gefs-par)**
+in two layouts:
+
+| Layout | HF path | Best for |
+|--------|---------|----------|
+| Catalog index | `run_par_gefs_agg/catalog.parquet` (773 KB) | Discover what's available |
+| Monthly aggregate | `run_par_gefs_agg/monthly_agg/{Y}/{MM}_00z.parquet` (~250 MB each) | Bulk reads of one month |
+| Per-member parquet | `run_par_gefs/{Y}/{MM}/{YYYYMMDD}/00z/{YYYYMMDD}00z-gepNN.parquet` | Single-member access |
+
+`upload_parquets_to_hf.py` builds the catalog and monthly aggregates;
+see [`lithops-cr-gik-gefs/SETUP_NEW_MACHINE.md`](lithops-cr-gik-gefs/SETUP_NEW_MACHINE.md#11-publishing-to-huggingface)
+for the publishing workflow.
+
+### Open a monthly aggregate and pull a single date
+
+The monthly aggregate concatenates every member's parquet for one month
+into a single file, with `date` and `source_file` columns added for
+provenance. Each row is one byte-range reference; one date contributes
+~30 members × 60 references = ~1,800 rows.
+
+```python
+import pandas as pd
+
+# Open one month's aggregate directly from HuggingFace (no auth needed for public repo)
+URL = "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/monthly_agg/2024/06_00z.parquet"
+df = pd.read_parquet(URL)
+print(f"{len(df):,} rows, columns: {list(df.columns)}")
+
+# Filter to a single date
+day = df[df.date == "20240615"]
+print(f"  2024-06-15: {len(day)} rows from "
+      f"{day.source_file.nunique()} member parquets")
+
+# Inspect what's there per member (gep01..gep30)
+day = day.assign(member=day.source_file.str.extract(r"-(gep\d+)")[0])
+print(day.groupby("member").size().head())
+```
+
+### Open a single date's data as a virtual zarr
+
+The per-member parquets are kerchunk byte-range references that point
+back into the original NOAA GEFS GRIBs on `s3://noaa-gefs-pds/`. To
+materialise one member of one date as an xarray dataset:
+
+```python
+from huggingface_hub import hf_hub_download
+import xarray as xr
+
+# Download one member's reference parquet (~280 KB)
+ref_path = hf_hub_download(
+    repo_id="E4DRR/gik-gefs-par",
+    repo_type="dataset",
+    filename="run_par_gefs/2024/06/20240615/00z/2024061500z-gep01.parquet",
+)
+
+# Open as a virtual zarr — kerchunk fetches only the bytes you index
+ds = xr.open_dataset(
+    "reference://", engine="zarr",
+    backend_kwargs={
+        "consolidated": False,
+        "storage_options": {
+            "fo": ref_path,
+            "remote_protocol": "s3",
+            "remote_options": {"anon": True},  # NOAA bucket is public
+        },
+    },
+)
+print(ds)        # 81 timesteps × 30 vars × 721×1440 grid
+print(ds.tp)     # Total precipitation, lazy-loaded
+```
+
+To pull every member for one date, iterate the catalog:
+
+```python
+catalog = pd.read_parquet(
+    "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/catalog.parquet"
+)
+day_files = catalog[catalog.date == "20240615"]
+print(f"{len(day_files)} parquet files for 2024-06-15:")
+print(day_files[["member", "hf_path", "size_bytes"]].head())
+```
+
 ## Tutorial
 
 Self-contained tutorials in `../tutorial/gefs/`:

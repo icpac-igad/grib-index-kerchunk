@@ -5,6 +5,7 @@
 #     "gcsfs",
 #     "huggingface_hub",
 #     "pyarrow",
+#     "python-dotenv",
 # ]
 # ///
 """
@@ -29,8 +30,11 @@ Catalog mode (--catalog) builds a lightweight index of every file:
 NOAA's GEFS realtime/reforecast archive on s3://noaa-gefs-pds/ starts on
 2020-09-25; earlier dates have no upstream data.
 
-Env vars
---------
+Configuration
+-------------
+Values can come from a `.env` file in the same directory as this script
+(loaded automatically via python-dotenv) or from real environment variables:
+
     GCS_BUCKET        Required. GCS bucket name (no gs:// prefix).
     GCS_SA_FILE       Optional. Path to GCS service-account JSON. If
                       unset, falls back to GOOGLE_APPLICATION_CREDENTIALS,
@@ -38,6 +42,9 @@ Env vars
     HF_REPO           Optional. HuggingFace dataset repo id.
                       Default: "E4DRR/gik-gefs-par".
     HF_TOKEN          Required for upload (read by huggingface_hub).
+
+Copy `.env.example` to `.env` and fill in your values. The .env file is
+gitignored.
 
 Usage
 -----
@@ -63,6 +70,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+# Load .env from the script's directory before reading any env vars.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass  # dotenv not installed — fall back to real environment variables
 
 import gcsfs
 import pyarrow as pa

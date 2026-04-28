@@ -29,6 +29,7 @@
 8. [Retry and Recovery](#8-retry-and-recovery)
 9. [Long-Running Sessions — tmux on a GCP VM](#9-long-running-sessions--tmux-on-a-gcp-vm)
 10. [What Lives in GCP vs What Lives Locally](#10-what-lives-in-gcp-vs-what-lives-locally)
+11. [Publishing to HuggingFace](#11-publishing-to-huggingface)
 
 ---
 
@@ -536,3 +537,48 @@ gcloud compute instances start gefs-orchestrator --zone=us-east1-b --project=sew
 | `service_account/*.json` | **Local** | Never committed to git |
 | `logs/` | **Local** | Orchestrator logs only |
 | GEFS S3 source data | AWS `us-east-1` | `s3://noaa-gefs-pds` — public, no credentials |
+
+---
+
+## 11. Publishing to HuggingFace
+
+Once the GCS backfill is complete, mirror the parquets to a public
+HuggingFace dataset using `../upload_parquets_to_hf.py` (sibling of this
+folder, at `grib-index-kerchunk/gefs/upload_parquets_to_hf.py`).
+
+### One-time setup
+
+```bash
+# In grib-index-kerchunk/gefs/
+cp .env.example .env
+# Edit .env to fill in:
+#   GCS_BUCKET=<your-bucket>
+#   GCS_SA_FILE=<path-to-sa-key.json>
+#   HF_REPO=E4DRR/gik-gefs-par   (or your own HF dataset id)
+#   HF_TOKEN=hf_xxx              (write-access token for HF_REPO)
+```
+
+`.env` is gitignored — never commit it.
+
+### Three modes (run in this order)
+
+```bash
+cd grib-index-kerchunk/gefs
+
+# 1. Catalog (~5 min) — single index parquet listing every file in GCS.
+uv run upload_parquets_to_hf.py --catalog
+
+# 2. Aggregate one year as a sanity check (~30 min for one full year of 00z).
+uv run upload_parquets_to_hf.py --aggregate --year 2024 --run 00
+
+# 3. Aggregate the full backfill (~2 h).
+nohup bash -c 'for Y in 2020 2021 2022 2023 2025; do
+    uv run upload_parquets_to_hf.py --aggregate --year "$Y" --run 00
+done' > logs/agg_chain.out 2>&1 &
+```
+
+For sync mode (mirror per-date instead of monthly aggregates) and the
+authoritative cost numbers for the 6-year 00z backfill, see
+[`BACKFILL.md`](BACKFILL.md). For a usage example showing how to open a
+monthly aggregate and filter to a single date, see
+[`../README.md`](../README.md#public-huggingface-dataset).

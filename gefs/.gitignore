@@ -1,0 +1,8 @@
+# Local secrets — must never be committed
+.env
+
+# Service account keys (typical names)
+coiled-data.json
+*-service-account.json
+*-key.json
+service_account/
