@@ -141,47 +141,70 @@ in two layouts:
 see [`lithops-cr-gik-gefs/SETUP_NEW_MACHINE.md`](lithops-cr-gik-gefs/SETUP_NEW_MACHINE.md#11-publishing-to-huggingface)
 for the publishing workflow.
 
-### Open a monthly aggregate and pull a single date
+### Open a monthly aggregate and pull a single date (with predicate pushdown)
 
-The monthly aggregate concatenates every member's parquet for one month
-into a single file, with `date` and `source_file` columns added for
-provenance. Each row is one byte-range reference; one date contributes
-~30 members × 60 references = ~1,800 rows.
+Each monthly aggregate is sorted by `(date, member)` and written with
+`row_group_size=60` (one row group per date). PyArrow's predicate
+pushdown skips non-matching row groups, so a single-date filter against
+a 44 MB monthly file reads only ~1.5 MB via HuggingFace range requests.
 
 ```python
 import pandas as pd
 
-# Open one month's aggregate directly from HuggingFace (no auth needed for public repo)
 URL = "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/monthly_agg/2024/06_00z.parquet"
-df = pd.read_parquet(URL)
-print(f"{len(df):,} rows, columns: {list(df.columns)}")
 
-# Filter to a single date
-day = df[df.date == "20240615"]
-print(f"  2024-06-15: {len(day)} rows from "
-      f"{day.source_file.nunique()} member parquets")
+# Predicate pushdown — pyarrow only reads the row groups matching the filter
+df = pd.read_parquet(
+    URL,
+    filters=[("date", "=", "20240615"), ("member", "=", "gep01")],
+)
+print(f"{len(df)} rows, columns: {list(df.columns)}")
+# Schema: key, value, date, source_file, member
+```
 
-# Inspect what's there per member (gep01..gep30)
-day = day.assign(member=day.source_file.str.extract(r"-(gep\d+)")[0])
-print(day.groupby("member").size().head())
+To pull all 30 members for one date:
+
+```python
+df = pd.read_parquet(URL, filters=[("date", "=", "20240615")])
+print(f"{df.member.nunique()} members, {len(df)} rows total")
+```
+
+For coverage discovery without downloading any aggregate, use the
+catalog at the repo root:
+
+```python
+catalog = pd.read_parquet("hf://datasets/E4DRR/gik-gefs-par/catalog.parquet")
+print(f"{len(catalog):,} files, dates {catalog.date.min()}..{catalog.date.max()}")
 ```
 
 ### Open a single date's data as a virtual zarr
 
-The per-member parquets are kerchunk byte-range references that point
-back into the original NOAA GEFS GRIBs on `s3://noaa-gefs-pds/`. To
-materialise one member of one date as an xarray dataset:
+The kerchunk references describe a zarr store backed by S3 byte ranges
+into the original NOAA GEFS GRIBs on `s3://noaa-gefs-pds/`. After
+filtering the aggregate to one member-date, reconstruct the zarr store
+dict and pass it through fsspec's reference filesystem to xarray:
 
 ```python
-from huggingface_hub import hf_hub_download
-import xarray as xr
+import json, pandas as pd, xarray as xr
 
-# Download one member's reference parquet (~280 KB)
-ref_path = hf_hub_download(
-    repo_id="E4DRR/gik-gefs-par",
-    repo_type="dataset",
-    filename="run_par_gefs/2024/06/20240615/00z/2024061500z-gep01.parquet",
+df = pd.read_parquet(
+    "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/monthly_agg/2024/06_00z.parquet",
+    filters=[("date", "=", "20240615"), ("member", "=", "gep01")],
 )
+
+# Reconstruct the {zarr_key: value} dict (decoding bytes / parsing JSON refs)
+def to_zstore(df):
+    out = {}
+    for _, row in df.iterrows():
+        v = row["value"]
+        if isinstance(v, bytes):
+            v = v.decode("utf-8")
+        if isinstance(v, str) and v[:1] in ("[", "{"):
+            v = json.loads(v)
+        out[row["key"]] = v
+    return out
+
+zstore = to_zstore(df)
 
 # Open as a virtual zarr — kerchunk fetches only the bytes you index
 ds = xr.open_dataset(
@@ -189,25 +212,14 @@ ds = xr.open_dataset(
     backend_kwargs={
         "consolidated": False,
         "storage_options": {
-            "fo": ref_path,
+            "fo": zstore,
             "remote_protocol": "s3",
             "remote_options": {"anon": True},  # NOAA bucket is public
         },
     },
 )
-print(ds)        # 81 timesteps × 30 vars × 721×1440 grid
+print(ds)        # 81 timesteps × multiple vars × 721×1440 grid
 print(ds.tp)     # Total precipitation, lazy-loaded
-```
-
-To pull every member for one date, iterate the catalog:
-
-```python
-catalog = pd.read_parquet(
-    "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/catalog.parquet"
-)
-day_files = catalog[catalog.date == "20240615"]
-print(f"{len(day_files)} parquet files for 2024-06-15:")
-print(day_files[["member", "hf_path", "size_bytes"]].head())
 ```
 
 ## Tutorial
