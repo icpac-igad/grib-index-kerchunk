@@ -125,96 +125,95 @@ df = pd.read_parquet(
 print(f"{df.member.nunique()} members, {len(df)} rows total")
 ```
 
-## Open one date as an xarray Dataset (virtual zarr)
+## Open one date as a lazy xarray Dataset (virtual, on-demand)
 
-The kerchunk references describe a zarr store backed by S3 byte ranges.
-After filtering the aggregate to one member-date, reconstruct the zarr
-store dict and pass it through fsspec's reference filesystem to xarray.
+Each (date, member) yields **two rows** in the aggregate: one with
+`key="refs"` whose `value` is a ~1.5 MB Python dict literal containing
+the entire kerchunk zstore (byte-range refs as Python lists, zarr
+metadata as JSON strings), and one with `key="version"`. Use
+`ast.literal_eval` — the blob uses single quotes so `json.loads` will
+fail.
+
+The pattern below builds the **full 30-member ensemble** as a
+dask-backed `xarray.Dataset` where parquet parsing happens instantly
+and S3 byte-range reads to NOAA's public bucket only fire when you call
+`.load()` or `.compute()`.
 
 ```python
-import json
-import pandas as pd
-import xarray as xr
+import ast, base64
+import dask, dask.array as da
+import fsspec, gribberish
+import numpy as np, pandas as pd, xarray as xr
 
-# 1. Pull just one member-date's references from the monthly aggregate
+GEFS_GRID = (721, 1440)
+GEFS_LATS = np.linspace(90, -90, 721)
+GEFS_LONS = np.linspace(0, 359.75, 1440)            # GEFS uses 0..360 longitude
+STEPS = [3, 6, 12, 24, 48, 72, 120, 168, 240]       # forecast hours
+
+# 1. Read all 30 members for one date in one HF call
+#    (~30 MB pulled via parquet filter pushdown + HF range reads)
 df = pd.read_parquet(
     "hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/monthly_agg/2024/06_00z.parquet",
-    filters=[("date", "=", "20240615"), ("member", "=", "gep01")],
+    filters=[("date", "=", "20240615")],
 )
 
-# 2. Reconstruct the {zarr_key: value} dict
-def to_zstore(df):
-    out = {}
-    for _, row in df.iterrows():
-        v = row["value"]
-        if isinstance(v, bytes):
-            v = v.decode("utf-8")
-        if isinstance(v, str) and v[:1] in ("[", "{"):
-            v = json.loads(v)
-        out[row["key"]] = v
-    return out
+def member_zstore(sub):
+    blob = sub[sub["key"] == "refs"].iloc[0]["value"]
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8")
+    return ast.literal_eval(blob)
 
-zstore = to_zstore(df)
+# 2. Lazy chunk fetcher — runs only when xarray pulls data
+s3 = fsspec.filesystem("s3", anon=True)
 
-# 3. Open as a virtual zarr — bytes are fetched lazily from NOAA's public S3
-ds = xr.open_dataset(
-    "reference://", engine="zarr",
-    backend_kwargs={
-        "consolidated": False,
-        "storage_options": {
-            "fo": zstore,
-            "remote_protocol": "s3",
-            "remote_options": {"anon": True},  # NOAA GEFS bucket is public
-        },
-    },
-)
-print(ds)        # 81 timesteps × 30+ vars × 721×1440 grid
-print(ds.tp)     # Total precipitation, lazy-loaded
-```
+def lazy_chunk(ref):
+    @dask.delayed
+    def _fetch():
+        url, off, ln = ref[0], ref[1], ref[2]
+        with s3.open(url, "rb") as f:
+            f.seek(off)
+            raw = f.read(ln)
+        return gribberish.parse_grib_array(raw, 0).reshape(GEFS_GRID).astype(np.float32)
+    return da.from_delayed(_fetch(), shape=GEFS_GRID, dtype=np.float32)
 
-## Open all members for a date as a lazy ensemble dataset
-
-Same idea, looped over the 30 members and stacked along a `member` axis.
-With dask, parquet parsing happens instantly and S3 byte-range reads only
-fire on `.load()`:
-
-```python
-import json, dask, dask.array as da, fsspec, numpy as np, pandas as pd, xarray as xr
-
-date = "20240615"
-df = pd.read_parquet(
-    f"hf://datasets/E4DRR/gik-gefs-par/run_par_gefs_agg/monthly_agg/2024/06_00z.parquet",
-    filters=[("date", "=", date)],
-)
-print(f"{df.member.nunique()} members, {len(df):,} rows")
-
-# Group rows by member, build a zarr store per member, open each lazily
-def member_to_zstore(sub):
-    out = {}
-    for _, row in sub.iterrows():
-        v = row["value"]
-        if isinstance(v, bytes): v = v.decode("utf-8")
-        if isinstance(v, str) and v[:1] in ("[", "{"): v = json.loads(v)
-        out[row["key"]] = v
-    return out
-
-datasets = []
+# 3. Build the (member, step) lazy stack — no S3 reads here, just metadata
+member_arrays, member_names = [], []
 for member, sub in df.groupby("member"):
-    zs = member_to_zstore(sub)
-    ds = xr.open_dataset(
-        "reference://", engine="zarr",
-        backend_kwargs={
-            "consolidated": False,
-            "storage_options": {
-                "fo": zs, "remote_protocol": "s3",
-                "remote_options": {"anon": True},
-            },
-        },
-    ).expand_dims(member=[member])
-    datasets.append(ds)
+    zs = member_zstore(sub)
+    val = zs.get("tp/accum/surface/step/0", "")
+    if isinstance(val, str) and val.startswith("base64:"):
+        step_hours = np.frombuffer(base64.b64decode(val[7:]), dtype="<f8")
+    else:
+        step_hours = np.arange(0, 243, 3, dtype=float)
+    tp_refs = {
+        int(k.rsplit("/", 1)[1].split(".")[0]): v
+        for k, v in zs.items()
+        if k.startswith("tp/accum/surface/tp/") and isinstance(v, list)
+    }
+    chunks = []
+    for h in STEPS:
+        idx = int(np.argmin(np.abs(step_hours - h)))
+        ref = tp_refs.get(idx)
+        chunks.append(lazy_chunk(ref) if ref else
+                      da.full(GEFS_GRID, np.nan, dtype=np.float32))
+    member_arrays.append(da.stack(chunks, axis=0))
+    member_names.append(member)
 
-ensemble = xr.concat(datasets, dim="member")
-print(ensemble)   # 30 members × 81 steps × 721 × 1440
+ds = xr.Dataset(
+    {"tp": (["member", "step", "latitude", "longitude"],
+            da.stack(member_arrays, axis=0))},
+    coords={"member": member_names, "step": STEPS,
+            "latitude": GEFS_LATS, "longitude": GEFS_LONS},
+)
+print(ds)
+# <xarray.Dataset>  Dimensions: member=30, step=9, latitude=721, longitude=1440
+# tp: dask.array<...>  ← zero bytes in memory, all delayed
+
+# 4. Fetch only what you need — each .load() triggers parallel S3 byte-range reads
+step48 = ds.tp.sel(step=48).load()                       # all 30 members, T+48h
+ea = ds.tp.sel(step=48,
+               latitude=slice(15, -12),                  # GEFS lat is 90..-90
+               longitude=slice(25, 52)).load()           # East Africa subset (~5 MB total)
 ```
 
 ## Variables Available
