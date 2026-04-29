@@ -22,7 +22,12 @@ Creates the zarr variable/dimension/chunk schema — identical across all 30 mem
 | **Template** (recommended) | `build_gefs_deflated_store_from_template()` | ~0.05s | Automatic when template exists |
 | **scan_grib** (fallback) | `scan_grib(f000, f003) → grib_tree()` | ~5.5s | Automatic fallback |
 
-The pre-built template `gefs-deflated-store-template-20241112.parquet` (26 KB, 915 entries) is loaded once and reused for all 30 members — **112x speedup** per invocation, **3300x total** for the full ensemble.
+The pre-built template (26 KB, 915 entries) is fetched at runtime from
+the HuggingFace dataset
+[`E4DRR/grib-index-kerchunk-templates`](https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates)
+and reused for all 30 members — **112x speedup** per invocation,
+**3300x total** for the full ensemble. The bundled local copy used to
+sit in this folder pre-v1.0 and now lives in `dev-test/` for reference.
 
 ### Stage 2: Index-Based Reference Building
 
@@ -34,34 +39,24 @@ Merges the deflated store with fresh byte-range references to produce one parque
 
 ## Quick Start
 
-### Daily Ensemble Processing
+### Production-scale parquet generation (Lithops Cloud Run)
+
+For multi-date backfills or ongoing daily generation, use the Cloud
+Run path — see [`lithops-cr-gik-gefs/`](lithops-cr-gik-gefs/) for the
+full setup including IAM, Dockerfile, deployment, and the
+[`BACKFILL.md`](lithops-cr-gik-gefs/BACKFILL.md) ops guide.
+
+### Single Member to Zarr (consumer side)
 
 ```bash
-# Process all 30 members for a date (uses template-based Stage 1)
-uv run run_day_gefs_ensemble_full.py --date 20250106
-
-# Process with member limit for testing
-uv run run_day_gefs_ensemble_full.py --date 20250106 --max-members 5
-```
-
-### Single Member to Zarr
-
-```bash
-# Convert one member's parquet to zarr (cfgrib)
-uv run run_single_gefs_to_zarr.py 20250106 00 gep01 --region east_africa
-
-# Same with gribberish (~80x faster decoding)
+# Convert one member's parquet to zarr using gribberish (~80x faster than cfgrib)
 uv run run_single_gefs_to_zarr_gribberish.py 20250106 00 gep01 --region east_africa
 ```
 
-### Ensemble Statistics
+### Build a TP NetCDF for one date
 
 ```bash
-# Concatenate members and compute mean/std/probabilities
-uv run process_ensemble_by_variable.py zarr_stores/20250106_00/
-
-# 24h rainfall accumulation and exceedance probabilities
-uv run run_gefs_24h_accumulation.py
+uv run create_gik_tp_netcdf.py --date 20250106 --max-members 30
 ```
 
 ## GIK vs Herbie Validation
@@ -87,32 +82,35 @@ Output in `gik_vs_herbie_gefs/`:
 - `scatter_gik_vs_herbie_gefs.png` — Grid-point scatter plot
 - `comparison_stats_gefs.json` — Numerical metrics
 
-## Scripts Reference
+## Scripts on the main path (v1.0)
 
-| Script | Purpose | Usage |
-|--------|---------|-------|
-| `gefs_util.py` | Core utilities — template loading, scan_grib, zarr store ops | Imported by other scripts |
-| `run_day_gefs_ensemble_full.py` | Daily ensemble processing (all 30 members) | `uv run run_day_gefs_ensemble_full.py --date YYYYMMDD` |
-| `run_gefs_preprocessing.py` | One-time template/mapping creation | `uv run run_gefs_preprocessing.py` |
-| `create_gik_tp_netcdf.py` | GIK TP extraction with gribberish streaming | `uv run create_gik_tp_netcdf.py --max-members 3` |
-| `fetch_tp_herbie_gefs.py` | Herbie-based TP fetching for validation | `uv run fetch_tp_herbie_gefs.py --date YYYYMMDD` |
-| `compare_gik_herbie_gefs.py` | GIK vs Herbie comparison PNGs | `uv run compare_gik_herbie_gefs.py --dates YYYYMMDD` |
-| `run_single_gefs_to_zarr.py` | Single member parquet-to-zarr (cfgrib) | `uv run run_single_gefs_to_zarr.py DATE RUN MEMBER` |
-| `run_single_gefs_to_zarr_gribberish.py` | Single member parquet-to-zarr (gribberish, ~80x faster) | `uv run run_single_gefs_to_zarr_gribberish.py DATE RUN MEMBER` |
-| `process_ensemble_by_variable.py` | Ensemble concatenation + statistics | `uv run process_ensemble_by_variable.py ZARR_DIR/` |
-| `run_gefs_24h_accumulation.py` | 24h rainfall accumulation + probability maps | `uv run run_gefs_24h_accumulation.py` |
-| `plot_ensemble_east_africa.py` | Visualization of ensemble outputs | `uv run plot_ensemble_east_africa.py` |
+| Script | Step | Purpose |
+|--------|------|---------|
+| `gefs_util.py` | shared | Core utilities — template loading, scan_grib, zarr store ops |
+| `run_gefs_preprocessing.py` | 1 | One-time template / mapping creation |
+| `lithops-cr-gik-gefs/` | 3 | Cloud Run + Lithops orchestration for production |
+| `create_gik_tp_netcdf.py` | 4 | GIK TP extraction + gribberish streaming → NetCDF |
+| `run_single_gefs_to_zarr_gribberish.py` | 4 | Single member → zarr (gribberish, ~80× faster than cfgrib) |
+| `compare_gik_herbie_gefs.py` | validation | GIK vs Herbie comparison PNGs |
+| `fetch_tp_herbie_gefs.py` | validation | Herbie-based TP fetching for validation |
+| `validate_gik_vs_herbie_2022_2026.py` | validation | Multi-year random-date Herbie comparison (local pipeline) |
+| `validate_hf_gik_vs_herbie.py` | validation | Same comparison but pulling refs from `E4DRR/gik-gefs-par` on HF |
+| `upload_parquets_to_hf.py` | publish | Mirror per-member parquets + monthly aggregates + catalog to HF |
+| `hf_README.md` | docs | Dataset card on `E4DRR/gik-gefs-par` |
 
-## Key Files
+The single-machine ensemble driver, cfgrib-decoder variants, ensemble
+analytics scripts, and bundled template parquet were moved to
+[`dev-test/`](dev-test/) in the v1.0 cleanup — see
+[`../RELEASE_CLEANUP_PLAN.md`](../RELEASE_CLEANUP_PLAN.md) §4.
 
-| File | Description |
-|------|-------------|
-| `gefs-deflated-store-template-20241112.parquet` | Pre-built Stage 1 template (26 KB, 915 zarr metadata entries) |
-| `gik-fmrc-gefs-20241112.tar.gz` | Template archive with per-member mapping parquets (from [HuggingFace](https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/blob/main/gik-fmrc-gefs-20241112.tar.gz)) |
-| `gik_tp_gefs_output/` | GIK-produced TP NetCDF files |
-| `herbie_tp_gefs_output/` | Herbie-produced TP NetCDF files |
+## Key folders
+
+| Folder | Description |
+|--------|-------------|
+| `lithops-cr-gik-gefs/` | Cloud Run + Lithops setup (Dockerfile, lithops_config, BACKFILL.md, COST_ANALYSIS.md) |
 | `gik_vs_herbie_gefs/` | Comparison PNG plots and statistics |
-| `docs/GEFS_SCAN_GRIB_TO_TEMPLATE.md` | Detailed documentation of the scan_grib to template transformation |
+| `docs/` | Method documentation including `GEFS_SCAN_GRIB_TO_TEMPLATE.md` |
+| `dev-test/` | Archived experiments, single-machine drivers, bundled template parquet |
 
 ## Performance
 
