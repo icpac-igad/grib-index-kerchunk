@@ -99,13 +99,13 @@ Anything not directly implementing one of these steps moves to `dev-test/`.
 | `2026-02-19-gik-validation.txt`, `2026-02-19-herbie-gik-difference.txt` | Session logs |
 | `COILED_DASK_IMPLEMENTATION_PLAN.md`, `GRIBBERISH_EXPERIMENT_REPORT.md` | Historical planning docs (alternatively → `docs/archive/`) |
 
-### 3c. REVIEW — needs your decision
+### 3c. REVIEW — RESOLVED
 
-| File | Question |
+| File | Decision |
 |------|----------|
-| `run_ecmwf_tutorial.py` | Move under top-level `tutorial/ecmwf/` or keep here? |
-| `plot_tp_maps.py` | Is this used by anyone in v1.0 docs? If not → dev-test. |
-| `consolidate_parquets_to_hf.py` | Replaced by `upload_parquets_to_hf.py --aggregate`? Confirm before moving. |
+| `run_ecmwf_tutorial.py` | **MOVE → `tutorial/ecmwf/`** (sibling of existing tutorials) |
+| `plot_tp_maps.py` | **MOVE → `ecmwf/dev-test/`** |
+| `consolidate_parquets_to_hf.py` | **MOVE → `ecmwf/dev-test/`** — replaced by `upload_parquets_to_hf.py --aggregate`. Prerequisite: ECMWF script ported with the same GEFS optimisations (member col + sort + row_group_size=102 + zstd + retry wrapper) — done as a prep commit before the moves. |
 
 ---
 
@@ -150,37 +150,41 @@ Anything not directly implementing one of these steps moves to `dev-test/`.
 | `gik_tp_gefs_output/`, `validation_hf_gik_vs_herbie/`, `plots/`, `logs/` | Runtime output dirs — gitignore + keep empty in repo, or move into `dev-test/runs/` |
 | `env/` | Old uv env scratch dir — delete or gitignore |
 
-### 4c. REVIEW — needs your decision
+### 4c. REVIEW — RESOLVED (all → dev-test)
 
-| File | Question |
+| File | Decision |
 |------|----------|
-| `process_ensemble_by_variable.py` | Used by tutorials — keep on main? |
-| `run_gefs_24h_accumulation.py` | Useful demo or move to `dev-test/`? |
-| `plot_ensemble_east_africa.py` | Keep one canonical plot script? |
-| `gefs-deflated-store-template-20241112.parquet` | Bundle in repo or fetch from HF templates dataset? |
+| `process_ensemble_by_variable.py` | **MOVE → `gefs/dev-test/`** |
+| `run_gefs_24h_accumulation.py` | **MOVE → `gefs/dev-test/`** |
+| `plot_ensemble_east_africa.py` | **MOVE → `gefs/dev-test/`** |
+| `gefs-deflated-store-template-20241112.parquet` | **MOVE → `gefs/dev-test/`** (fetched from HF templates dataset at runtime; no need to bundle in repo) |
 
 ---
 
-## 5. Suggested commit / tag strategy
-
-To keep history reviewable, do the cleanup in **separate, atomic commits**
-per logical group:
+## 5. Commit / tag strategy (locked)
 
 ```
-Commit  Branch    Subject (proposed)
+Commit  Subject (final)
 ─────────────────────────────────────────────────────────────────────
-1       main      docs: add RELEASE_CLEANUP_PLAN.md (this file)
-2       main      ecmwf: archive legacy parquet creators (v2/efficient/multidate)
-3       main      ecmwf: archive AIFS pipeline (separate workstream)
-4       main      ecmwf: archive icechunk + source.coop variants
-5       main      ecmwf: archive older validators + tutorial runner
-6       main      ecmwf: keep one Coiled streamer (move stream_cgan_variables{,_coiled}.py)
-7       main      gefs: archive single-machine driver + cfgrib variant
-8       main      gefs: archive cost-test + PNG uploader + scratch outputs
-9       main      docs: refresh top-level README + ecmwf/README + gefs/README
-10      main      v1.0.0 release notes
+1       docs: add RELEASE_CLEANUP_PLAN.md   (already shipped — b929896)
+2       ecmwf: port GEFS aggregate optimisations (member/sort/zstd/retry)
+        + lock §3c & §4c decisions in RELEASE_CLEANUP_PLAN.md
+3       ecmwf: archive legacy parquet creators (v2/efficient/multidate)
+4       ecmwf: archive AIFS pipeline (separate workstream)
+5       ecmwf: archive icechunk + source.coop / pencil zarr variants
+6       ecmwf: archive older validators + run_random_date_test
+7       ecmwf: archive plot/test/doc one-offs (CGAN plots, gribberish-vs-scangrib, etc.)
+8       ecmwf: keep one Coiled streamer; move tutorial runner to tutorial/ecmwf/
+9       ecmwf: archive consolidate_parquets_to_hf.py
+        (functionality folded into upload_parquets_to_hf.py --aggregate)
+10      gefs: archive single-machine driver + cfgrib variant
+11      gefs: archive cost-test, PNG uploader, scratch outputs
+12      gefs: archive REVIEW items (process_ensemble, 24h_accum, EA plot,
+        bundled .parquet template)
+13      docs: refresh top-level README + ecmwf/README + gefs/README for v1.0
+14      docs: v1.0.0 release notes
 ─────────────────────────────────────────────────────────────────────
-11      tag       git tag -a v1.0.0 -m "GIK v1.0 — GEFS + ECMWF GIK pipeline"
+TAG     v1.0.0 — git tag -a v1.0.0 -m "GIK v1.0 — GEFS + ECMWF GIK pipeline"
 ```
 
 Each move-commit message follows this template:
@@ -227,13 +231,12 @@ After the moves, the **three READMEs** should be tightened:
 
 ---
 
-## 7. What I need from you before executing
+## 7. Status
 
-1. **Confirm the §3a / §4a "KEEP" lists** — anything in there you'd actually like in `dev-test/`?
-2. **Resolve the §3c / §4c REVIEW items** — quick yes/no on each.
-3. **Confirm the commit batching in §5** — too granular? Combine? One mega commit?
-4. **README rewrite scope** — do you want me to draft the three new READMEs in this same plan doc before any moves, or after?
-
-Once you reply with the deltas (e.g. "move plot_tp_maps.py to dev-test, keep
-consolidate_parquets_to_hf.py, README rewrites after moves"), I'll execute
-in the commit order above and tag `v1.0.0` at the end.
+- §3c / §4c review items: **RESOLVED** (see locked decisions above).
+- §3a / §4a "KEEP" lists: implicitly confirmed by user reply
+  ("move all to dev-test, move parquet file to dev-test as well"
+  applies to §4c only — §4a / §3a stay as proposed).
+- §5 commit sequence: **LOCKED**.
+- README rewrites: drafted **after** the moves, in commit 13 (so each
+  README references the post-move file layout).

@@ -51,6 +51,26 @@ import gcsfs
 import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi
+from huggingface_hub.errors import HfHubHTTPError
+
+
+def _upload_with_retry(api, *, max_retries=5, **kwargs):
+    """Wrap HfApi.upload_file with exponential backoff on 429 rate-limit errors.
+
+    HF caps repo commits at 128/hour. Long aggregate runs (96+ commits for
+    ECMWF) can hit it; we back off starting at 5 min and double each retry.
+    """
+    delay = 300  # 5 min
+    for attempt in range(max_retries):
+        try:
+            return api.upload_file(**kwargs)
+        except HfHubHTTPError as e:
+            if "429" not in str(e) or attempt == max_retries - 1:
+                raise
+            print(f"  Rate limited, sleeping {delay // 60} min then retrying "
+                  f"(attempt {attempt+2}/{max_retries})...", flush=True)
+            time.sleep(delay)
+            delay *= 2
 
 # ── Configuration ─────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -199,7 +219,10 @@ def build_catalog(fs, api, years: list[str], dry_run: bool = False,
     print(f"  Members: {len(members)} ({sorted(members)[:5]}...)")
     print(f"  Total:   {total_size / (1024**3):.2f} GB")
 
-    hf_path = f"{AGG_PREFIX}/catalog.parquet"
+    # Catalog lives at the repo root (matches the path documented in
+    # ecmwf/hf_README.md so users can hf_hub_download(filename="catalog.parquet")
+    # in one line).
+    hf_path = "catalog.parquet"
 
     if dry_run:
         print(f"\n  [DRY RUN] Would upload catalog to {hf_path}")
@@ -210,7 +233,8 @@ def build_catalog(fs, api, years: list[str], dry_run: bool = False,
         out_path = os.path.join(tmpdir, "catalog.parquet")
         pq.write_table(table, out_path)
         size_kb = os.path.getsize(out_path) / 1024
-        api.upload_file(
+        _upload_with_retry(
+            api,
             path_or_fileobj=out_path,
             path_in_repo=hf_path,
             repo_id=HF_REPO,
@@ -281,20 +305,37 @@ def aggregate_month(fs, api, year: str, month: str, run_hour: str,
 
             table = pq.read_table(local_path)
             n_rows = len(table)
+            # Extract member from filename like "2024061500z-control.parquet"
+            # or "2024061500z-ens01.parquet"
+            base = fname.rsplit(".parquet", 1)[0]
+            member = base.split("-", 1)[1] if "-" in base else ""
             date_col = pa.array([date_name] * n_rows, type=pa.string())
             source_col = pa.array([fname] * n_rows, type=pa.string())
+            member_col = pa.array([member] * n_rows, type=pa.string())
             table = table.append_column("date", date_col)
             table = table.append_column("source_file", source_col)
+            table = table.append_column("member", member_col)
             tables.append(table)
 
             # Remove temp file immediately to manage memory
             os.remove(local_path)
 
         combined = pa.concat_tables(tables, promote_options="default")
+        # Sort by (date, member) so all rows for one date are contiguous; with
+        # small row groups this enables PyArrow predicate pushdown on
+        # `date` / `member`. A single-date query against a ~80 MB monthly
+        # aggregate then reads only a few MB via HF range requests.
+        combined = combined.sort_by([("date", "ascending"), ("member", "ascending")])
         out_path = os.path.join(tmpdir, "aggregated.parquet")
-        pq.write_table(combined, out_path)
+        pq.write_table(
+            combined, out_path,
+            row_group_size=102,   # 51 members × 2 rows = one day per row group
+            write_statistics=True,
+            compression="zstd",
+        )
 
-        api.upload_file(
+        _upload_with_retry(
+            api,
             path_or_fileobj=out_path,
             path_in_repo=hf_path,
             repo_id=HF_REPO,
