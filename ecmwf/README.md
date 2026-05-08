@@ -20,10 +20,21 @@ for GEFS (`../gefs/`), adapted for the 51-member IFS ensemble.
 
 | Step | Script(s) | Output |
 |------|-----------|--------|
-| **1. Template** | `utils_ecmwf_step1_scangrib.py`, `ecmwf_index_preprocessing.py` | `gik-fmrc-ecmwf-YYYYMMDD.tar.gz` (~30 MB) |
-| **2. Index** | `ecmwf_index_processor.py` | per-member kerchunk dict from each `.idx` |
+| **1. Template** (one-time, frozen at reference date `20240529`) | `ecmwf_index_preprocessing.py` runs `build_idx_grib_mapping` over **every (member, timestep) = 51 × 85 ≈ 4,335 GRIB files** | `gik-fmrc-v2ecmwf_fmrc.tar.gz` (~30 MB) — published to HF, baked into the Cloud Run image |
+| **2. Index** | `ecmwf_index_processor.py` (or, in Lithops, the inline `process_ecmwf_member` parser) | per-member kerchunk dict built from each daily `.index` file |
 | **3. Build parquet & save** | `ecmwf_three_stage_multidate.py` (local) or `lithops-cr-gik-ecmwf/` (Cloud Run) | per-member parquets in GCS / on HF |
 | **4. Stream → xarray** | `run_single_ecmwf_to_zarr_gribberish.py` (single member), `stream_cgan_variables_coiled_simple.py` (Coiled Dask cluster) | xarray Dataset / `.zarr` |
+
+> **Step 1 in production is a parquet read, not a `scan_grib` call.** The
+> Lithops Cloud Run path (`lithops-cr-gik-ecmwf/run_lithops_ecmwf.py`)
+> never calls — and never imports — `scan_grib`. It opens the baked-in
+> tar.gz, extracts each member's `rt000.par` slice into memory and parses
+> the rows to reconstruct the deflated zarr store (~5 s for all 51
+> members). `utils_ecmwf_step1_scangrib.py` and the older
+> `ecmwf_ensemble_par_creator_efficient.py` describe a `scan_grib`-based
+> Stage 1 that **was never used to build the production template** — they
+> are kept on the main path only for reproducibility of the historical
+> approach, and can be ignored for v1.0 backfill operations.
 
 ---
 

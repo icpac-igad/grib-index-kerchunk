@@ -24,13 +24,16 @@ template — so generating a new day's references takes seconds, not the
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Template      Scan two sample GRIBs (f000+f003) → tar.gz with    │
-│                  deflated zarr store + per-member mapping parquets. │
-│                  ONE-TIME per model.                                │
+│ 1. Template      ONE-TIME per model on a reference date:            │
+│                  run build_idx_grib_mapping over EVERY (member,     │
+│                  timestep) → tar.gz of mapping parquets             │
+│                  (GEFS: 30×81 parquets, ECMWF: 51×85 parquets).     │
+│                  Published to HF, baked into the Docker image.      │
+│                  Frozen at 2024-11-12 (GEFS) / 2024-05-29 (ECMWF).  │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. Index         For each new date+member: fetch the .idx (~few KB),│
 │                  look up byte ranges, merge with the template's     │
-│                  mapping parquets — NO scan_grib needed.            │
+│                  mapping parquets — NO scan_grib at runtime.        │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 3. Build parquet Combine step 1 (zarr metadata) + step 2 (byte-range│
 │   & save         refs) → write one parquet per member-date.         │
@@ -42,6 +45,18 @@ template — so generating a new day's references takes seconds, not the
 │                  Validators: Herbie + dynamical-earth zarr.         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+> **Note on Step 1.** Earlier descriptions of this repo claimed Step 1
+> was a `scan_grib(f000, f003)` two-file scan. That is **not** what
+> produces the production templates. The tar.gz baked into the Docker
+> image is the output of a full per-timestep `build_idx_grib_mapping`
+> sweep (`gefs/dev-test/gefs_index_preprocessing_fixed.py` and
+> `ecmwf/ecmwf_index_preprocessing.py`). A separate 27 KB GEFS
+> `gefs-deflated-store-template-20241112.parquet` was made one-time by
+> a 2-file `scan_grib` and is bundled alongside the tar.gz, but it is
+> a convenience artefact only — the same zarr-metadata skeleton can be
+> reconstructed from any single `rt000` parquet inside the tar.gz, which
+> is what the ECMWF Lithops path does.
 
 ### Weather Data vs Video Streaming — same idea
 

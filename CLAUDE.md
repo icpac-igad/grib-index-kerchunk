@@ -68,28 +68,45 @@ for each product but the overall GIK method is the same.
 Both GEFS and ECMWF use a three-stage pipeline to create parquet reference files.
 The stages have evolved differently between the two products.
 
-### Stage 1: Build Zarr Metadata Structure
+### Stage 1: Template (one-time, frozen at v1.0 reference date)
 
-**Purpose**: Create a "deflated store" -- the zarr variable/dimension/chunk schema
-with all data references stripped out. This is the skeleton that defines what
-variables exist, their dimensions, chunk layout, and coordinate metadata.
+**Purpose**: Produce the per-(member, timestep) idx-to-grib mapping parquets
+that Stage 2 needs to translate fresh `.idx` byte positions into a complete
+zarr reference set. The template also implicitly carries the zarr metadata
+skeleton (variable names, dimensions, chunk shapes, coordinate data) — for
+ECMWF this is recovered from a single `rt000` mapping parquet at runtime;
+for GEFS it lives as a separate auxiliary parquet bundled alongside the tar.gz.
 
-**ECMWF (current)**: Loads the zarr structure directly from a pre-built
-HuggingFace template archive (`gik-fmrc-v2ecmwf_fmrc.tar.gz`). Takes ~5 seconds.
-No GRIB scanning. The template was originally created by running `scan_grib` once
-on a reference date (`20240529`) and archiving the result.
+**Production templates (what's actually baked into the Docker image and used
+by the Lithops backfill):**
 
-**GEFS (current)**: Still uses `kerchunk.grib2.scan_grib` to scan 2 GRIB files
-(`f000` and `f003`) and build the tree via `grib_tree`. Takes ~30 seconds. This
-is carried over from the original architecture. The pre-built template
-(`gik-fmrc-gefs-20241112.tar.gz`) exists on HuggingFace and could replace
-`scan_grib` in the same way ECMWF did, but the implementation has not been
-refactored yet. The 2-file scan is fast enough (~30s) that it is not a bottleneck.
+- **GEFS** — `gik-fmrc-gefs-20241112.tar.gz`. Built once on reference date
+  `20241112` by `gefs/dev-test/gefs_index_preprocessing_fixed.py` running
+  `build_idx_grib_mapping` over **every (member, hour)** — 30 members × 81
+  timesteps = 2,430 mapping parquets. Plus a separate 27 KB
+  `gefs-deflated-store-template-20241112.parquet` (made one-time by
+  `scan_grib(f000, f003) → grib_tree → strip_datavar_chunks`) that holds the
+  zarr metadata skeleton. Both are baked into the Cloud Run image.
+- **ECMWF** — `gik-fmrc-v2ecmwf_fmrc.tar.gz`. Built once on reference date
+  `20240529` by `ecmwf/ecmwf_index_preprocessing.py` running
+  `build_idx_grib_mapping` over every (member, hour) — 51 members × 85
+  timesteps ≈ 4,335 mapping parquets. The deflated zarr store is reconstructed
+  at runtime from each member's `rt000.par` slice inside that same tar.gz.
+  No separate skeleton parquet, and **no `scan_grib` is involved anywhere
+  in the ECMWF path**.
 
-**Why only 2 files**: The zarr structure (variable names, dimension names, chunk
-shapes, coordinate schemas) is identical across all timesteps of a forecast run.
-Scanning `f000` and `f003` captures the full variable/dimension schema. The actual
-byte-range references for all 81 timesteps come from Stage 2.
+**Stage 1 at runtime (every Lithops backfill date):** the 2-file `scan_grib`
+is **not called**. GEFS Lithops opens the 27 KB pre-built parquet (~0.05 s);
+ECMWF Lithops opens the tar.gz and decodes 51 `rt000.par` rows (~5 s). Both
+are pure parquet reads — no GRIB scanning of any kind.
+
+**Historical note**: An older single-machine GEFS driver
+(`gefs/dev-test/run_day_gefs_ensemble_full.py`) and the legacy ECMWF
+ensemble creator did call `scan_grib(f000, f003)` per ensemble member to
+rebuild the deflated store from scratch. The 2-file scan was fast enough
+(~5.5 s for GEFS, ~73 min for ECMWF) but produced nothing the production
+tar.gz needs. It survives only in `dev-test/` and as the original recipe
+that produced the 27 KB GEFS auxiliary parquet.
 
 ### Stage 2: Index-Based Reference Building
 

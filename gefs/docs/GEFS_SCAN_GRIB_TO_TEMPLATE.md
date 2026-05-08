@@ -1,5 +1,20 @@
 # GEFS Stage 1: scan_grib to Template Transformation
 
+> **Scope of this doc (post-v1.0 correction).** This document describes
+> how the small 26 KB `gefs-deflated-store-template-20241112.parquet`
+> auxiliary file was generated one-time from `scan_grib(f000, f003)`, and
+> how the GEFS Lithops production runtime loads it instead of calling
+> `scan_grib`. It does **not** describe how the main production template
+> archive `gik-fmrc-gefs-20241112.tar.gz` was built — that came from a
+> full per-(member, timestep) sweep with `build_idx_grib_mapping` (see
+> `gefs/dev-test/gefs_index_preprocessing_fixed.py` and the Stage 1
+> section of `gefs/README.md`). The 26 KB parquet only carries the zarr
+> metadata skeleton; the same skeleton can be reconstructed from any
+> single `rt000` parquet inside the tar.gz, which is what the ECMWF
+> Lithops path does. The "scan_grib fallback" referenced in this doc
+> survives only in `gefs/dev-test/run_day_gefs_ensemble_full.py` and is
+> not on the production path.
+
 ## Overview
 
 This document describes the replacement of `kerchunk.grib2.scan_grib()` with a

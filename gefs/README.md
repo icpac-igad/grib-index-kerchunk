@@ -13,25 +13,26 @@ Complete pipeline for processing GEFS (Global Ensemble Forecast System) ensemble
 
 The pipeline creates lightweight parquet reference files containing `[url, byte_offset, byte_length]` triplets pointing into remote GRIB files on AWS S3.
 
-### Stage 1: Build Zarr Metadata Structure (Deflated Store)
+### Stage 1: Template (one-time, frozen at reference date 2024-11-12)
 
-Creates the zarr variable/dimension/chunk schema — identical across all 30 members.
+The production "template" is two artefacts, both baked into the Cloud Run
+Docker image and also published to HuggingFace:
 
-| Mode | Method | Time | Command |
-|------|--------|------|---------|
-| **Template** (recommended) | `build_gefs_deflated_store_from_template()` | ~0.05s | Automatic when template exists |
-| **scan_grib** (fallback) | `scan_grib(f000, f003) → grib_tree()` | ~5.5s | Automatic fallback |
+| Artefact | Size | How it was built (one-time, on `20241112`) | Used for |
+|----------|------|--------------------------------------------|----------|
+| `gik-fmrc-gefs-20241112.tar.gz` | ~10 MB | `gefs/dev-test/gefs_index_preprocessing_fixed.py` running `build_idx_grib_mapping` over **every (member, timestep) = 30 × 81 = 2,430 GRIB files** | Stage 2 byte-range merging |
+| `gefs-deflated-store-template-20241112.parquet` | 26 KB | One-time `scan_grib(f000, f003) → grib_tree → strip_datavar_chunks` | Stage 3 zarr metadata skeleton (convenience — equivalent zstore is also present inside any `rt000` slice of the tar.gz) |
 
-The pre-built template (26 KB, 915 entries) is fetched at runtime from
-the HuggingFace dataset
-[`E4DRR/grib-index-kerchunk-templates`](https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates)
-and reused for all 30 members — **112x speedup** per invocation,
-**3300x total** for the full ensemble. The bundled local copy used to
-sit in this folder pre-v1.0 and now lives in `dev-test/` for reference.
+**At runtime** (`lithops-cr-gik-gefs/run_lithops_gefs.py`), Stage 1 is just
+`pd.read_parquet(...)` on the 26 KB file (~0.05 s). **No `scan_grib` is
+called in the production Lithops path.** The single-machine driver
+`run_day_gefs_ensemble_full.py` (now in `dev-test/`) has a `scan_grib`
+fallback for environments without the template, but it's not on the
+production path.
 
 ### Stage 2: Index-Based Reference Building
 
-Reads `.idx` files from S3 (one per GRIB file), extracts byte offsets, and merges with mapping parquets from the template archive (`gik-fmrc-gefs-20241112.tar.gz`). I/O-bound, ~25-30s per member.
+Reads `.idx` files from S3 (one per GRIB file), extracts byte offsets, and merges with the per-(member, timestep) mapping parquets that were pre-built into the template archive (`gik-fmrc-gefs-20241112.tar.gz`). I/O-bound, ~25-30s per member.
 
 ### Stage 3: Final Zarr Store Assembly
 
