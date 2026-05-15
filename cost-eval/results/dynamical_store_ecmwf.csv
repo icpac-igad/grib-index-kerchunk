@@ -1,0 +1,7 @@
+product,subdir,n_objects,bytes_on_disk
+ecmwf,(root),1,85737
+ecmwf,chunks,231029,42454260240690
+ecmwf,manifests,2641,597299661
+ecmwf,overwritten,1096,50843917
+ecmwf,snapshots,2144,17729069
+ecmwf,transactions,2142,598642

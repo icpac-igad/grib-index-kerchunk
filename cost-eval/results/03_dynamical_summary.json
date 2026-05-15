@@ -1,0 +1,112 @@
+{
+  "gefs": {
+    "xarray_view": {
+      "dataset_id": "noaa-gefs-forecast-35-day",
+      "dims": {
+        "init_time": 2052,
+        "ensemble_member": 31,
+        "lead_time": 181,
+        "latitude": 721,
+        "longitude": 1440
+      },
+      "n_data_vars": 22,
+      "nbytes_uncompressed_total": 1051957163964470,
+      "tib_uncompressed_total": 956.749,
+      "init_time_count": 2052,
+      "init_time_start": "2020-10-01T00:00:00.00000",
+      "init_time_end": "2026-05-14T00:00:00.00000",
+      "ensemble_members": 31
+    },
+    "on_disk_store": {
+      "bucket": "dynamical-noaa-gefs",
+      "prefix": "noaa-gefs-forecast-35-day/v0.2.0.icechunk/",
+      "region": "us-west-2",
+      "n_pages": 370,
+      "n_objects": 369699,
+      "bytes_on_disk": 160564041605212,
+      "gib_on_disk": 149536.917,
+      "tib_on_disk": 146.032,
+      "list_seconds": 94.3,
+      "by_subdir": {
+        "(root)": 41893,
+        "chunks": 160563294196534,
+        "manifests": 728317437,
+        "overwritten": 10950627,
+        "snapshots": 7841371,
+        "transactions": 257350
+      },
+      "n_objects_by_subdir": {
+        "(root)": 1,
+        "chunks": 365220,
+        "manifests": 2220,
+        "overwritten": 504,
+        "snapshots": 878,
+        "transactions": 876
+      }
+    },
+    "vs_gik_grib": {
+      "matched_grib_bytes_recent": 364032304784876,
+      "matched_grib_tib_recent": 331.085,
+      "dynamical_uncompressed_tib": 956.749,
+      "ratio_uncompressed_over_grib": 2.89,
+      "dynamical_on_disk_tib": 146.032,
+      "dynamical_compression_ratio": 6.55,
+      "ratio_dynamical_on_disk_over_grib": 0.44
+    }
+  },
+  "ecmwf": {
+    "xarray_view": {
+      "dataset_id": "ecmwf-ifs-ens-forecast-15-day-0-25-degree",
+      "dims": {
+        "init_time": 774,
+        "lead_time": 85,
+        "ensemble_member": 51,
+        "latitude": 721,
+        "longitude": 1440
+      },
+      "n_data_vars": 19,
+      "nbytes_uncompressed_total": 264753318572574,
+      "tib_uncompressed_total": 240.792,
+      "init_time_count": 774,
+      "init_time_start": "2024-04-01T00:00:00.00000",
+      "init_time_end": "2026-05-14T00:00:00.00000",
+      "ensemble_members": 51
+    },
+    "on_disk_store": {
+      "bucket": "dynamical-ecmwf-ifs-ens",
+      "prefix": "ecmwf-ifs-ens-forecast-15-day-0-25-degree/v0.1.0.icechunk/",
+      "region": "us-west-2",
+      "n_pages": 240,
+      "n_objects": 239053,
+      "bytes_on_disk": 42454926797716,
+      "gib_on_disk": 39539.232,
+      "tib_on_disk": 38.613,
+      "list_seconds": 62.2,
+      "by_subdir": {
+        "(root)": 85737,
+        "chunks": 42454260240690,
+        "manifests": 597299661,
+        "overwritten": 50843917,
+        "snapshots": 17729069,
+        "transactions": 598642
+      },
+      "n_objects_by_subdir": {
+        "(root)": 1,
+        "chunks": 231029,
+        "manifests": 2641,
+        "overwritten": 1096,
+        "snapshots": 2144,
+        "transactions": 2142
+      }
+    },
+    "vs_gik_grib": {
+      "matched_grib_bytes_recent": 1342116244265775,
+      "matched_grib_tib_recent": 1220.648,
+      "dynamical_uncompressed_tib": 240.792,
+      "ratio_uncompressed_over_grib": 0.2,
+      "dynamical_on_disk_tib": 38.613,
+      "dynamical_compression_ratio": 6.24,
+      "ratio_dynamical_on_disk_over_grib": 0.03
+    }
+  }
+}

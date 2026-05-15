@@ -1,0 +1,7 @@
+product,subdir,n_objects,bytes_on_disk
+gefs,(root),1,41893
+gefs,chunks,365220,160563294196534
+gefs,manifests,2220,728317437
+gefs,overwritten,504,10950627
+gefs,snapshots,878,7841371
+gefs,transactions,876,257350

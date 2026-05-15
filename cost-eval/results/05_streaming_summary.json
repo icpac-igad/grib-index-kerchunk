@@ -1,0 +1,90 @@
+{
+  "gefs": {
+    "global": {
+      "gik": {
+        "mib_on_wire": 10702.13,
+        "n_get": 5611,
+        "$_total_cross_cloud": 1.0122,
+        "$_total_same_cloud": 0.0022
+      },
+      "zarr": {
+        "mib_on_wire": 3734.42,
+        "n_get": 11610,
+        "$_total_cross_cloud": 0.3571,
+        "$_total_same_cloud": 0.0046
+      }
+    },
+    "regional": {
+      "gik": {
+        "mib_on_wire": 10702.13,
+        "n_get": 5611,
+        "$_total_cross_cloud": 1.0122,
+        "$_total_same_cloud": 0.0022
+      },
+      "zarr": {
+        "mib_on_wire": 61.76,
+        "n_get": 192,
+        "$_total_cross_cloud": 0.0059,
+        "$_total_same_cloud": 0.0001
+      }
+    },
+    "pencil": {
+      "gik": {
+        "mib_on_wire": 21960777.28,
+        "n_get": 11513772,
+        "$_total_cross_cloud": 2077.0845,
+        "$_total_same_cloud": 4.6055
+      },
+      "zarr": {
+        "mib_on_wire": 1980.11,
+        "n_get": 6156,
+        "$_total_cross_cloud": 0.1893,
+        "$_total_same_cloud": 0.0025
+      }
+    }
+  },
+  "ecmwf": {
+    "global": {
+      "gik": {
+        "mib_on_wire": 20670.89,
+        "n_get": 85,
+        "$_total_cross_cloud": 1.9508,
+        "$_total_same_cloud": 0.0
+      },
+      "zarr": {
+        "mib_on_wire": 2738.48,
+        "n_get": 1035,
+        "$_total_cross_cloud": 0.2588,
+        "$_total_same_cloud": 0.0004
+      }
+    },
+    "regional": {
+      "gik": {
+        "mib_on_wire": 20670.89,
+        "n_get": 85,
+        "$_total_cross_cloud": 1.9508,
+        "$_total_same_cloud": 0.0
+      },
+      "zarr": {
+        "mib_on_wire": 42.33,
+        "n_get": 16,
+        "$_total_cross_cloud": 0.004,
+        "$_total_same_cloud": 0.0
+      }
+    },
+    "pencil": {
+      "gik": {
+        "mib_on_wire": 15999269.49,
+        "n_get": 65790,
+        "$_total_cross_cloud": 1509.9068,
+        "$_total_same_cloud": 0.0263
+      },
+      "zarr": {
+        "mib_on_wire": 2047.91,
+        "n_get": 774,
+        "$_total_cross_cloud": 0.1936,
+        "$_total_same_cloud": 0.0003
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "archive_costs": {
+    "gefs": {
+      "grib_archive_tib_recent": 310.43,
+      "grib_archive_$_per_year_aws_s3_std": 94206.0,
+      "dynamical_on_disk_tib": 146.03,
+      "dynamical_$_per_year_aws_s3_std": 44316.0,
+      "gik_parquet_archive_gib": 13.879420470446348,
+      "gik_parquet_$_per_year_aws_s3_std": 4.11
+    },
+    "ecmwf": {
+      "grib_archive_tib_recent": 1135.49,
+      "grib_archive_$_per_year_aws_s3_std": 344581.0,
+      "dynamical_on_disk_tib": 38.61,
+      "dynamical_$_per_year_aws_s3_std": 11718.0,
+      "gik_parquet_archive_gib": 16.364174250513315,
+      "gik_parquet_$_per_year_aws_s3_std": 4.85
+    }
+  },
+  "break_even": {
+    "gefs": {
+      "own_arco_storage_$_per_year": 14720.0,
+      "gik_$_per_regional_slice": 1.0122,
+      "zarr_$_per_regional_slice": 0.0059,
+      "$_saved_per_slice_if_zarr": 1.0063,
+      "break_even_slices_per_year": 14627.0,
+      "break_even_per_day": 40.1
+    },
+    "ecmwf": {
+      "own_arco_storage_$_per_year": 53841.0,
+      "gik_$_per_regional_slice": 1.9508,
+      "zarr_$_per_regional_slice": 0.004,
+      "$_saved_per_slice_if_zarr": 1.9468,
+      "break_even_slices_per_year": 27656.0,
+      "break_even_per_day": 75.8
+    }
+  }
+}

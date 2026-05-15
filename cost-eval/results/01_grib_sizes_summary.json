@@ -1,0 +1,178 @@
+{
+  "primary": {
+    "gefs": {
+      "runs_probed": [
+        "00",
+        "06",
+        "12",
+        "18"
+      ],
+      "n_objects_probed": 68040,
+      "n_objects_present": 68040,
+      "n_objects_missing": 0,
+      "n_dates_sampled": 7,
+      "dates_sampled": [
+        "20200923",
+        "20201013",
+        "20201102",
+        "20201122",
+        "20201212",
+        "20210101",
+        "20210121"
+      ],
+      "files_per_run": {
+        "00": 17010,
+        "06": 17010,
+        "12": 17010,
+        "18": 17010
+      },
+      "bytes_per_run": {
+        "00": 257813183616,
+        "06": 257532651613,
+        "12": 257332975052,
+        "18": 257528936989
+      },
+      "total_bytes_sampled": 1030207747270,
+      "total_gib_sampled": 959.456,
+      "mean_bytes_per_date_all_runs": 147172535324.2857,
+      "mean_bytes_per_object": 15141207.337889478,
+      "extrapolated_full_archive_bytes": 283159957963925,
+      "extrapolated_full_archive_tib": 257.532,
+      "extrapolated_full_archive_pib": 0.2515,
+      "projection_one_year_tib": 48.856,
+      "archive_window": "2020-09-25..2025-12-31",
+      "archive_n_dates": 1924
+    },
+    "ecmwf": {
+      "runs_probed": [
+        "00",
+        "06",
+        "12",
+        "18"
+      ],
+      "n_objects_probed": 1876,
+      "n_objects_present": 1876,
+      "n_objects_missing": 0,
+      "n_dates_sampled": 7,
+      "dates_sampled": [
+        "20240301",
+        "20240522",
+        "20240813",
+        "20241104",
+        "20250126",
+        "20250419",
+        "20250705"
+      ],
+      "files_per_run": {
+        "00": 595,
+        "06": 343,
+        "12": 595,
+        "18": 343
+      },
+      "bytes_per_run": {
+        "00": 3061639326072,
+        "06": 1767042669528,
+        "12": 3061810922370,
+        "18": 1769064286430
+      },
+      "total_bytes_sampled": 9659557204400,
+      "total_gib_sampled": 8996.164,
+      "mean_bytes_per_date_all_runs": 1379936743485.7144,
+      "mean_bytes_per_object": 5149017699.573561,
+      "extrapolated_full_archive_bytes": 993554455309714,
+      "extrapolated_full_archive_tib": 903.633,
+      "extrapolated_full_archive_pib": 0.8825,
+      "projection_one_year_tib": 458.091,
+      "archive_window": "2024-03-01..2026-02-20",
+      "archive_n_dates": 720
+    }
+  },
+  "recent_check": {
+    "gefs": {
+      "runs_probed": [
+        "00",
+        "06",
+        "12",
+        "18"
+      ],
+      "n_objects_probed": 68040,
+      "n_objects_present": 68040,
+      "n_objects_missing": 0,
+      "n_dates_sampled": 7,
+      "dates_sampled": [
+        "20251201",
+        "20251202",
+        "20251203",
+        "20251204",
+        "20251205",
+        "20251206",
+        "20251207"
+      ],
+      "files_per_run": {
+        "00": 17010,
+        "06": 17010,
+        "12": 17010,
+        "18": 17010
+      },
+      "bytes_per_run": {
+        "00": 311220472353,
+        "06": 310023168223,
+        "12": 310144366011,
+        "18": 310437594531
+      },
+      "total_bytes_sampled": 1241825601118,
+      "total_gib_sampled": 1156.54,
+      "mean_bytes_per_date_all_runs": 177403657302.57144,
+      "mean_bytes_per_object": 18251405.07228101,
+      "extrapolated_full_archive_bytes": 341324636650147,
+      "extrapolated_full_archive_tib": 310.433,
+      "extrapolated_full_archive_pib": 0.3032,
+      "projection_one_year_tib": 58.892,
+      "archive_window": "2020-09-25..2025-12-31",
+      "archive_n_dates": 1924
+    },
+    "ecmwf": {
+      "runs_probed": [
+        "00",
+        "06",
+        "12",
+        "18"
+      ],
+      "n_objects_probed": 1876,
+      "n_objects_present": 1876,
+      "n_objects_missing": 0,
+      "n_dates_sampled": 7,
+      "dates_sampled": [
+        "20251201",
+        "20251202",
+        "20251203",
+        "20251204",
+        "20251205",
+        "20251206",
+        "20251207"
+      ],
+      "files_per_run": {
+        "00": 595,
+        "06": 343,
+        "12": 595,
+        "18": 343
+      },
+      "bytes_per_run": {
+        "00": 3845665148206,
+        "06": 2225988478057,
+        "12": 3842340254240,
+        "18": 2224008328619
+      },
+      "total_bytes_sampled": 12138002209122,
+      "total_gib_sampled": 11304.395,
+      "mean_bytes_per_date_all_runs": 1734000315588.8572,
+      "mean_bytes_per_object": 6470150431.301705,
+      "extrapolated_full_archive_bytes": 1248480227223977,
+      "extrapolated_full_archive_tib": 1135.486,
+      "extrapolated_full_archive_pib": 1.1089,
+      "projection_one_year_tib": 575.628,
+      "archive_window": "2024-03-01..2026-02-20",
+      "archive_n_dates": 720
+    }
+  }
+}

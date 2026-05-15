@@ -1,0 +1,9 @@
+scenario,method,workload,annual_bytes,annual_gib,annual_n_get,annual_$_same_cloud,annual_$_cross_cloud,infrastructure_$_per_year,ergonomics
+gefs_gik_regional_jit_sequential,gik_byte_range,regional_daily_yolo,4095979028480,3814.7,2048015,0.8,369.45,0.0,"single-machine, slow per slice (~min) but trivial setup"
+gefs_gik_regional_jit_dask20,gik_byte_range_dask20,regional_daily_yolo,4095979028480,3814.7,2048015,37.3,405.95,0.0,parquet refs serialise trivially over cloudpickle; Coiled wall ~3 min/slice
+gefs_dynamical_regional_jit,dynamical_zarr_regional,regional_daily_yolo,23346544640,21.74,70080,0.04,2.15,44316.0,"icechunk is dask-native; user free-rides on dynamical's $44,316/yr archive"
+gefs_own_arco_regional_jit,own_arco_zarr_regional,regional_daily_yolo,23346544640,21.74,70080,0.04,2.15,14720.0,you pay the full ARCO storage bill; access cost is identical to dynamical Zarr
+ecmwf_gik_regional_jit_sequential,gik_byte_range,regional_daily_yolo,7911034060800,7367.7,31025,0.0,712.04,0.0,"single-machine, slow per slice (~min) but trivial setup"
+ecmwf_gik_regional_jit_dask20,gik_byte_range_dask20,regional_daily_yolo,7911034060800,7367.7,31025,36.5,748.54,0.0,parquet refs serialise trivially over cloudpickle; Coiled wall ~3 min/slice
+ecmwf_dynamical_regional_jit,dynamical_zarr_regional,regional_daily_yolo,16074670080,14.97,5840,0.0,1.46,11718.0,"icechunk is dask-native; user free-rides on dynamical's $11,718/yr archive"
+ecmwf_own_arco_regional_jit,own_arco_zarr_regional,regional_daily_yolo,16074670080,14.97,5840,0.0,1.46,53841.0,you pay the full ARCO storage bill; access cost is identical to dynamical Zarr

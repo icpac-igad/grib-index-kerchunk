@@ -1,0 +1,176 @@
+# cost-eval/config.yaml
+#
+# Single source of truth for the cost-evaluation harness.
+# All measurement scripts (01..06) and the cost model (07) read from this file.
+# Override on the command line with --config path/to/other.yaml.
+#
+# Editing intent:
+#   - sample.dates           : which forecast cycles to probe with HEAD requests
+#   - workload               : the "analysis slice" that 04/05/06 will time and cost
+#   - pricing.*              : cloud price points (USD); keep dated for traceability
+#   - archive.*              : the full-archive spans we extrapolate to in the report
+
+# ---------------------------------------------------------------------------
+# Sample windows
+# ---------------------------------------------------------------------------
+# Two complementary samples:
+#
+#   primary       : per-product, stratified across the dates available on the
+#                   public HuggingFace mirror (E4DRR/gik-{gefs,ecmwf}-par).
+#                   Used by *both* step 01 (GRIB HEAD) and step 02 (parquet
+#                   size). Apples-to-apples → drives the compression-ratio
+#                   number and the dollar matrix.
+#
+#   recent_check  : a recent 7-date window probed only on S3 by step 01.
+#                   Surfaces current archive volume so we can quote a
+#                   "today" number even though the HF mirror only goes up
+#                   to ~mid-2025 for ECMWF and early-2021 for GEFS.
+#
+# HF mirror windows discovered live (see 02_measure_parquet_sizes.py):
+#   GEFS  HF range: 2020-09-23 .. 2021-01-28 (128 dates)
+#   ECMWF HF range: 2024-03-01 .. 2025-07-06 (493 dates)
+sample:
+  run: "00"
+
+  primary:
+    gefs:
+      # 7 dates evenly spaced across the GEFS HF window (~20-day stride).
+      dates: ["20200923", "20201013", "20201102", "20201122",
+              "20201212", "20210101", "20210121"]
+    ecmwf:
+      # 7 dates evenly spaced across the ECMWF HF window (~82-day stride).
+      dates: ["20240301", "20240522", "20240813", "20241104",
+              "20250126", "20250419", "20250705"]
+
+  recent_check:
+    # Both products probed for current-state GRIB volume.
+    dates: ["20251201", "20251202", "20251203", "20251204",
+            "20251205", "20251206", "20251207"]
+
+# ---------------------------------------------------------------------------
+# Product geometry — verified live against S3 + HF on 2025-12-01.
+# ---------------------------------------------------------------------------
+#
+# Run-cycle asymmetries (this is the part the tex didn't surface):
+#   GEFS  — all four runs (00,06,12,18) publish 30 members × 81 timesteps,
+#           but only 00z parquets are mirrored to HF today.
+#   ECMWF — 00z and 12z run to lead 360h (85 unique steps; S3 also includes
+#           two duplicate files at 240h and 360h → 87 .grib2 objects).
+#           06z and 18z run to lead 144h only (49 .grib2 objects).
+#           All four runs are mirrored as parquets on HF.
+#
+# The `runs` map drives per-run URL generation in step 01 and parquet
+# enumeration in step 02. `parquet_runs` is the subset actually present on
+# the HF mirror today.
+products:
+
+  gefs:
+    s3_bucket: "noaa-gefs-pds"
+    path_template: "gefs.{date}/{run}/atmos/pgrb2sp25/{member}.t{run}z.pgrb2s.0p25.f{step:03d}"
+    members: ["gep01","gep02","gep03","gep04","gep05","gep06","gep07","gep08","gep09","gep10",
+              "gep11","gep12","gep13","gep14","gep15","gep16","gep17","gep18","gep19","gep20",
+              "gep21","gep22","gep23","gep24","gep25","gep26","gep27","gep28","gep29","gep30"]
+    runs:                          # all 4 cycles use the same forecast schedule
+      "00": "default"
+      "06": "default"
+      "12": "default"
+      "18": "default"
+    forecast_hours:
+      default: {start: 0, stop: 240, step: 3}     # 0..240 step 3 → 81 values
+    parquet_runs: ["00"]           # HF mirror currently has 00z only for GEFS
+    parquet_gcs_prefix: "gs://gik-gefs-aws-tf/run_par_gefs"
+
+  ecmwf:
+    s3_bucket: "ecmwf-forecasts"
+    path_template: "{date}/{run}z/ifs/0p25/enfo/{date}{run}0000-{step}h-enfo-ef.grib2"
+    n_members_in_file: 51          # 1 control + 50 ensemble packed per file
+    runs:
+      "00": "long"
+      "06": "short"
+      "12": "long"
+      "18": "short"
+    forecast_hours:
+      long:
+        ranges:
+          - {start: 0,   stop: 144, step: 3}      # 49 values
+          - {start: 150, stop: 360, step: 6}      # 36 values → 85 total
+      short:
+        ranges:
+          - {start: 0, stop: 144, step: 3}        # 49 values
+    parquet_runs: ["00","06","12","18"]
+    parquet_gcs_prefix: "gs://gik-ecmwf-aws-tf/run_par_ecmwf"
+
+# ---------------------------------------------------------------------------
+# Full-archive spans (used by 07/08 to extrapolate from the sample). These are
+# the catalog windows reported in the tex; bump when the public catalog grows.
+# ---------------------------------------------------------------------------
+archive:
+  gefs:
+    start: "2020-09-25"
+    end:   "2025-12-31"
+    n_dates_published: 1924    # tex Table 1
+  ecmwf:
+    start: "2024-03-01"
+    end:   "2026-02-20"
+    n_dates_published: 720     # tex Table 1
+
+# ---------------------------------------------------------------------------
+# Reference workload for the per-slice benchmarks (04/05/06).
+# Keep these small enough to run live without burning hours / dollars.
+# ---------------------------------------------------------------------------
+workload:
+  ecmwf:
+    variables: ["tp","t2m","sp","ssr","ssrd","tcw","tcwv","tcc","u700","v700","sf","ro"]
+    members: 4                 # subset of 51 (sample then extrapolate)
+    forecast_hours: [0, 24, 48, 72, 96, 120, 144, 168, 192]
+    full_members: 51           # what we extrapolate to in the report
+  gefs:
+    variables: ["TMP:2 m above ground", "APCP", "UGRD:10 m above ground", "VGRD:10 m above ground"]
+    members: 4
+    forecast_hours: [0, 24, 48, 72, 96, 120, 144, 168, 192]
+    full_members: 30
+
+# ---------------------------------------------------------------------------
+# Cloud pricing (USD). Prices change; keep `as_of` set when editing.
+# Sources: AWS public price list, GCS public price list (Dec 2025 list).
+# ---------------------------------------------------------------------------
+pricing:
+  as_of: "2025-12-15"
+  currency: "USD"
+
+  storage_per_gb_month:           # $/GB/month
+    aws_s3_standard:        0.023
+    aws_s3_ia:              0.0125
+    aws_s3_glacier_ir:      0.004
+    aws_s3_deep_archive:    0.00099
+    gcs_standard:           0.020
+    gcs_nearline:           0.010
+    gcs_coldline:           0.004
+
+  egress_per_gb:                  # $/GB
+    aws_internet:           0.09
+    aws_cross_region:       0.02
+    aws_same_region:        0.0
+    gcs_internet:           0.12
+    gcs_cross_region:       0.02
+    gcs_same_region:        0.0
+
+  request_per_1000:               # $/1k requests
+    aws_s3_get:             0.0004
+    aws_s3_put:             0.005
+    aws_s3_head:            0.0004     # treated as GET
+    gcs_class_a:            0.005      # PUT, LIST, etc.
+    gcs_class_b:            0.0004     # GET, HEAD
+
+  compute_per_vcpu_hour:          # $/vCPU-hour
+    cloud_run:              0.048      # GCP Cloud Run on-demand
+    aws_lambda_equiv:       0.0517     # rough Lambda-vCPU-hr equiv
+    local_baseline:         0.05       # used in tex for "consumer compute"
+
+# ---------------------------------------------------------------------------
+# Output knobs.
+# ---------------------------------------------------------------------------
+output:
+  results_dir: "results"
+  http_concurrency: 32             # ThreadPoolExecutor max_workers for S3 HEAD
+  request_timeout_s: 30

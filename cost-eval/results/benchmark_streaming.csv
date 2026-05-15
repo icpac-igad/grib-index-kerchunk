@@ -1,0 +1,17 @@
+product,workload,method,source,n_inits,n_messages,bytes_on_wire,mib_on_wire,n_get_requests,note,egress_gb,n_get,vcpu_hours,$_egress_same_cloud,$_egress_cross_cloud,$_get_requests,$_vcpu,$_total_same_cloud,$_total_cross_cloud,chunks_shape,chunk_size_compressed_mb,n_chunks_touched,wall_s,vcpu_s,decoded_values
+gefs,global,gik,analytical,1.0,5611.0,11222000000,10702.13,5611.0,bytes independent of spatial subset (full GRIB message read),11.222,5611.0,0.0,0.0,1.01,0.00224,0.0,0.0022,1.0122,,,,,,
+gefs,regional,gik,analytical,1.0,5611.0,11222000000,10702.13,5611.0,bytes independent of spatial subset (full GRIB message read),11.222,5611.0,0.0,0.0,1.01,0.00224,0.0,0.0022,1.0122,,,,,,
+gefs,pencil,gik,analytical,2052.0,11513772.0,23027544000000,21960777.28,11513772.0,bytes independent of spatial subset (full GRIB message read),23027.544,11513772.0,0.0,0.0,2072.479,4.60551,0.0,4.6055,2077.0845,,,,,,
+gefs,global,zarr,analytical,1.0,,3915820800,3734.42,11610.0,,3.9158,11610.0,0.0,0.0,0.3524,0.00464,0.0,0.0046,0.3571,"[1, 31, 64, 17, 16]",0.337,11610.0,,,
+gefs,regional,zarr,analytical,1.0,,64757760,61.76,192.0,,0.0648,192.0,0.0,0.0,0.0058,8e-05,0.0,0.0001,0.0059,"[1, 31, 64, 17, 16]",0.337,192.0,,,
+gefs,pencil,zarr,analytical,2052.0,,2076295680,1980.11,6156.0,,2.0763,6156.0,0.0,0.0,0.1869,0.00246,0.0,0.0025,0.1893,"[1, 31, 64, 17, 16]",0.337,6156.0,,,
+gefs,regional,zarr,live_1init,,,92479734,88.2,,,,,,,,,,,,,,,15.004,2.58,66664291.0
+gefs,pencil,zarr,live_100inits,,,208827545,199.15,,,,,,,,,,,,,,,9.454,3.599,561100.0
+ecmwf,global,gik,analytical,1.0,4335.0,21675000000,20670.89,85.0,bytes independent of spatial subset (full GRIB message read),21.675,85.0,0.0,0.0,1.9507,3e-05,0.0,0.0,1.9508,,,,,,
+ecmwf,regional,gik,analytical,1.0,4335.0,21675000000,20670.89,85.0,bytes independent of spatial subset (full GRIB message read),21.675,85.0,0.0,0.0,1.9507,3e-05,0.0,0.0,1.9508,,,,,,
+ecmwf,pencil,gik,analytical,774.0,3355290.0,16776450000000,15999269.49,65790.0,bytes independent of spatial subset (full GRIB message read),16776.45,65790.0,0.0,0.0,1509.8805,0.02632,0.0,0.0263,1509.9068,,,,,,
+ecmwf,global,zarr,analytical,1.0,,2871504000,2738.48,1035.0,,2.8715,1035.0,0.0,0.0,0.2584,0.00041,0.0,0.0004,0.2588,"[1, 85, 51, 32, 32]",2.774,1035.0,,,
+ecmwf,regional,zarr,analytical,1.0,,44390400,42.33,16.0,,0.0444,16.0,0.0,0.0,0.004,1e-05,0.0,0.0,0.004,"[1, 85, 51, 32, 32]",2.774,16.0,,,
+ecmwf,pencil,zarr,analytical,774.0,,2147385600,2047.91,774.0,,2.1474,774.0,0.0,0.0,0.1933,0.00031,0.0,0.0003,0.1936,"[1, 85, 51, 32, 32]",2.774,774.0,,,
+ecmwf,regional,zarr,live_1init,,,66969495,63.87,,,,,,,,,,,,,,,5.05,1.302,51504135.0
+ecmwf,pencil,zarr,live_100inits,,,425412995,405.71,,,,,,,,,,,,,,,6.996,2.845,433500.0

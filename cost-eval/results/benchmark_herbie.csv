@@ -1,0 +1,3 @@
+product,mode,file_url,n_bytes_observed,wall_s,vcpu_s,mb_per_s,status
+gefs,B_searchString,https://noaa-gefs-pds.s3.amazonaws.com/gefs.20251201/00/atmos/pgrb2sp25/gep01.t00z.pgrb2s.0p25.f024,,1.687,1.388,,ok
+ecmwf,B_searchString,https://storage.googleapis.com/ecmwf-open-data/20251201/00z/ifs/0p25/enfo/20251201000000-24h-enfo-ef.grib2,,9.575,5.181,,ok

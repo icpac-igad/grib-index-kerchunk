@@ -1,0 +1,87 @@
+{
+  "gefs": {
+    "parquet_runs_mirrored": [
+      "00"
+    ],
+    "n_parquets_expected": 210,
+    "n_parquets_present": 210,
+    "n_parquets_missing": 0,
+    "n_dates_sampled": 7,
+    "n_dates_with_data": 7,
+    "dates_with_data": [
+      "20200923",
+      "20201013",
+      "20201102",
+      "20201122",
+      "20201212",
+      "20210101",
+      "20210121"
+    ],
+    "files_per_run": {
+      "00": 210
+    },
+    "bytes_per_run": {
+      "00": 54220582
+    },
+    "total_bytes_sampled": 54220582,
+    "total_mib_sampled": 51.709,
+    "mean_bytes_per_parquet": 258193.24761904762,
+    "mean_bytes_per_date_mirrored_runs": 7745797.428571428,
+    "extrapolated_full_archive_bytes": 14902914252,
+    "extrapolated_full_archive_gib": 13.879,
+    "matched_grib_bytes": 257813183616,
+    "matched_parquet_bytes": 54220582,
+    "compression_ratio": 4754.9,
+    "compression_note": "GRIB bytes for runs ['00'] (from step 01 primary, same dates) \u00f7 parquet bytes for the same runs.",
+    "template_tarball": "gik-fmrc-gefs-20241112.tar.gz",
+    "template_bytes": 3251745,
+    "template_mib": 3.101
+  },
+  "ecmwf": {
+    "parquet_runs_mirrored": [
+      "00",
+      "06",
+      "12",
+      "18"
+    ],
+    "n_parquets_expected": 1428,
+    "n_parquets_present": 1377,
+    "n_parquets_missing": 51,
+    "n_dates_sampled": 7,
+    "n_dates_with_data": 7,
+    "dates_with_data": [
+      "20240301",
+      "20240522",
+      "20240813",
+      "20241104",
+      "20250126",
+      "20250419",
+      "20250705"
+    ],
+    "files_per_run": {
+      "00": 357,
+      "06": 357,
+      "12": 357,
+      "18": 306
+    },
+    "bytes_per_run": {
+      "00": 51986424,
+      "06": 36264907,
+      "12": 51974106,
+      "18": 30602741
+    },
+    "total_bytes_sampled": 170828178,
+    "total_mib_sampled": 162.914,
+    "mean_bytes_per_parquet": 124058.22657952069,
+    "mean_bytes_per_date_mirrored_runs": 24404025.42857143,
+    "extrapolated_full_archive_bytes": 17570898308,
+    "extrapolated_full_archive_gib": 16.364,
+    "matched_grib_bytes": 9659557204400,
+    "matched_parquet_bytes": 170828178,
+    "compression_ratio": 56545.5,
+    "compression_note": "GRIB bytes for runs ['00', '06', '12', '18'] (from step 01 primary, same dates) \u00f7 parquet bytes for the same runs.",
+    "template_tarball": "gik-fmrc-v2ecmwf_fmrc.tar.gz",
+    "template_bytes": 126558882,
+    "template_mib": 120.696
+  }
+}

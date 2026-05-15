@@ -1,0 +1,168 @@
+{
+  "gefs": {
+    "bench_date": "20251201",
+    "bench_fxx": 24,
+    "workload": {
+      "variables": [
+        "TMP:2 m above ground",
+        "APCP",
+        "UGRD:10 m above ground",
+        "VGRD:10 m above ground"
+      ],
+      "members": 4,
+      "forecast_hours": [
+        0,
+        24,
+        48,
+        72,
+        96,
+        120,
+        144,
+        168,
+        192
+      ],
+      "full_members": 30
+    },
+    "mode_A": {
+      "extrapolation": {
+        "n_steps": 9,
+        "n_files": 270,
+        "n_members": 30,
+        "n_vars": 4,
+        "mean_file_size_bytes": 18251405,
+        "bytes_on_wire": 4927879369,
+        "gib_on_wire": 4.589,
+        "observed_bandwidth_mbps": 100.0,
+        "download_s_modelled": 49.28,
+        "decode_s_modelled": 540.0,
+        "wall_s_modelled": 589.28,
+        "n_get_requests": 270
+      },
+      "cost": {
+        "egress_gb": 4.928,
+        "n_get": 270,
+        "vcpu_hours": 0.1637,
+        "$_egress_same_cloud": 0.0,
+        "$_egress_cross_cloud": 0.4435,
+        "$_get_requests": 0.0001,
+        "$_vcpu": 0.0082,
+        "$_total_same_cloud": 0.0083,
+        "$_total_cross_cloud": 0.4518
+      }
+    },
+    "mode_B": {
+      "extrapolation": {
+        "n_steps": 9,
+        "n_files": 270,
+        "n_members": 30,
+        "n_vars": 4,
+        "msg_mean_mb_assumed": 2.0,
+        "n_messages": 1080,
+        "n_get_requests": 1080,
+        "bytes_on_wire": 2160000000,
+        "gib_on_wire": 2.012,
+        "download_s_modelled": 21.6,
+        "decode_s_modelled": 54.0,
+        "wall_s_modelled": 75.6
+      },
+      "cost": {
+        "egress_gb": 2.16,
+        "n_get": 1080,
+        "vcpu_hours": 0.021,
+        "$_egress_same_cloud": 0.0,
+        "$_egress_cross_cloud": 0.1944,
+        "$_get_requests": 0.0004,
+        "$_vcpu": 0.001,
+        "$_total_same_cloud": 0.0015,
+        "$_total_cross_cloud": 0.1959
+      }
+    }
+  },
+  "ecmwf": {
+    "bench_date": "20251201",
+    "bench_fxx": 24,
+    "workload": {
+      "variables": [
+        "tp",
+        "t2m",
+        "sp",
+        "ssr",
+        "ssrd",
+        "tcw",
+        "tcwv",
+        "tcc",
+        "u700",
+        "v700",
+        "sf",
+        "ro"
+      ],
+      "members": 4,
+      "forecast_hours": [
+        0,
+        24,
+        48,
+        72,
+        96,
+        120,
+        144,
+        168,
+        192
+      ],
+      "full_members": 51
+    },
+    "mode_A": {
+      "extrapolation": {
+        "n_steps": 9,
+        "n_files": 9,
+        "n_members": 51,
+        "n_vars": 12,
+        "mean_file_size_bytes": 6470150431,
+        "bytes_on_wire": 58231353881,
+        "gib_on_wire": 54.232,
+        "observed_bandwidth_mbps": 100.0,
+        "download_s_modelled": 582.31,
+        "decode_s_modelled": 18.0,
+        "wall_s_modelled": 600.31,
+        "n_get_requests": 9
+      },
+      "cost": {
+        "egress_gb": 58.231,
+        "n_get": 9,
+        "vcpu_hours": 0.1668,
+        "$_egress_same_cloud": 0.0,
+        "$_egress_cross_cloud": 5.2408,
+        "$_get_requests": 0.0,
+        "$_vcpu": 0.0083,
+        "$_total_same_cloud": 0.0083,
+        "$_total_cross_cloud": 5.2492
+      }
+    },
+    "mode_B": {
+      "extrapolation": {
+        "n_steps": 9,
+        "n_files": 9,
+        "n_members": 51,
+        "n_vars": 12,
+        "msg_mean_mb_assumed": 5.0,
+        "n_messages": 5508,
+        "n_get_requests": 108,
+        "bytes_on_wire": 27540000000,
+        "gib_on_wire": 25.649,
+        "download_s_modelled": 275.4,
+        "decode_s_modelled": 275.4,
+        "wall_s_modelled": 550.8
+      },
+      "cost": {
+        "egress_gb": 27.54,
+        "n_get": 108,
+        "vcpu_hours": 0.153,
+        "$_egress_same_cloud": 0.0,
+        "$_egress_cross_cloud": 2.4786,
+        "$_get_requests": 0.0,
+        "$_vcpu": 0.0077,
+        "$_total_same_cloud": 0.0077,
+        "$_total_cross_cloud": 2.4863
+      }
+    }
+  }
+}

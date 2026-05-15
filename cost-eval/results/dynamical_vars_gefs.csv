@@ -1,0 +1,23 @@
+name,dtype,shape,nbytes_uncompressed
+categorical_freezing_rain_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+categorical_ice_pellets_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+categorical_rain_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+categorical_snow_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+geopotential_height_500hpa,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+geopotential_height_cloud_ceiling,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+downward_long_wave_radiation_flux_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+downward_short_wave_radiation_flux_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+minimum_temperature_2m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+percent_frozen_precipitation_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+precipitable_water_atmosphere,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+maximum_temperature_2m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+precipitation_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+pressure_reduced_to_mean_sea_level,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+pressure_surface,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+wind_u_100m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+wind_u_10m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+relative_humidity_2m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+total_cloud_cover_atmosphere,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+temperature_2m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+wind_v_100m,float32,"[2052, 31, 181, 721, 1440]",47816234565120
+wind_v_10m,float32,"[2052, 31, 181, 721, 1440]",47816234565120

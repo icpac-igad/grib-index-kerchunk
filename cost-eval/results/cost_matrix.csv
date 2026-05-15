@@ -1,0 +1,17 @@
+product,method,workload,n_inits,bytes_on_wire,gib_on_wire,n_get,wall_s,$_same_cloud,$_cross_cloud,source
+gefs,herbie_mode_A,full_operational_slice_1init,1,4927879369,4.589,270,589.28,0.0083,0.4518,step04_analytical_w_live_b_calibration
+gefs,herbie_mode_B,full_operational_slice_1init,1,2160000000,2.012,1080,75.6,0.0015,0.1959,step04_analytical_w_live_b_calibration
+ecmwf,herbie_mode_A,full_operational_slice_1init,1,58231353881,54.232,9,600.31,0.0083,5.2492,step04_analytical_w_live_b_calibration
+ecmwf,herbie_mode_B,full_operational_slice_1init,1,27540000000,25.649,108,550.8,0.0077,2.4863,step04_analytical_w_live_b_calibration
+gefs,gik,global_1var,,11221996666,10.451,5611,,0.0022,1.0122,step05_analytical
+gefs,zarr,global_1var,,3915823185,3.647,11610,,0.0046,0.3571,step05_analytical
+gefs,gik,regional_1var,,11221996666,10.451,5611,,0.0022,1.0122,step05_analytical
+gefs,zarr,regional_1var,,64760053,0.06,192,,0.0001,0.0059,step05_analytical
+gefs,gik,pencil_1var,all_archive,23027543997153,21446.072,11513772,,4.6055,2077.0845,step05_analytical
+gefs,zarr,pencil_1var,all_archive,2076295823,1.934,6156,,0.0025,0.1893,step05_analytical
+ecmwf,gik,global_1var,,21674999152,20.186,85,,0.0,1.9508,step05_analytical
+ecmwf,zarr,global_1var,,2871504404,2.674,1035,,0.0004,0.2588,step05_analytical
+ecmwf,gik,regional_1var,,21674999152,20.186,85,,0.0,1.9508,step05_analytical
+ecmwf,zarr,regional_1var,,44386222,0.041,16,,0.0,0.004,step05_analytical
+ecmwf,gik,pencil_1var,all_archive,16776450004746,15624.287,65790,,0.0263,1509.9068,step05_analytical
+ecmwf,zarr,pencil_1var,all_archive,2147389276,2.0,774,,0.0003,0.1936,step05_analytical
