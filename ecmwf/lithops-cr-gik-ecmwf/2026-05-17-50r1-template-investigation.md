@@ -110,3 +110,48 @@ template (an earlier premature edit was reverted).
 `service_account/*.json` and `ecmwf/coiled-data.json` were **not**
 gitignored (SETUP_NEW_MACHINE.md wrongly states they are). `.gitignore`
 hardened in this commit; staging is always explicit, never `git add -A`.
+
+## 7. CRUCIAL MISSING PIECE — the real packaging step (found 2026-05-17)
+
+The builder restructure (`utils_ecmwf_step1_scangrib.py`, commit c8d71e7;
+synced to the production dev-test copy in 7bac214 — the two were
+byte-identical duplicates and editing only `ecmwf/` silently no-ops the
+production chain) is correct for the **scan/idx-join** layer (+10 hPa,
+enfo/oper-fc split, `ecmwf_scan_grib_50r1_one_pass`; 11/11 index-validated).
+
+The orchestrator `build_ecmwf_50r1_template.py` was then built on
+`fixed_ensemble_grib_tree` + `extract_member_refs`. The cheap **hour-0
+checkpoint** (2026-05-13 00z, 14.2 min) caught — before any 2 h run — that
+this produces the **wrong artifact**: ~375-row bare grib_tree skeleton, not
+consolidated, key style `asn/instant/surface/.zattrs`, all 51 members
+identical — vs the live production template's ~2774-row **consolidated**
+zarr (`metadata` + `zarr_consolidated_format`), key style
+`cape/entireAtmosphere/0.0/.zarray`, ~1386 `.zarray`/member.
+
+Git history (Oct 2025–Feb 2026, per user recollection) located the true
+producer. The ECMWF template is built by this chain:
+
+  notebook `99o-coiled-function-ecmwf-scan_grib_store_fmrc.ipynb`
+    → per-hour, ALL-51-members scan dump `e_sg_mdt_{date}_{hr}.parquet`
+  → **`ecmwf/dev-test/ecmwf_par_to_ensemble_members.py`**
+    (class `ECMWFParquetProcessor`): parse `.index` (idx→member),
+    split per member, `grib_tree`+`strip_datavar_chunks` per member,
+    write `ensemble_members/{H}h/{control|ensNN}.par`
+  → packaged `v2ecmwf_fmrc/ens_{NN}/ecmwf-{date}00-{m}-rt{hhh}.par`
+  → tar.gz → HuggingFace.
+
+Key commits: `7a9a796` (2025-11-12, moved to dev-test);
+**`e013256` "gik method update for ecmwf 85 steps" (2025-12-01)** — the
+85-step rework (also rewrote `ecmwf_util.py`,
+`utils_ecmwf_step1_scangrib.py`, the creators; added
+`read_stage3_aifs_all_timesteps.py`).
+
+**Consequence for the 50r1 rebuild:** the packaging layer must be reworked
+onto `ecmwf_par_to_ensemble_members.py`, NOT
+`fixed_ensemble_grib_tree`/`extract_member_refs`. That script's
+`parse_index_file` already maps a missing `number` → -1 (control); for 50r1
+it needs the dual-stream split (perturbed 1..50 from `enfo/ef`; control from
+the separate `oper/fc` file). `build_ecmwf_50r1_template.py` is superseded
+(kept as WIP scaffold; its one-pass scanner remains reusable). Re-validate a
+corrected hour-0 build *against the live 2774-key consolidated structure*
+before authorizing the full ~2 h run.
