@@ -1,0 +1,12 @@
+# --- Secrets / service-account credentials (NEVER commit) ---
+**/service_account/*.json
+**/coiled-data.json
+**/*-key.json
+*-deployer-key.json
+gcp-*-key.json
+
+# --- Notebook / tooling noise ---
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+__pycache__/
+*.pyc
