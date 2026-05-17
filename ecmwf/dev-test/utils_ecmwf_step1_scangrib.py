@@ -132,16 +132,18 @@ def ecmwf_idx_unique_dict(edf):
     """
     Extract unique parameter combinations from ECMWF index dataframe.
 
-    FIXED: Now includes ALL pressure levels (50, 100, 150, 200, 250, 300, 400, 500,
-    600, 700, 850, 925, 1000) and ALL soil levels (1, 2, 4), not just level 50.
+    Includes ALL pressure levels and ALL soil levels (1, 2, 4).
+
+    50r1 (2026-05-12 06z+): the ENS gained a new **10 hPa** pressure level
+    (13 -> 14 levels). It MUST be in this allowlist or every parquet silently
+    drops the 10 hPa data. Keeps the older 13 levels for <=49r compatibility.
     """
     # Fill empty rows or missing values in 'levelist' with 'null'
     edf['levelist'] = edf['levelist'].fillna('null')
 
-    # FIXED: Include ALL pressure levels and soil levels, not just 50!
-    # Define the levels we want to extract
-    pressure_levels = ['50', '100', '150', '200', '250', '300', '400', '500',
-                      '600', '700', '850', '925', '1000']
+    # 50r1: '10' added (new top pressure level). Order irrelevant (used as a set).
+    pressure_levels = ['10', '50', '100', '150', '200', '250', '300', '400',
+                       '500', '600', '700', '850', '925', '1000']
     soil_levels = ['1', '2', '4']
 
     # Filter for:
@@ -173,10 +175,18 @@ def ecmwf_idx_unique_dict(edf):
     return combined_dict
 
 
-def ecmwf_duplicate_dict_ens_mem(var_dict):
-    # Generate sequence for ensemble members 1-50, with control (-1) at the start
-    ens_numbers = np.arange(1, 51)
-    ens_numbers = np.insert(ens_numbers, 0, -1)
+def ecmwf_duplicate_dict_ens_mem(var_dict, ens_numbers=None):
+    """Expand the unique-var dict across ensemble members.
+
+    50r1 stream split:
+      - enfo/ef (perturbed)  -> ens_numbers = 1..50 (NO control; 49r had -1
+        bundled here, 50r1 does not).
+      - oper/fc (control)    -> ens_numbers = [-1] (single forecast; the
+        control moved to its own open-data stream in 50r1).
+    Default = perturbed 1..50.
+    """
+    if ens_numbers is None:
+        ens_numbers = np.arange(1, 51)
     updated_data_dict = var_dict.copy()
     for ens_number in ens_numbers:
         for key, subdict in var_dict.items():
@@ -204,7 +214,14 @@ def ecmwf_get_matching_indices(filter_dict, df):
     return final_df.index.tolist()
 
 
-def ecmwf_idx_df_create_with_keys(ecmwf_s3url):
+def ecmwf_idx_df_create_with_keys(ecmwf_s3url, is_control=False):
+    """Build {idx_line -> member_key} for one GRIB file.
+
+    is_control=True  -> oper/fc stream: a single deterministic forecast with
+                        NO `number` field (s3_parse_ecmwf_grib_idx defaults it
+                        to -1), so expand to the single control member [-1].
+    is_control=False -> enfo/ef stream: perturbed members 1..50.
+    """
     fs = fsspec.filesystem("s3", anon=True)
     suffix = 'index'
     idx_file_index = s3_parse_ecmwf_grib_idx(fs=fs,
@@ -216,7 +233,8 @@ def ecmwf_idx_df_create_with_keys(ecmwf_s3url):
     ],
                     axis=1)
     combined_dict = ecmwf_idx_unique_dict(edf)
-    all_em = ecmwf_duplicate_dict_ens_mem(combined_dict)
+    ens_numbers = np.array([-1]) if is_control else np.arange(1, 51)
+    all_em = ecmwf_duplicate_dict_ens_mem(combined_dict, ens_numbers=ens_numbers)
     idx_mapping = {}
     for ens_key, conditions in all_em.items():
         mask = True
@@ -231,10 +249,14 @@ def ecmwf_idx_df_create_with_keys(ecmwf_s3url):
     return idx_mapping, combined_dict
 
 
-def ecmwf_filter_scan_grib(ecmwf_s3url):
+def ecmwf_filter_scan_grib(ecmwf_s3url, is_control=False):
     """
     Scan an ECMWF GRIB file, add ensemble information to the Zarr references,
     and return a list of modified groups along with an index mapping.
+
+    is_control=True for the 50r1 oper/fc control file (single member -1);
+    False for the enfo/ef perturbed file (members 1..50). The control key is
+    `..._ens-1`, so the `'ens' in ens_key` parse below yields ens_number=-1.
     """
     # Use anonymous access for S3
     storage_options = {"anon": True}
@@ -242,7 +264,8 @@ def ecmwf_filter_scan_grib(ecmwf_s3url):
     print(
         f"Completed scan_grib for {ecmwf_s3url}, found {len(esc_groups)} messages"
     )
-    idx_mapping, _ = ecmwf_idx_df_create_with_keys(ecmwf_s3url)
+    idx_mapping, _ = ecmwf_idx_df_create_with_keys(ecmwf_s3url,
+                                                   is_control=is_control)
     print(f"Found {len(idx_mapping)} matching indices")
     modified_groups = []
     for i, group in enumerate(esc_groups):
@@ -320,10 +343,20 @@ def ecmwf_filter_scan_grib(ecmwf_s3url):
     return modified_groups, idx_mapping
 
 
-def organize_ensemble_tree(original_tree):
+def organize_ensemble_tree(original_tree, member_numbers=None):
     """
-    Reorganize the original Zarr tree by adding ensemble dimensions to the attributes.
+    Reorganize the original Zarr tree by adding ensemble dimensions.
+
+    50r1: the `number` coordinate is no longer a hardcoded 51 incl. control.
+    Pass `member_numbers` explicitly:
+      - perturbed enfo tree -> np.arange(1, 51)  (50 members)  [default]
+      - control oper/fc tree -> np.array([-1])   (single member)
+    All shape/chunk insertions for the `number` dim use len(member_numbers).
     """
+    if member_numbers is None:
+        member_numbers = np.arange(1, 51, dtype=np.int64)
+    member_numbers = np.asarray(member_numbers, dtype=np.int64)
+    n_members = len(member_numbers)
     ensemble_tree = copy.deepcopy(original_tree)
     attrs_keys = [k for k in ensemble_tree['refs'] if k.endswith('/.zattrs')]
     for key in attrs_keys:
@@ -359,17 +392,16 @@ def organize_ensemble_tree(original_tree):
             "1"
         })
         ensemble_tree['refs']['number/.zarray'] = json.dumps({
-            "chunks": [51],
+            "chunks": [n_members],
             "compressor": None,
             "dtype": "<i8",
             "fill_value": None,
             "filters": None,
             "order": "C",
-            "shape": [51],
+            "shape": [n_members],
             "zarr_format": 2
         })
-        numbers = np.arange(-1, 50, dtype=np.int64)
-        ensemble_tree['refs']['number/0'] = numbers.tobytes().decode('latin1')
+        ensemble_tree['refs']['number/0'] = member_numbers.tobytes().decode('latin1')
     array_keys = [k for k in ensemble_tree['refs'] if k.endswith('/.zarray')]
     for key in array_keys:
         try:
@@ -388,15 +420,15 @@ def organize_ensemble_tree(original_tree):
                     number_index = attrs['_ARRAY_DIMENSIONS'].index('number')
                     shape = array_def['shape']
                     if number_index < len(shape):
-                        shape.insert(number_index, 51)
+                        shape.insert(number_index, n_members)
                     elif number_index == len(shape):
-                        shape.append(51)
+                        shape.append(n_members)
                     if 'chunks' in array_def and array_def['chunks']:
                         chunks = array_def['chunks']
                         if number_index < len(chunks):
-                            chunks.insert(number_index, 51)
+                            chunks.insert(number_index, n_members)
                         elif number_index == len(chunks):
-                            chunks.append(51)
+                            chunks.append(n_members)
                     ensemble_tree['refs'][key] = json.dumps(array_def)
         except json.JSONDecodeError:
             print(f"Error parsing array definition for {key}")
@@ -662,6 +694,39 @@ def fixed_ensemble_grib_tree(message_groups: Iterable[Dict],
     }
 
     return {"refs": zarr_store, "version": 1}
+
+
+def ecmwf_scan_grib_50r1_one_pass(date_str, run, hour,
+                                  s3_bucket="ecmwf-forecasts"):
+    """50r1 one-pass scan for a single (date, run, hour) across BOTH streams.
+
+    IFS Cycle 50r1 (live 2026-05-12 06z) split the ENS open data:
+      - perturbed members 1..50  -> stream=enfo, type=ef  (50 members)
+      - ENS control               -> stream=oper, type=fc  (single forecast,
+        moved out of enfo/cf; superset schema with extra z/sdor/slor)
+
+    This scans the enfo/ef file (perturbed, members 1..50) and the oper/fc
+    file (control, member -1) for the same forecast hour and returns the
+    combined list of member-tagged scan_grib groups (Option A: keep 51).
+
+    Returns
+    -------
+    (all_groups, idx_mappings)
+        all_groups : list[dict]  -- 50 perturbed + 1 control, each group
+                     tagged with its ensemble_member in refs['.zattrs'].
+        idx_mappings : {'enfo': {...}, 'oper': {...}}
+    """
+    base = f"s3://{s3_bucket}/{date_str}/{run}z/ifs/0p25"
+    enfo_url = f"{base}/enfo/{date_str}{run}0000-{hour}h-enfo-ef.grib2"
+    oper_url = f"{base}/oper/{date_str}{run}0000-{hour}h-oper-fc.grib2"
+
+    pert_groups, pert_map = ecmwf_filter_scan_grib(enfo_url, is_control=False)
+    ctrl_groups, ctrl_map = ecmwf_filter_scan_grib(oper_url, is_control=True)
+    print(
+        f"50r1 one-pass {date_str} {run}z {hour}h: "
+        f"{len(pert_groups)} perturbed + {len(ctrl_groups)} control groups"
+    )
+    return pert_groups + ctrl_groups, {"enfo": pert_map, "oper": ctrl_map}
 
 
 def analyze_grib_tree_output(original_tree, ensembe_tree):
