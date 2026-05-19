@@ -3,6 +3,9 @@
 [![v1.0](https://img.shields.io/badge/release-v1.0.0-blue)](https://github.com/icpac-igad/grib-index-kerchunk/releases/tag/v1.0.0)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
+
+CASE STUDY: [preprint](https://drive.google.com/file/d/1-BUnCVNU5EWdytSlZrria5N6e4cK_H8v/view?usp=drive_link)
+
 GIK turns multi-GB GRIB files into ~140 KB virtual references — enabling
 xarray analysis and Dask-cluster ensemble work without ever downloading the
 raw GRIBs. Based on the
