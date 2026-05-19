@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 
-CASE STUDY: [preprint](https://drive.google.com/file/d/1-BUnCVNU5EWdytSlZrria5N6e4cK_H8v/view?usp=drive_link)
+CASE STUDY: [preprint](https://drive.google.com/file/d/1iujfnMabQ60RAKtEJC2qhhsylYe2de40/view?usp=sharing)
 
 GIK turns multi-GB GRIB files into ~140 KB virtual references — enabling
 xarray analysis and Dask-cluster ensemble work without ever downloading the
