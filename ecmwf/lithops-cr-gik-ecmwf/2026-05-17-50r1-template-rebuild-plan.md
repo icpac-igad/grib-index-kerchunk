@@ -86,32 +86,70 @@ run ≥ 2026-05-12 06z.
   logic needed unless we must *re-backfill* a 49r date later (then run the
   old image/commit).
 
-## 3. Build & deploy steps
+## 3. Build & deploy steps  (CORRECTED — validated chain)
 
-1. **Env**: `uv run --with kerchunk==0.2.7 --with cfgrib --with eccodes
-   --with s3fs --with zarr==2.18.7 --with pandas --with numpy` (verified
-   buildable; eccodes 2.46.2).
-2. **Scan**: run the scan_grib Stage-1 builder for **2026-05-13 00z** across
-   **all 85 forecast hours** (the deflated store's `step`/`valid_time` coords
-   need the full forecast structure — single-file scan is NOT sufficient for
-   the template, only for the §4 smoke test). This is the ~2 hr / 9-worker
-   Coiled job (`99o-…ipynb` is the parallel front-end; or run
-   `ecmwf_three_stage_multidate.py` Stage-1 path on a big VM).
-   Prereq for the notebook: reassemble `utils.py` (≈ `ecmwf/dev-test/fmrc_utils.py`)
-   and `dynamic_zarr_store.py`; `coiled-data.json` already in `ecmwf/`.
-3. **Per-member deflated stores** → `gs://gik-ecmwf-aws-tf/v2ecmwf_fmrc/ens_{NN}/
-   ecmwf-2026051300-{member}-rt000.par` (50 members, no `ens_control`).
-4. **Package** (manual — no repo script does this):
-   `tar czf gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz gik-fmrc/v2ecmwf_fmrc/`.
-5. **Upload** to HF template repo `E4DRR/grib-index-kerchunk-templates`
-   (needs HF write token).
-6. **Patch** `run_lithops_ecmwf.py` (§2.2), rebuild Cloud Run runtime image
-   (template baked in), redeploy (`cloudbuild.yaml` + `lithops runtime
-   deploy`), per `SETUP_NEW_MACHINE.md §5`.
-7. **Reprocess** 2026-05-12 06z → present (all run hours) via the gap-backfill
-   driver **with the cleanup-hang watchdog** ([[ecmwf-lithops-cleanup-hang]]).
-8. **Re-mirror** to HF `E4DRR/gik-ecmwf-par` (`upload_parquets_to_hf.py`,
-   needs `ecmwf/coiled-data.json` + HF token).
+The real chain is **notebook-scan → `ecmwf_par_to_ensemble_members.py`**
+(NOT `fixed_ensemble_grib_tree`/`build_ecmwf_50r1_template.py`, which yields a
+wrong 375-key skeleton — see §4 / §7 of the investigation MD). Code for steps
+1–2 is done, committed on branch `ecmwf-50r1-template`, and index-validated
+(no scan, no cost): builder restructure `c8d71e7`+`7bac214`, dual-stream
+packaging + Coiled driver `1421667`, Coiled config pinned `040ad86`.
+
+Status legend: ✅ done & validated · ▶ run-later (gated/expensive) · ✋ user-only
+
+**▶✋ Step 1 — Coiled scan (170 tasks, ~2 h, PAID). User runs it; the
+assistant has no Coiled auth.** Coiled config follows the notebook:
+software `gik-coiled-v6`, workspace `gcp-sewaa-nka`, `n2-standard-2`,
+`us-east1`, `arm=False`, `idle_timeout=30m`, `cluster.adapt(1,9)`.
+Prereq in `ecmwf/dev-test/`: `coiled login` done; `coiled-data.json`,
+`fmrc_utils.py`, `dynamic_zarr_store.py` present; `coiled env list` shows
+`gik-coiled-v6`.
+
+```bash
+cd ecmwf/dev-test
+# free preview:
+python3 ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 --dry-run
+# real scan (~2 h, paid):
+python3 ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 \
+    --software gik-coiled-v6 --workspace gcp-sewaa-nka --max-workers 9
+# -> GCS gs://gik-ecmwf-aws-tf/fmrc/scan_grib20260513/
+#    e_sg_mdt_20260513_{enfo|oper}_{h}h.parquet   (170 dumps)
+```
+
+**▶ Step 2 — per-member split (cheap, no scan_grib).** Pull the 170 dumps
+locally (or point at GCS), then:
+
+```bash
+cd ecmwf/dev-test
+python3 ecmwf_par_to_ensemble_members.py \
+    --input-dir <dir-with-170-dumps> --output-dir ./ensemble_members_50r1 \
+    --run 00
+# enfo dumps -> ens01..ens50 ; oper dumps -> control ; into {H}h/{m}.par
+```
+**GATE:** before trusting, diff one `control` rt000 vs the live 49r
+`/tmp/ins/.../ecmwf-2024052900-control-rt000.par` — expect the consolidated
+~2774-key shape (`zarr_consolidated_format`/`metadata`, `var/levtype/idx`),
+NOT a 375-key grib_tree skeleton. (Assistant can do this step + gate.)
+
+**▶ Step 3 — package & rename to the template layout** →
+`gik-fmrc/v2ecmwf_fmrc/{ens_control|ens_NN}/ecmwf-2026051300-{m}-rt{hhh}.par`
+then `tar czf gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz gik-fmrc/`.
+
+**▶✋ Step 4 — upload** to HF `E4DRR/grib-index-kerchunk-templates`
+(new name `…-50r1.tar.gz`; keep the 49r tar.gz for ≤2026-05-12-00z history).
+Needs HF write token.
+
+**▶ Step 5 — wire `run_lithops_ecmwf.py`** (§2 + §2.0 decision-A):
+`REFERENCE_DATE→20260513`, `TEMPLATE_URL`/`ECMWF_TEMPLATE_PATH`→ the new
+artifact, control via `oper/fc` in Stage 2 (`OPER_STREAM`), keep `ens_control`.
+Rebuild/redeploy Cloud Run runtime (`cloudbuild.yaml` + `lithops runtime
+deploy`, `SETUP_NEW_MACHINE.md §5`).
+
+**▶ Step 6 — reprocess** 2026-05-12 06z → present (all run hours) via the
+gap-backfill driver **with the cleanup-hang watchdog**
+([[ecmwf-lithops-cleanup-hang]]); then **re-mirror** to HF
+`E4DRR/gik-ecmwf-par` (`upload_parquets_to_hf.py`, needs `ecmwf/coiled-data.json`
++ HF token).
 
 ## 4. Dry-run RESULTS (2026-05-17, 20260513 00z 0h) — decisive
 
