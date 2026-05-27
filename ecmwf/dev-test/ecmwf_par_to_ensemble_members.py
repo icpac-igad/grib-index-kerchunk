@@ -42,17 +42,20 @@ ENSEMBLE_MEMBERS_TOTAL = 51  # Control (-1) + 50 perturbed members (1-50)
 class ECMWFParquetProcessor:
     """Process ECMWF scan_grib parquet files to create individual ensemble member files."""
 
-    def __init__(self, input_dir: str, output_base_dir: str):
+    def __init__(self, input_dir: str, output_base_dir: str, run: str = "00"):
         """
         Initialize the processor.
 
         Args:
             input_dir: Directory containing scan_grib parquet files
             output_base_dir: Base directory for output ensemble member files
+            run: model run hour (00/06/12/18) — used to reconstruct the
+                 GRIB/.index S3 URI when the dump has no uri column.
         """
         self.input_dir = Path(input_dir)
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
+        self.run = run
 
     def log(self, message: str, level: str = "INFO"):
         """Log message with timestamp."""
@@ -63,20 +66,21 @@ class ECMWFParquetProcessor:
         """
         Parse parquet filename to extract metadata.
 
-        Example: e_sg_mdt_20240529_0h.parquet
+        50r1 format:  e_sg_mdt_20260513_enfo_0h.parquet  (stream-tagged)
+        legacy format: e_sg_mdt_20240529_0h.parquet      (stream -> 'enfo')
 
         Returns:
-            Dict with date and forecast_hour, or None if parse fails
+            Dict with date, stream, forecast_hour, or None if parse fails
         """
-        pattern = r'e_sg_mdt_(\d{8})_(\d+)h\.parquet'
-        match = re.search(pattern, filename)
-
-        if match:
-            return {
-                'date': match.group(1),
-                'forecast_hour': int(match.group(2)),
-                'filename': filename
-            }
+        m = re.search(r'e_sg_mdt_(\d{8})_(enfo|oper)_(\d+)h\.parquet', filename)
+        if m:
+            return {'date': m.group(1), 'stream': m.group(2),
+                    'forecast_hour': int(m.group(3)), 'filename': filename}
+        # legacy (pre-50r1, no stream tag) -> enfo perturbed dump
+        m = re.search(r'e_sg_mdt_(\d{8})_(\d+)h\.parquet', filename)
+        if m:
+            return {'date': m.group(1), 'stream': 'enfo',
+                    'forecast_hour': int(m.group(2)), 'filename': filename}
         return None
 
     def extract_ensemble_number(self, group: Dict) -> int:
@@ -128,13 +132,23 @@ class ECMWFParquetProcessor:
                 break
 
         if grib_uri is None:
-            # If no URI found, we need to reconstruct it from filename info
+            # Reconstruct from filename — 50r1 stream-aware:
+            #   enfo -> .../enfo/{ts}-{h}h-enfo-ef.grib2  (perturbed 1..50)
+            #   oper -> .../oper/{ts}-{h}h-oper-fc.grib2  (control; .index has
+            #           no `number` so parse_index_file yields -1 = control)
             file_info = self.parse_filename(parquet_path.name)
             if file_info:
                 date_str = file_info['date']
                 forecast_hour = file_info['forecast_hour']
-                # Construct likely ECMWF S3 path
-                grib_uri = f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-{forecast_hour}h-enfo-ef.grib2"
+                stream = file_info.get('stream', 'enfo')
+                run = self.run
+                ts = f"{date_str}{run}0000"
+                if stream == 'oper':
+                    grib_uri = (f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/"
+                                f"oper/{ts}-{forecast_hour}h-oper-fc.grib2")
+                else:
+                    grib_uri = (f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/"
+                                f"enfo/{ts}-{forecast_hour}h-enfo-ef.grib2")
 
         self.log(f"  GRIB URI: {grib_uri}")
         return df, grib_uri
@@ -512,11 +526,18 @@ def main():
         default=None,
         help="Process specific forecast hours (e.g., --forecast-hours 0 3 6 9)"
     )
+    parser.add_argument(
+        "--run",
+        type=str,
+        default=os.getenv("ECMWF_RUN", "00"),
+        choices=["00", "06", "12", "18"],
+        help="Model run hour for S3 URI reconstruction (default: 00)"
+    )
 
     args = parser.parse_args()
 
     # Initialize processor
-    processor = ECMWFParquetProcessor(args.input_dir, args.output_dir)
+    processor = ECMWFParquetProcessor(args.input_dir, args.output_dir, run=args.run)
 
     if args.forecast_hours is not None:
         # Process specific forecast hours
