@@ -18,9 +18,17 @@ Must be launched by a user with Coiled auth in `ecmwf/dev-test/`
 (`coiled login` done; `coiled-data.json` present). It cannot be launched
 from the assistant. `--dry-run` prints the plan with no Coiled/cost.
 
+Coiled config follows the notebook: software=gik-coiled-v6,
+vm_type=n2-standard-2, region=us-east1, arm=False, idle_timeout=30m,
+cluster.adapt(min=1,max=N). Workspace defaults to gcp-sewaa-nka (the
+notebook used the `coiled login` default; made explicit here). All
+overridable via flags.
+
 Usage:
     python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 --dry-run
     python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00            # ~2 h, paid
+    python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 \
+        --software gik-coiled-v6 --workspace gcp-sewaa-nka --max-workers 9
 """
 import os
 import re
@@ -71,6 +79,17 @@ def main():
     ap.add_argument("--date", required=True, help="scan date YYYYMMDD (>=20260513)")
     ap.add_argument("--run", default="00", choices=["00", "06", "12", "18"])
     ap.add_argument("--max-workers", type=int, default=9)
+    # Coiled config — defaults follow the notebook
+    # (99o-coiled-function-ecmwf-scan_grib_store_fmrc.ipynb). The notebook
+    # did NOT set a workspace (it used the `coiled login` default); the run
+    # the user referenced was workspace gcp-sewaa-nka — made explicit here so
+    # the scan can't accidentally land in the wrong workspace.
+    ap.add_argument("--software", default="gik-coiled-v6",
+                    help="Coiled software environment (notebook: gik-coiled-v6)")
+    ap.add_argument("--workspace", default="gcp-sewaa-nka",
+                    help="Coiled workspace/account (notebook used login default)")
+    ap.add_argument("--vm-type", default="n2-standard-2")
+    ap.add_argument("--region", default="us-east1")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the task plan; no Coiled, no cost")
     args = ap.parse_args()
@@ -88,12 +107,13 @@ def main():
     import fsspec
 
     @coiled.function(
-        vm_type="n2-standard-2",
-        software="gik-coiled-v6",
-        name="func-ecmwf-50r1",
-        region="us-east1",
-        arm=False,
-        idle_timeout="30 minutes",
+        vm_type=args.vm_type,          # notebook: n2-standard-2
+        software=args.software,        # notebook: gik-coiled-v6
+        workspace=args.workspace,      # notebook: login default (gcp-sewaa-nka)
+        name="func-ecmwf-50r1",        # notebook: func-ecmwf3
+        region=args.region,            # notebook: us-east1
+        arm=False,                     # notebook: arm=False
+        idle_timeout="30 minutes",     # notebook: 30 minutes
     )
     def scan_one(task):
         from fmrc_utils import s3_ecmwf_scan_grib_storing
