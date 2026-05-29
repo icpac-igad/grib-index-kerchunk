@@ -561,6 +561,20 @@ def fixed_ensemble_grib_tree(message_groups: Iterable[Dict],
             if value:
                 path_parts.append(value)
 
+        # Per-pressure-level fix: for isobaric (pl) messages, append the actual
+        # level value (e.g. 250, 500, 850 hPa) so each level becomes its own
+        # zarr group. Without this, all 13 isobaric levels for one (var, step)
+        # collapse into a single group and the byte-range under e.g.
+        # `u/instant/isobaricInhPa/{member}/0.0.0` points at whichever level
+        # happens to be the FIRST GRIB message for that (var, step) in the
+        # source file — which varies by step. Surface (sfc) / soil (sol) /
+        # entireAtmosphere etc. paths are unaffected (single-level by nature).
+        # See cGAN_tutorial GIK_PARQUET_PER_LEVEL_KEYS_NEEDED.md (2026-05-28).
+        if gfilters.get("typeOfLevel") == "isobaricInhPa":
+            level_val = dattrs.get("GRIB_level")
+            if level_val is not None and level_val != "unknown":
+                path_parts.append(str(int(level_val)))
+
         # The base path excludes ensemble information
         base_path = "/".join(path_parts)
 
