@@ -40,7 +40,7 @@ physically coherent pl-channel data for MAM 2024, MAM 2025, and the
 | Streams scanned | `enfo/ef` only (51 members in one file) | `enfo/ef` (50 perturbed) **+** `oper/fc` (control) — dual-stream |
 | Members | 51 (`-1` control + 1..50 perturbed; `-1` is the realigner's normalised form of `number=0`) | 51 = 50 + 1, but split across two source files |
 | pl levels | 13 (no 10 hPa) | 14 (50r1 added 10 hPa) |
-| Coiled scan task count | 85 (one per forecast hour) | 170 (85 enfo + 85 oper) |
+| Coiled preprocessing task count | 85 (one per forecast hour) | 170 (85 enfo + 85 oper) |
 | Source URL pattern | `s3://ecmwf-forecasts/{date}/{run}z/ifs/0p25/enfo/{ts}-{h}h-enfo-ef.grib2` | enfo + oper paths |
 | Output dump naming (post-fix) | `e_sg_mdt_{date}_enfo_{h}h.parquet` (stream-tagged for forward compat) | `e_sg_mdt_{date}_{enfo\|oper}_{h}h.parquet` |
 | `pressure_levels` allowlist | 13 entries — but the 50r1 allowlist (14 entries incl `'10'`) is a strict superset that just won't match anything in 49r1 data → **no code change needed**. | 14 entries incl `'10'` |
@@ -60,28 +60,28 @@ parameters take the 49r1-shape inputs natively. The only NEW code is a
 
 Status legend: ✅ done & validated · ▶ run-later (gated/expensive) · ✋ user-only · 🆕 still to build
 
-**🆕 Step 0 — write `ecmwf_49r1_coiled_scan.py`.** Single-stream cousin
-of `ecmwf_50r1_coiled_scan.py`. ~85 lines. Same Coiled config
+**🆕 Step 0 — write `ecmwf_49r1_coiled_preprocessing.py`.** Single-stream
+cousin of `ecmwf_50r1_coiled_preprocessing.py`. ~85 lines. Same Coiled config
 (`software=gik-coiled-v6`, `workspace=gcp-sewaa-nka`, `n2-standard-2`,
 `us-east1`, `arm=False`, `idle_timeout=30m`, `cluster.adapt(1,9)`). Task
 plan builder yields 85 enfo-only tasks for one date/run. `--dry-run`
 prints the plan with no cost. Cheap to write (1 hour) and validate
 (`uv run` + dry-run on date `20240529`).
 
-**▶✋ Step 1 — Coiled scan (85 tasks, ~1 h, PAID).** User-run.
+**▶✋ Step 1 — Coiled preprocessing (85 tasks, ~1 h, PAID).** User-run.
 
 ```bash
 cd ecmwf/dev-test
 # free preview:
-python3 ecmwf_49r1_coiled_scan.py --date 20240529 --run 00 --dry-run
-# real scan (~1 h, paid):
-python3 ecmwf_49r1_coiled_scan.py --date 20240529 --run 00 \
+python3 ecmwf_49r1_coiled_preprocessing.py --date 20240529 --run 00 --dry-run
+# real preprocessing run (~1 h, paid):
+python3 ecmwf_49r1_coiled_preprocessing.py --date 20240529 --run 00 \
     --software gik-coiled-v6 --workspace gcp-sewaa-nka --max-workers 9
 # -> GCS gs://gik-ecmwf-aws-tf/fmrc/scan_grib20240529/
 #    e_sg_mdt_20240529_enfo_{h}h.parquet   (85 dumps)
 ```
 
-Wall-clock is ~half the 50r1 scan because there's only one stream.
+Wall-clock is ~half the 50r1 preprocessing because there's only one stream.
 
 **▶ Step 2 — per-member split.** Use the existing realigner — it
 already handles the legacy-format case via its `parse_filename`
@@ -177,7 +177,7 @@ The re-bake (Step 6) deploys the 49r1 image first, runs through
 ongoing operations. Total Cloud Run downtime during the cutover: a
 few seconds per revision swap.
 
-## 6. Cheap dry-run gates (do BEFORE the paid scan)
+## 6. Cheap dry-run gates (do BEFORE the paid preprocessing)
 
 Two gates that cost zero S3-scan time and can be run today on the
 existing 50r1 dumps (which were produced by the FIXED scan_grib code
@@ -193,11 +193,11 @@ This is the 50r1 equivalent of GATE A above; if it passes for 50r1, it
 will pass for 49r1 (same code path, just one less level value).
 
 **Gate B2 — the 49r1 Coiled driver dry-run.** Once Step 0 is done,
-`python3 ecmwf_49r1_coiled_scan.py --date 20240529 --run 00 --dry-run`
+`python3 ecmwf_49r1_coiled_preprocessing.py --date 20240529 --run 00 --dry-run`
 should print:
 
 ```
-49r1 scan plan: date=20240529 run=00z  85 tasks (enfo only)
+49r1 preprocessing plan: date=20240529 run=00z  85 tasks (enfo only)
 GCS dest: gs://gik-ecmwf-aws-tf/fmrc/scan_grib20240529/
           e_sg_mdt_20240529_enfo_<h>h.parquet
   [enfo]  0h  s3://ecmwf-forecasts/20240529/00z/ifs/0p25/enfo/20240529000000-0h-enfo-ef.grib2
@@ -207,7 +207,7 @@ GCS dest: gs://gik-ecmwf-aws-tf/fmrc/scan_grib20240529/
 
 Both gates together exhaust the correctness questions that can be
 answered without spending money. If both pass, the only risks left in
-Step 1 (the paid scan) are operational — Coiled quotas, S3 weather,
+Step 1 (the paid preprocessing) are operational — Coiled quotas, S3 weather,
 worker eviction — not algorithm correctness.
 
 ## 7. Risks & open items
@@ -228,11 +228,11 @@ worker eviction — not algorithm correctness.
 - **28r1 (pre-2024-03).** Out of scope per the 2026-05-29 decision. If
   pre-2024-03 pl-channel data is needed later, a parallel plan would
   apply.
-- **What if 49r1 Coiled driver scaffold goes wrong.** The 49r1 scan is
-  single-stream so the most likely error is using the 50r1 dual-stream
-  driver by accident on a 49r1 date — which would 404 on every
-  `oper/fc` URL because 49r1 didn't publish that stream. Hard to
-  silently corrupt; easy to diagnose.
+- **What if 49r1 Coiled driver scaffold goes wrong.** The 49r1
+  preprocessing is single-stream, so the most likely error is using
+  the 50r1 dual-stream driver by accident on a 49r1 date — which would
+  404 on every `oper/fc` URL because 49r1 didn't publish that stream.
+  Hard to silently corrupt; easy to diagnose.
 
 ## 8. What this plan does NOT do
 
@@ -248,20 +248,20 @@ worker eviction — not algorithm correctness.
 ## 9. Summary
 
 - **Code is ready** for 49r1 reprocessing on `ecmwf-50r1-template@4ca1c21`.
-- **One new artifact to build**: `ecmwf_49r1_coiled_scan.py` (~85
+- **One new artifact to build**: `ecmwf_49r1_coiled_preprocessing.py` (~85
   lines, mirrors the 50r1 driver but single-stream / 51-member /
   enfo-only).
 - **Same Coiled config, same workspace, same image stack** as the 50r1
   rebuild — institutional infra reused.
 - **Two gates** (B1 aggregator structure, B2 driver dry-run) drain the
-  correctness questions before any paid scan.
-- **Two paid steps** are user-gated: the ~1 h 49r1 scan (Step 1) and
+  correctness questions before any paid preprocessing.
+- **Two paid steps** are user-gated: the ~1 h 49r1 preprocessing (Step 1) and
   the bulk MAM-first re-bake (Step 6).
 - **Coordinates cleanly with the 50r1 plan** — the two cycles end up
   on separate Cloud Run images, swapped at the 2026-05-12 06z
   boundary by Cloud Run revisions, not runtime logic.
 
 The next concrete action gated on the user, in order:
-1. Write `ecmwf_49r1_coiled_scan.py` (cheap, can be done in this branch).
+1. Write `ecmwf_49r1_coiled_preprocessing.py` (cheap, can be done in this branch).
 2. Run gate B1 against an existing scan dump (free).
-3. Approve the paid 49r1 scan when ready (Step 1).
+3. Approve the paid 49r1 preprocessing when ready (Step 1).

@@ -97,7 +97,7 @@ packaging + Coiled driver `1421667`, Coiled config pinned `040ad86`.
 
 Status legend: ✅ done & validated · ▶ run-later (gated/expensive) · ✋ user-only
 
-**▶✋ Step 1 — Coiled scan (170 tasks, ~2 h, PAID). User runs it; the
+**▶✋ Step 1 — Coiled preprocessing (170 tasks, ~2 h, PAID). User runs it; the
 assistant has no Coiled auth.** Coiled config follows the notebook:
 software `gik-coiled-v6`, workspace `gcp-sewaa-nka`, `n2-standard-2`,
 `us-east1`, `arm=False`, `idle_timeout=30m`, `cluster.adapt(1,9)`.
@@ -108,9 +108,9 @@ Prereq in `ecmwf/dev-test/`: `coiled login` done; `coiled-data.json`,
 ```bash
 cd ecmwf/dev-test
 # free preview:
-python3 ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 --dry-run
-# real scan (~2 h, paid):
-python3 ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 \
+python3 ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00 --dry-run
+# real preprocessing run (~2 h, paid):
+python3 ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00 \
     --software gik-coiled-v6 --workspace gcp-sewaa-nka --max-workers 9
 # -> GCS gs://gik-ecmwf-aws-tf/fmrc/scan_grib20260513/
 #    e_sg_mdt_20260513_{enfo|oper}_{h}h.parquet   (170 dumps)

@@ -180,10 +180,12 @@ rebuild plan in
 that chain now produces a **per-level-correct** template automatically
 — no further plan changes needed. Order of operations:
 
-1. **Run Coiled scan** (`ecmwf_50r1_coiled_scan.py --date 20260513
-   --run 00`) — 170 tasks (85 enfo + 85 oper), ~2 h, paid. The scan
-   uses `fmrc_utils.s3_ecmwf_scan_grib_storing` which is unaffected by
-   the level fix (it dumps raw scan_grib output per message). User-only
+1. **Run Coiled preprocessing** (`ecmwf_50r1_coiled_preprocessing.py
+   --date 20260513 --run 00`) — 170 tasks (85 enfo + 85 oper), ~2 h,
+   paid. Step 1 in `ecmwf/README.md`'s terminology; renamed from
+   "coiled scan" 2026-05-29 to align with that. Uses
+   `fmrc_utils.s3_ecmwf_scan_grib_storing` which is unaffected by the
+   level fix (it dumps raw scan_grib output per message). User-only
    step, requires Coiled auth.
 2. **Realign with `ecmwf_par_to_ensemble_members.py`** — per-member
    `rt000.par` files. Unaffected by the level fix (row-level reorg).
@@ -258,11 +260,12 @@ last step of each daily run.
   produces a correct template now that the code is fixed — no plan
   changes needed.
 - **A cheap dry-run gate** can validate the rebuild on existing dumps
-  before the paid Coiled scan.
+  before the paid Coiled preprocessing run.
 - The `GIK_MAINTAINER_REQUEST.md` Request-2 backfill gap closes
   automatically during the post-fix re-bake.
 
 The next concrete action gated on the user: run the ~2 h paid Coiled
-scan when ready (`ecmwf_50r1_coiled_scan.py --date 20260513 --run 00`),
+preprocessing when ready (`ecmwf_50r1_coiled_preprocessing.py --date
+20260513 --run 00`),
 and feed the dumps back here for the realigner + packaging + cheap
 template-structure gate.

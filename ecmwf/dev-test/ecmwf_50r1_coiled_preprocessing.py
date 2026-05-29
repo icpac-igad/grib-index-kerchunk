@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-ECMWF 50r1 Coiled scan driver — replaces the hardcoded notebook
+ECMWF 50r1 Coiled preprocessing driver — replaces the hardcoded notebook
 `99o-coiled-function-ecmwf-scan_grib_store_fmrc.ipynb`.
 
-Step 1 of the template build: scan every forecast-hour GRIB of BOTH 50r1
-streams in parallel on Coiled and store per-(stream,hour) all-member dumps
-to GCS `gs://{bucket}/fmrc/scan_grib{date}/e_sg_mdt_{date}_{stream}_{h}h.parquet`.
+This is Step 1 ("preprocessing", per `ecmwf/README.md`) of the template
+build: in parallel on Coiled, scan_grib every forecast-hour GRIB of BOTH
+50r1 streams and store per-(stream,hour) all-member dumps to GCS
+`gs://{bucket}/fmrc/scan_grib{date}/e_sg_mdt_{date}_{stream}_{h}h.parquet`.
+
+The `coiled_scan` -> `coiled_preprocessing` rename (2026-05-29) aligns
+the file name with the README terminology; the underlying operation is
+still raw scan_grib, just exposed under the Step-1 name.
 
   enfo/ef -> perturbed members 1..50   (85 files)
   oper/fc -> control (number -1)       (85 files)
@@ -25,9 +30,9 @@ notebook used the `coiled login` default; made explicit here). All
 overridable via flags.
 
 Usage:
-    python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 --dry-run
-    python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00            # ~2 h, paid
-    python ecmwf_50r1_coiled_scan.py --date 20260513 --run 00 \
+    python ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00 --dry-run
+    python ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00            # ~2 h, paid
+    python ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00 \
         --software gik-coiled-v6 --workspace gcp-sewaa-nka --max-workers 9
 """
 import os
@@ -64,7 +69,7 @@ def build_task_plan(date, run):
 def print_plan(tasks, date, run):
     n_enfo = sum(t["stream"] == "enfo" for t in tasks)
     n_oper = sum(t["stream"] == "oper" for t in tasks)
-    print(f"50r1 scan plan: date={date} run={run}z  {len(tasks)} tasks "
+    print(f"50r1 preprocessing plan: date={date} run={run}z  {len(tasks)} tasks "
           f"({n_enfo} enfo + {n_oper} oper)")
     print(f"GCS dest: gs://{GCS_BUCKET}/fmrc/scan_grib{date}/"
           f"e_sg_mdt_{date}_<stream>_<h>h.parquet")
