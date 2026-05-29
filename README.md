@@ -181,14 +181,22 @@ full GRIB download:
 
 ## How to cite / contribute
 
-GIK is developed by [ICPAC](https://www.icpac.net/) (IGAD Climate
-Prediction and Applications Centre) for continuous climate-risk
-monitoring over East Africa. Funded by the **E4DRR** (UN CRAF'd) and
-**SEWAA** projects.
+GIK is developed and maintained by [ICPAC](https://www.icpac.net/)
+(IGAD Climate Prediction and Applications Centre) for continuous risk
+monitoring and assessment over East Africa. Funded by the **E4DRR**
+(UN CRAF'd) and **SEWAA** programmes.
 
 - Method paper / tutorials: see `tutorial/`
 - Issues / PRs welcome: <https://github.com/icpac-igad/grib-index-kerchunk>
-- Licensed under Apache 2.0 — see [`LICENSE`](LICENSE)
+- Licensed under **Apache License 2.0** — see [`LICENSE`](LICENSE) for
+  the license text and [`NOTICE`](NOTICE) for the institutional copyright
+  statement and funder attribution that must be preserved by downstream
+  redistributors (Apache 2.0 §4(d)).
+- **Copyright** is held by ICPAC as the institutional host. Contributions
+  are accepted on an **inbound = outbound** basis (Apache 2.0 §5): by
+  opening a pull request you license your contribution to the project
+  under the same Apache 2.0 terms, without any additional terms or
+  conditions.
 
 ---
 
