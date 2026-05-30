@@ -561,19 +561,33 @@ def fixed_ensemble_grib_tree(message_groups: Iterable[Dict],
             if value:
                 path_parts.append(value)
 
-        # Per-pressure-level fix: for isobaric (pl) messages, append the actual
-        # level value (e.g. 250, 500, 850 hPa) so each level becomes its own
-        # zarr group. Without this, all 13 isobaric levels for one (var, step)
-        # collapse into a single group and the byte-range under e.g.
-        # `u/instant/isobaricInhPa/{member}/0.0.0` points at whichever level
-        # happens to be the FIRST GRIB message for that (var, step) in the
-        # source file — which varies by step. Surface (sfc) / soil (sol) /
-        # entireAtmosphere etc. paths are unaffected (single-level by nature).
-        # See cGAN_tutorial GIK_PARQUET_PER_LEVEL_KEYS_NEEDED.md (2026-05-28).
+        # Per-pressure-level fix: for isobaric (pl) messages, append the
+        # actual level value (e.g. 250, 500, 850 hPa) so each level becomes
+        # its own zarr group. Without this, all 13/14 isobaric levels for
+        # one (var, step) collapse into a single group and the byte-range
+        # under e.g. `u/instant/isobaricInhPa/{member}/0.0.0` points at
+        # whichever level happens to be the FIRST GRIB message for that
+        # (var, step) — which varies by step. sfc / sol / entireAtmosphere
+        # paths are unaffected (single-level by nature).
+        #
+        # NOTE: cfgrib's scan_grib does NOT populate `GRIB_level` in
+        # dattrs (the original 4ca1c21 fix assumed it did, which is why
+        # Gate B1 emitted 0 per-level groups). The level value lives in
+        # the coord variable's BINARY BLOB at group["refs"]["isobaricInhPa/0"],
+        # dtype <f8 per the isobaricInhPa/.zarray. Decode the same way
+        # the existing ensemble_member extraction above does. See
+        # gate_b1_real_scangrib.py for the on-real-data verification.
+        # cGAN_tutorial GIK_PARQUET_PER_LEVEL_KEYS_NEEDED.md is the bug report.
         if gfilters.get("typeOfLevel") == "isobaricInhPa":
-            level_val = dattrs.get("GRIB_level")
-            if level_val is not None and level_val != "unknown":
-                path_parts.append(str(int(level_val)))
+            level_raw = group["refs"].get("isobaricInhPa/0")
+            if isinstance(level_raw, str):
+                try:
+                    arr = np.frombuffer(level_raw.encode("latin1"),
+                                        dtype=np.float64)
+                    if len(arr) == 1:
+                        path_parts.append(str(int(arr[0])))
+                except Exception:
+                    pass
 
         # The base path excludes ensemble information
         base_path = "/".join(path_parts)

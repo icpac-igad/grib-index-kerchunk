@@ -77,8 +77,11 @@ def main() -> int:
     elapsed = time.time() - t0
     print(f"\n  scan_grib done in {elapsed:.1f}s — {len(groups)} message groups\n")
 
-    # Sanity: each group should have version=1, a GRIB_typeOfLevel attr,
-    # and a GRIB_level attr that's a real isobaric value.
+    # Sanity: each group should have version=1, GRIB_typeOfLevel attr,
+    # and an isobaricInhPa/0 BINARY BLOB carrying the level (f8).
+    # Discovery 2026-05-29: cfgrib's scan_grib does NOT put GRIB_level
+    # in dattrs; level lives in group["refs"]["isobaricInhPa/0"].
+    import numpy as np
     levels_seen = Counter()
     members_seen = set()
     bad = 0
@@ -87,7 +90,6 @@ def main() -> int:
             bad += 1
             continue
         try:
-            # Find the data variable in the group.
             zattrs = json.loads(g["refs"][".zattrs"])
             coords = zattrs["coordinates"].split(" ")
             vname = None
@@ -101,14 +103,20 @@ def main() -> int:
                 continue
             dattrs = json.loads(g["refs"][f"{vname}/.zattrs"])
             if dattrs.get("GRIB_typeOfLevel") == "isobaricInhPa":
-                levels_seen[int(dattrs.get("GRIB_level"))] += 1
-            # ensemble member from .zattrs
-            mem = zattrs.get("ensemble_member")
-            if mem is None:
-                # Fall back to number/0 binary
-                pass
-            else:
-                members_seen.add(mem)
+                # Decode level from binary blob (f8).
+                level_raw = g["refs"].get("isobaricInhPa/0")
+                if isinstance(level_raw, str):
+                    arr = np.frombuffer(level_raw.encode("latin1"),
+                                        dtype=np.float64)
+                    if len(arr) == 1:
+                        levels_seen[int(arr[0])] += 1
+            # ensemble member from number/0 binary blob.
+            num_raw = g["refs"].get("number/0")
+            if isinstance(num_raw, str):
+                arr = np.frombuffer(num_raw.encode("latin1"),
+                                    dtype=np.int64)
+                if len(arr) == 1:
+                    members_seen.add(int(arr[0]))
         except Exception:
             bad += 1
 
