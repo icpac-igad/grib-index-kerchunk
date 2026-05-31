@@ -380,6 +380,216 @@ not in the production critical path.
 
 ---
 
+## Part 5 — Why the HuggingFace template tar.gz exists (and why a one-time, whole-corpus scan_grib is needed to build it)
+
+### What the template actually is
+
+The artifact at
+`https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main/gik-fmrc-v2ecmwf_fmrc.tar.gz`
+is **not** a copy of any forecast data. It is a 126 MB archive
+containing 51 members × 85 forecast hours = **4 335 `rt{hhh}.par`
+files**, each a small parquet (~40 KB) that serialises ONE member's
+zarr-metadata skeleton — `.zarray` definitions, `.zattrs`, coordinate
+arrays (`latitude`, `longitude`, `step`, `valid_time`, `time`,
+`number`), the `zarr_consolidated_format` marker, etc.
+
+No byte-range references to the source GRIBs live in the template.
+Those are added at runtime by Stage 2 of the Lithops pipeline against
+each fresh `.index` file. The template is the **shape**; the per-date
+`.index` provides the **byte offsets**. Glue them together and you
+have a full zarr-store reference set that `xarray.open_dataset` can
+open.
+
+### Why the template is needed in the first place: `.index` alone is not enough
+
+The `.index` JSON-lines sidecar tells the runtime WHERE in the GRIB
+each message lives — `_offset`, `_length`, `param`, `number`, `step`,
+`levtype`, `levelist`. That is enough to do a direct fetch-decode-
+pickle workflow (see Part 1: the `ea-aifs/s3_grib_pkl_input_aifsens.py`
+script).
+
+It is **not** enough to construct a zarr store. zarr needs, for each
+variable, structural metadata that the `.index` does not carry:
+
+- Grid shape (`[721, 1440]` for ECMWF 0.25°).
+- Chunk shape (typically `[1, 721, 1440]`).
+- dtype (`<f4`).
+- `fill_value`, compression, byte order, dimension separator.
+- Coordinate variable VALUES — the actual latitude array (length 721),
+  longitude array (length 1440), level array (length N), valid_time
+  array (length 85), number array (length 51), step array (length 85).
+- Coordinate `.zattrs` with CF metadata (`standard_name`, `units`,
+  `_ARRAY_DIMENSIONS`, etc.).
+- GRIB-specific provenance (`GRIB_centre`, `GRIB_paramId`,
+  `GRIB_typeOfLevel`, `GRIB_stepType`, etc.) so downstream tools that
+  understand GRIB can reason about the data.
+
+The only way to extract all that is to **read the GRIB headers
+themselves**. That is what kerchunk's `scan_grib` (built on `cfgrib`,
+which is built on ECMWF's `eccodes`) does. Each `scan_grib` call
+on one GRIB file emits a list of "message groups" — one per GRIB
+message — each carrying the zarr-shaped metadata for that message.
+
+### Why a whole-corpus scan is required (51 × 85, not just one file)
+
+You might ask: surely the metadata for the same variable is the
+same across timesteps and members? Why not scan ONE file and
+extrapolate?
+
+Three reasons it cannot be reduced to one file:
+
+1. **Per-(member, hour) metadata genuinely differs in places that
+   matter for zarr.** Each rt000.par carries the analysis time as
+   `time/0`, the forecast hour as `step/0`, the `valid_time/0` for
+   that specific slot, plus the ensemble number. To get a complete
+   `(member × step)` coordinate grid you have to capture every cell.
+2. **Accumulation variables behave differently at step 0 vs later.**
+   Total precipitation `tp` at `step=0` is zero; at `step=3` it is
+   the 0–3 h accumulation. The `.zattrs` (specifically
+   `GRIB_stepType`, `GRIB_stepUnits`, the GRIB_indicatorOfUnitForRangeIndex
+   field) reflect that. Capturing only step 0 would lose this.
+3. **ECMWF reorders messages across timesteps and across members.**
+   The scan must visit each `(member, hour)` to be sure it has seen
+   every (var, level) combination — single-file scans are not safe
+   for the kind of "any consumer asks for anything" use case GIK
+   targets.
+
+So the whole corpus IS scanned, once. For 0.25° ECMWF 50r1 ENS that
+is:
+
+```
+51 members × 85 forecast hours = 4 335 GRIB files per reference date.
+```
+
+### Why it costs ~2 hours, and what the dollar math looks like
+
+scan_grib reads each GRIB file via S3 byte-range to extract message
+metadata. Empirically (from the 50r1 dry-run):
+
+```
+8 500 messages in one ECMWF enfo-ef 0h file -> 756 s (~12.6 min)
+                                               on a single VM
+```
+
+Sequential: 4 335 × 12.6 min = 909 hours = **~38 days** on one
+machine — operationally not viable.
+
+Parallel on a 9-worker Coiled cluster: ~2 hours wall-clock. The job
+fans out across worker VMs; each scans a few files; results are
+serialised back. This is the "Step 1 — Coiled preprocessing" in both
+the 50r1 and 49r1 rebuild plans.
+
+Approximate cost (n2-standard-2, us-east1, 9 workers × 2 hours
+plus scheduler):
+
+```
+~20 worker-hours × $0.05/hr ≈ $1 of compute
++ a few cents of network egress
+~ low single-digit dollars per template rebuild.
+```
+
+That is paid ONCE per reference date.
+
+### The amortisation: why this expensive one-time scan is the right design
+
+Once the template exists, every future backfill date that uses the
+same model configuration does this instead of scan_grib:
+
+```
+runtime Stage 1: load template tar.gz       (~5 s, just parquet read)
+runtime Stage 2: read .index files          (~5-10 min, S3 I/O bound)
+runtime Stage 3: merge template + index     (~2 s, dict merge)
+                 write per-member parquets  (~1 min)
+                 upload to GCS/HF           (~1 min)
+```
+
+Total per-date runtime: ~10-15 minutes on Cloud Run, no scan_grib.
+A few cents per date in compute.
+
+For an archive of 1 000 days × 4 run hours = 4 000 backfills:
+
+| Approach | Per-date cost | Total (4 000 dates) |
+|---|---|---|
+| scan_grib every date (no template) | ~$0.50 (73 min single-machine equivalent) | **~$2 000** |
+| Template + Stage 2 .index merge | ~$0.02 (10 min Cloud Run) | **~$80** |
+
+Plus the one-time ~$2 template build. The template **amortises an
+expensive one-time scan into thousands of cheap reads** — that ratio
+is the economic backbone of the GIK pipeline. Without it, an
+archive-scale workflow on a research budget is impractical.
+
+### When does the template need rebuilding?
+
+A given template stays valid as long as the source GRIB schema is
+unchanged:
+
+- Grid resolution (still 0.25° / 721 × 1440).
+- Variable set (still the same 47 params for ENS).
+- Pressure-level set (still the same 13 isobaric levels).
+- Member count (still 50 perturbed + 1 control).
+- Forecast-hour list (still 0–144 every 3 h + 150–360 every 6 h).
+- Per-stream layout (still control in `enfo/ef` as `number=0` or
+  separately in `oper/fc`).
+
+Any of those changing breaks the template. **Cycle 50r1 changed two
+of them** (added 10 hPa to the pressure-level set; moved control from
+`enfo/ef` to `oper/fc`), which is what kicked off the rebuild plan in
+the first place (`2026-05-17-50r1-template-rebuild-plan.md`).
+
+### Why HuggingFace specifically
+
+The template is:
+
+- 126 MB tar.gz (small enough to download to any worker, small enough
+  to bake into a Cloud Run Docker image so no per-backfill download).
+- Public-readable, no auth, no rate-limiting beyond the dataset host.
+- Versioned via filename suffix (the per-level rebuild will publish
+  as `gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz`, leaving the legacy
+  artifact in place for any consumer pinned to it).
+- Stable URL — once uploaded it stays, so Docker images that bake it
+  in at build time keep working indefinitely.
+
+HuggingFace is just the storage layer; an equivalent setup on S3 or
+GCS would work. What matters is the artifact is at a stable public
+URL that any consumer or runtime image can rely on.
+
+### Connecting back to the per-level bug
+
+This is why the runtime fix in `59b89dd` alone isn't enough for
+whole-archive consumers. The runtime now emits **correct chunk-ref
+keys** for pl variables (`u/pl/250/control/0.0.0`, ...), but the
+TEMPLATE's `.zarray` for those variables still has shape
+`[1, 181, 360]` and no `level` dimension. When `xarray.open_dataset`
+tries to open the consolidated zarr store, it reads the template's
+`.zarray` to compute chunk addresses — and the new per-level chunk
+refs don't fit into a zarr that doesn't know about levels.
+
+So the per-level fix is fundamentally two-part:
+
+1. **Runtime (`59b89dd`)** — fixed; new per-date parquets emit
+   per-level chunk-ref keys.
+2. **Template** — still broken; needs rebuild against a producer that
+   knows about per-level structure (see Part 3 / `3ddb98a` for the
+   producer identification and Options A/B for the repair path).
+
+Single-key consumers (read one specific parquet for one variable at
+one level) benefit from #1 immediately. Whole-archive consumers
+(`xarray.open_dataset(tar.gz + parquets)`) need both #1 and #2.
+
+### Summary table
+
+| Question | Answer |
+|---|---|
+| What's in the template? | The reusable zarr-metadata skeleton for one IFS-cycle config (~4 335 rt{hhh}.par files of zarr `.zarray`/`.zattrs`/coord arrays) |
+| Why is it needed? | `.index` files give byte offsets; zarr also needs structural schema + coord values that only `scan_grib` produces from GRIB headers |
+| Why scan the whole corpus? | Per-(member, hour) metadata genuinely differs (time, valid_time, accumulation flags, member ID); single-file scans miss data |
+| Why does it cost ~2 hours? | 4 335 files × ~12-13 min sequential = 38 days; Coiled at 9 workers compresses to ~2 hours |
+| Why is it one-time? | Same template serves thousands of future backfills as long as the model config (grid, vars, levels, members, hours) doesn't change |
+| Why rebuild for 50r1? | 50r1 added 10 hPa + moved control to oper/fc — both schema-breaking changes |
+| Why HuggingFace? | Public, versioned, stable URL; cheap to bake into Docker for offline runtime |
+
+---
+
 ## References
 
 - The direct-pkl script for AIFS:
