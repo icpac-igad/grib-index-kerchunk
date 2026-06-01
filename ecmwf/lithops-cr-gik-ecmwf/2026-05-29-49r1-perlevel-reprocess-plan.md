@@ -29,7 +29,7 @@ physically coherent pl-channel data for MAM 2024, MAM 2025, and the
 | 49r1 data is retained on `s3://ecmwf-forecasts` from 2024-03 onwards | User-confirmed retention policy (2026-05-29) |
 | The existing 49r1 template uses reference date **2024-05-29** | `CLAUDE.md`, `gik-fmrc-v2ecmwf_fmrc.tar.gz` on HF |
 | 49r1 enfo/ef carried 51 members in a single file: 1 control (`number=0`) + 50 perturbed (`number=1..50`) | 49r1 `.index` JSON-line schema |
-| 49r1 pl set: **13 levels** (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000) — no 10 hPa | 49r1 `.index` `levelist` distinct values |
+| 49r1 pl set is **date-dependent** (CORRECTED 2026-06-01): **9 levels** before 2025-01-14 06z, **13 levels** (`+100,150,400,600`) from 2025-01-14 06z on; never 10 hPa | anon `.index` `levelist` scan across the archive (boundary pinned to the run) |
 | 49r1 msgs/file: ~8211 (vs 50r1's 8500 — the extra +289 in 50r1 is 50× new 10 hPa + reshuffled sfc/sol counts) | 49r1 `.index` line count |
 | 49r1 cutover: last 49r run is 2026-05-12 **00z**; first 50r1 run is 2026-05-12 **06z** | Pinned in `2026-05-17-50r1-template-investigation.md` §1 |
 
@@ -39,7 +39,7 @@ physically coherent pl-channel data for MAM 2024, MAM 2025, and the
 |---|---|---|
 | Streams scanned | `enfo/ef` only (51 members in one file) | `enfo/ef` (50 perturbed) **+** `oper/fc` (control) — dual-stream |
 | Members | 51 (`-1` control + 1..50 perturbed; `-1` is the realigner's normalised form of `number=0`) | 51 = 50 + 1, but split across two source files |
-| pl levels | 13 (no 10 hPa) | 14 (50r1 added 10 hPa) |
+| pl levels | 9 (≤2025-01-14 00z) → 13 (≥2025-01-14 06z); no 10 hPa | 14 (50r1 added 10 hPa) |
 | Coiled preprocessing task count | 85 (one per forecast hour) | 170 (85 enfo + 85 oper) |
 | Source URL pattern | `s3://ecmwf-forecasts/{date}/{run}z/ifs/0p25/enfo/{ts}-{h}h-enfo-ef.grib2` | enfo + oper paths |
 | Output dump naming (post-fix) | `e_sg_mdt_{date}_enfo_{h}h.parquet` (stream-tagged for forward compat) | `e_sg_mdt_{date}_{enfo\|oper}_{h}h.parquet` |
@@ -98,13 +98,32 @@ python3 ecmwf_par_to_ensemble_members.py \
 # into {H}h/{m}.par
 ```
 
-**GATE A (structural, no scan_grib, ~free):** open one `control/rt000.par`
-and confirm:
-- `u/instant/isobaricInhPa/.zarray` has a `level` axis of size **13**.
-- `level` coordinate `[50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]` (no 10 hPa).
-- 51 members present incl. `-1`.
-- sfc/sol shapes unchanged from the legacy template.
+**GATE A (structural, no scan_grib, ~free) — now AUTOMATED.** Use
+`ecmwf/dev-test/gate_step2_realigner.py` (added 2026-06-01); it runs the
+patched realigner against the live `.index` and asserts the structure
+below. Run it on a **13-level** ref date:
+`python gate_step2_realigner.py --date 20250515 --run 00 --hour 12 --stream enfo`
+(PASSES 8/8 as of 2026-06-01). Confirm:
+- `u/isobaricInhPa/{hPa}` keys span the **full published level set for the
+  chosen ref date** (see the level-window table below), each `.zarray`
+  shape `[1, 721, 1440]` (0.25°, NOT the legacy `[1, 181, 360]` 1° stub).
+- 51 members present incl. control `-1`.
+- per-member key set derives from that member's own messages (no
+  replicate-to-all).
 If gate A fails, do NOT proceed — diagnose first.
+
+> **⚠ Reference-date correction (2026-06-01).** The pl level set is
+> **not constant across 49r1**: **9 levels** before 2025-01-14 06z
+> (`[50,200,250,300,500,700,850,925,1000]`) and **13 levels** from
+> 2025-01-14 06z onward (`+100,150,400,600`). The originally-chosen ref
+> date **`20240529` is a 9-level date** — a template built from it would
+> orphan the 4 extra levels' chunk-refs for every ≥2025-01-14 date,
+> including all of MAM 2025 / MAM 2026 (the cGAN windows). **Build the
+> 49r1 template from a 13-level reference date instead (e.g. `20250515`).**
+> A 13-level template is a safe superset for the 9-level sub-era (those
+> levels just carry no refs). See
+> `2026-06-01-step2-realigner-fix-scope.md` § "Pressure-level coverage is
+> DATE-DEPENDENT within 49r1" for the evidence and the pinned boundary.
 
 **▶ Step 3 — package & rename to the template layout.**
 
@@ -123,7 +142,11 @@ deployed runtimes working until they cut over). Needs HF write token.
 
 **▶ Step 5 — build a 49r1 Cloud Run runtime image.** Branch off a tag
 of the current code and wire `run_lithops_ecmwf.py`:
-- `REFERENCE_DATE = '20240529'` (49r1 template ref)
+- `REFERENCE_DATE = '20250515'` (49r1 template ref — a **13-level** date;
+  do NOT use the 9-level `20240529`, see the GATE-A reference-date
+  correction above). The Coiled preprocessing (Step 1) and the dry-run
+  examples below still work for any 49r1 date; only the date whose dumps
+  are packaged into the published template must be a 13-level one.
 - `ECMWF_TEMPLATE_PATH = '/gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz'` (or the HF URL)
 - Stage 1 member list = `['ens_control'] + [f'ens_{i:02d}' for i in range(1, 51)]`
   (51 members, same as the pre-50r1 line we restored conceptually for

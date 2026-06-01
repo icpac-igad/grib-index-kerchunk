@@ -207,14 +207,57 @@ and the off-by-one becomes a hard requirement rather than a caution.
 
 ## Gates (free) before any paid Coiled run
 
-- **Structural gate:** run the patched realigner on ONE existing scan
-  dump + its `.index`; open `control/rt000.par`; assert pl `.zarray`
-  shapes are `[1,721,1440]`, keys are `var/isobaricInhPa/{hPa}` across
-  the full level set (13 for 49r1, 14 for 50r1), and member count is
-  51 (49r1) / 51-with-oper (50r1). This is the GATE A / GATE B1 already
-  described in the 49r1 and 50r1 plans — now it can actually pass.
+- **Structural gate — BUILT and PASSING:** `ecmwf/dev-test/gate_step2_realigner.py`
+  runs the real patched realigner against a faithful dump (pl `level`
+  zeroed) + the live `.index`, and asserts: member count == `.index`,
+  per-level pl keys, **full** published-level coverage, no level-0
+  collapse, `[1,721,1440]` shape, and no replicate-to-all. Parameterised
+  `--date/--run/--hour/--stream`. Results (2026-06-01), all **8/8**:
+  - `--date 20240529 --hour 0  --stream enfo` → 49r1 9-level, 51 members
+  - `--date 20250515 --hour 12 --stream enfo` → 49r1 **13-level**, 51 members
+  - `--date 20260513 --hour 12 --stream enfo` → 50r1 **14-level**, 50 perturbed
+  - `--date 20260513 --hour 12 --stream oper` → 50r1 **14-level**, control only
 - Only after the structural gate is green does Step 1 (the paid Coiled
   preprocessing) become worth running.
+
+## Pressure-level coverage is DATE-DEPENDENT within 49r1 (new finding)
+
+Empirically (anon `.index` scan across the archive, 2026-06-01) the
+open-data ENS pl set is **not** constant across the 49r1 era:
+
+| Window | pl levels | set |
+|---|---|---|
+| 2024-03-01 → **2025-01-14 00z** | **9** | 50, 200, 250, 300, 500, 700, 850, 925, 1000 |
+| **2025-01-14 06z** → 2026-05-12 00z | **13** | + 100, 150, 400, 600 |
+| 2026-05-12 06z → present (50r1) | **14** | + 10 |
+
+The 9→13 expansion is pinned to **2025-01-14 06z** (00z that day = 9,
+06z = 13). Every pl variable (`d gh q r t u v vo w`) carries the full
+set for its window; the level set is uniform across members and forecast
+hours within a date.
+
+**This invalidates two assumptions in the existing plans:**
+
+1. **The 49r1 reprocess plan's reference date `20240529` is a 9-level
+   date.** A template built from it has `.zarray`/coords for only 9
+   levels. Used at runtime for a **13-level** date (≥2025-01-14 06z —
+   which includes all of MAM 2025 and MAM 2026, the cGAN-critical
+   windows), the 4 extra levels' chunk-refs (100/150/400/600 hPa) would
+   be **orphaned** — exactly the per-level breakage this whole effort is
+   fixing, just one level up. **Fix: build the 49r1 template from a
+   13-level reference date (e.g. `20250515`), which is a superset.** A
+   13-level template used for a pre-2025-01-14 (9-level) date is benign —
+   those 4 levels simply carry no chunk-refs (empty), because the older
+   `.index` never lists them, so nothing is orphaned.
+2. **The "13→14, +10 hPa" framing in the 50r1 plan** is only correct
+   relative to *late* 49r1. Relative to the template's stale ref era
+   (2024, 9 levels) the jump is 9→14. Immaterial to 50r1 (which has its
+   own 14-level ref `20260513`), but the 49r1 plan must not describe its
+   own era as a single 13-level block.
+
+`gate_b1_real_scangrib.py` hardcodes `EXPECTED_LEVELS_49R1` = the 13-level
+set and asserts equality — that assertion is **false for any 49r1 date
+before 2025-01-14 06z** and should be made window-aware or dropped.
 
 ## Effort & risk
 
@@ -224,14 +267,20 @@ and the off-by-one becomes a hard requirement rather than a caution.
   edge. Everything else is additive (richer `.index` parse, real grid
   shape) and validated by a free structural gate before any spend.
 
-## Sibling-MD updates implied (per producer MD §"Impact")
+## Sibling-MD updates (per producer MD §"Impact") — DONE 2026-06-01
 
-- `2026-05-17-50r1-template-rebuild-plan.md` and
-  `2026-05-29-49r1-perlevel-reprocess-plan.md`: their GATE A / B1 steps
-  now have a concrete pass condition (above). The "aggregator =
-  `fixed_ensemble_grib_tree`" framing remains wrong; the producer is the
-  realigner, fixed via Option A here.
-- `2026-05-30-template-producer-identified.md`: its "Next concrete
-  action #1 (trace)" is **done** (this MD). #2 (pick A/B) is **decided**:
-  refined Option A. #3 (update plan MDs) and #4 (then run paid scan)
-  remain.
+- `2026-05-29-49r1-perlevel-reprocess-plan.md`: GATE A rewritten to point
+  at the automated `gate_step2_realigner.py`; reference date corrected
+  from the 9-level `20240529` to a 13-level date (`20250515`); the
+  "13 levels" facts corrected to the 9/13 date-dependent reality.
+- `2026-05-17-50r1-template-rebuild-plan.md`: Step-2 GATE rewritten to the
+  automated gate (both enfo + oper streams, 14-level), replacing the
+  "diff vs legacy 20240529 control rt000" gate (wrong 1°/9-level baseline).
+- `2026-05-30-template-producer-identified.md`: "Next action #1 (trace)"
+  **done** (this MD); #2 (pick A/B) **decided** — refined Option A,
+  **implemented** in `ecmwf_par_to_ensemble_members.py`; #3 (update plan
+  MDs) **done**. #4 (run the paid Coiled scan) remains, now correctly
+  targeted (13-level 49r1 ref + 14-level 50r1 ref).
+- `gate_b1_real_scangrib.py`: its hardcoded 13-level `EXPECTED_LEVELS_49R1`
+  assertion is false pre-2025-01-14 06z — flagged for window-awareness or
+  removal (not yet changed).

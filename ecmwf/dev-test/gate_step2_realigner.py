@@ -29,9 +29,22 @@ from ecmwf_par_to_ensemble_members import (
     ECMWFParquetProcessor, ECMWF_0P25_FIELD_SHAPE,
 )
 
-DATE, RUN, HOUR = "20240529", "00", "0"
-GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/ifs/0p25/enfo/"
-        f"{DATE}{RUN}0000-{HOUR}h-enfo-ef.grib2")
+import argparse
+_ap = argparse.ArgumentParser(description="Step 2 realigner structural gate")
+_ap.add_argument("--date", default="20240529", help="YYYYMMDD (default 49r1 ref 20240529)")
+_ap.add_argument("--run", default="00", choices=["00", "06", "12", "18"])
+_ap.add_argument("--hour", default="0", help="forecast hour (default 0; use a non-0h to exercise full level coverage)")
+_ap.add_argument("--stream", default="enfo", choices=["enfo", "oper"],
+                 help="enfo=perturbed (49r1 also bundles control); oper=50r1 control")
+_args = _ap.parse_args()
+DATE, RUN, HOUR, STREAM = _args.date, _args.run, _args.hour, _args.stream
+
+if STREAM == "oper":
+    GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/ifs/0p25/oper/"
+            f"{DATE}{RUN}0000-{HOUR}h-oper-fc.grib2")
+else:
+    GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/ifs/0p25/enfo/"
+            f"{DATE}{RUN}0000-{HOUR}h-enfo-ef.grib2")
 INDEX = GRIB.replace(".grib2", ".index")
 
 # levtype -> the typeOfLevel name scan_grib would put in the dump row
@@ -92,11 +105,12 @@ def main():
     try:
         in_dir = workdir / "in"; in_dir.mkdir()
         out_dir = workdir / "out"
+        fname = f"e_sg_mdt_{DATE}_{STREAM}_{HOUR}h.parquet"
         dump = build_faithful_dump(index_lines)
-        dump.to_parquet(in_dir / f"e_sg_mdt_{DATE}_enfo_{HOUR}h.parquet", engine="pyarrow")
+        dump.to_parquet(in_dir / fname, engine="pyarrow")
 
         proc = ECMWFParquetProcessor(str(in_dir), str(out_dir), run=RUN)
-        proc.process_forecast_hour(in_dir / f"e_sg_mdt_{DATE}_enfo_{HOUR}h.parquet")
+        proc.process_forecast_hour(in_dir / fname)
 
         hour_dir = out_dir / f"{HOUR}h"
         produced = sorted(p.stem for p in hour_dir.glob("*.par"))
@@ -107,55 +121,64 @@ def main():
         check("member count == .index member count",
               len(produced) == len(exp_counts),
               f"{len(produced)} vs {len(exp_counts)}")
-        check("control member produced", "control" in produced)
+        has_control = -1 in exp_counts
+        check("control present iff .index has it",
+              ("control" in produced) == has_control,
+              f"control in output={'control' in produced}, .index has control={has_control}")
 
-        # Load control + one perturbed member, parse their key/value parquet.
+        # Load the key/value parquet for a member.
         def load_store(member):
             df = pd.read_parquet(hour_dir / f"{member}.par")
-            # save_parquet writes columns [key, value]
             return dict(zip(df["key"], df["value"]))
 
-        ctrl = load_store("control")
-        ens01 = load_store("ens01")
+        # Primary member to inspect: control if this stream carries it, else ens01.
+        primary = "control" if has_control else "ens01"
+        store = load_store(primary)
 
-        # per-level keys present (u at multiple isobaric levels)?
-        def levels_for(store, var):
+        def levels_for(s, var):
             out = set()
-            for k in store:
+            for k in s:
                 parts = k.split("/")
                 if parts[0] == var and len(parts) >= 3 and parts[1] == "isobaricInhPa":
                     try: out.add(int(float(parts[2])))
                     except ValueError: pass
             return out
 
-        u_levels = levels_for(ctrl, "u")
+        u_levels = levels_for(store, "u")
         check("pl keys are PER-LEVEL (u has multiple isobaric levels)",
-              len(u_levels) > 1, f"u levels in control: {sorted(u_levels)}")
-        check("recovered pl levels match .index levelist set",
+              len(u_levels) > 1, f"u levels in {primary}: {sorted(u_levels)}")
+        check(f"FULL level coverage: u carries ALL {len(exp_levels)} published levels",
+              u_levels == exp_levels,
+              f"u={sorted(u_levels)} vs published={sorted(exp_levels)}")
+        check("recovered pl levels are a subset of .index levelist set",
               u_levels.issubset(exp_levels) and len(u_levels) >= 1,
               f"recovered {sorted(u_levels)} ⊆ {sorted(exp_levels)}")
         check("NO collapse to level 0 for pl",
               0 not in u_levels, f"u levels: {sorted(u_levels)}")
 
         # 0.25 deg shape, not the 1 deg placeholder
-        zarray_keys = [k for k in ctrl if k.endswith(".zarray")]
-        shapes = {tuple(json.loads(ctrl[k])["shape"]) for k in zarray_keys}
+        zarray_keys = [k for k in store if k.endswith(".zarray")]
+        shapes = {tuple(json.loads(store[k])["shape"]) for k in zarray_keys}
         check(".zarray shape is 0.25deg [1,721,1440] (not [1,181,360])",
               shapes == {tuple(ECMWF_0P25_FIELD_SHAPE)},
               f"distinct shapes: {shapes}")
 
-        # member separation: control's data-var key count should reflect ITS
-        # own messages, not all members replicated. With replicate-to-all the
-        # old bug gave every member the same (full) key set.
-        ctrl_chunkrefs = sum(1 for k in ctrl if k.endswith("/.zarray"))
-        ens_chunkrefs = sum(1 for k in ens01 if k.endswith("/.zarray"))
-        # control in 49r1 carries extra static fields => >= perturbed, but both
-        # must be FAR below the all-members total (≈ unique (var,level) per member).
+        # member separation: a member's (var,level) group count must derive
+        # only from ITS OWN messages — never the all-members union (the old
+        # replicate-to-all bug gave every member the full set).
+        prim_vars = sum(1 for k in store if k.endswith("/.zarray"))
         total_msgs = len(index_lines)
-        check("per-member key set is a fraction of all messages (no replicate-to-all)",
-              ctrl_chunkrefs < total_msgs / 5 and ens_chunkrefs < total_msgs / 5,
-              f"control vars={ctrl_chunkrefs}, ens01 vars={ens_chunkrefs}, "
-              f"total msgs={total_msgs}")
+        prim_member = -1 if has_control else 1
+        own_msgs = exp_counts[prim_member]
+        # groups can't exceed this member's own message count...
+        ok_own = prim_vars <= own_msgs
+        # ...and with >1 member, must be strictly below the all-members total
+        # (single-member streams like oper/fc legitimately have own_msgs≈total).
+        ok_sep = (prim_vars < total_msgs) if len(exp_counts) > 1 else True
+        check("per-member key set derives from own messages only (no replicate-to-all)",
+              ok_own and ok_sep,
+              f"{primary} groups={prim_vars}, own msgs={own_msgs}, "
+              f"total msgs={total_msgs}, members={len(exp_counts)}")
 
         print()
         if all(results):
