@@ -63,37 +63,50 @@ for idx, row in df.iterrows():
     member_dict.setdefault(member_num, []).append(build_group(row, idx, member_num))
 ```
 
-## Defect 2 — level collapse (root cause confirmed via Gate B1)
+## Defect 2 — level handling (CORRECTED 2026-06-01 after empirical check)
 
-`gate_b1_real_scangrib.py:82-83` already established the mechanism:
+> **Correction.** The first draft of this MD (commit `a58b47a`) claimed
+> the level value is "silently dropped" because it lives only in the
+> `group["refs"]["isobaricInhPa/0"]` binary blob that the dump never
+> carries. **That root cause is wrong for the current kerchunk.** An
+> empirical scan + source read on 2026-06-01 (see "Empirical validation"
+> below) shows the scan dump **does** carry the real isobaric level as a
+> proper `level` column. Gate B1's "level is in a blob" was about *raw*
+> `scan_grib` dattrs — but `_map_grib_file_by_group` does not store raw
+> dattrs; it stores the output of `_extract_single_group`, which decodes
+> that blob into a coordinate value.
 
-> "cfgrib's scan_grib does NOT put `GRIB_level` in dattrs; level lives in
-> `group["refs"]["isobaricInhPa/0"]`" — a binary `<f8` blob.
+What actually happens (verified):
 
-Consequence: kerchunk's `_extract_single_group` (used by
-`_map_grib_file_by_group` in `fmrc_utils.py:85`) surfaces
-`typeOfLevel="isobaricInhPa"` as a column but **never the level value**.
-So in the dump, pl rows have no usable `level`; `row.get('level', 0)`
-returns `0` for all of them. In `create_member_parquet` (L296):
+- `_extract_single_group` → `extract_datatree_chunk_index(dt, …, grib=True)`
+  → `extract_dataset_chunk_index(grib=True)` (kerchunk `_grib_idx.py`).
+  With `grib=True` it renames the vertical coordinate to `level`
+  (`cname = "level" if cname in ECCODES_VERTICAL_LEVELS`; `isobaricInhPa`
+  ∈ that set — confirmed) and writes its **value** into the row:
+  `coord_vals[cname] = cvar.to_numpy()[coord_index]`.
+- So each dump row is `dict(varname=…, **attrs, level=<real hPa>, uri, offset, length, idx)`.
+  `build_idx_grib_mapping` even indexes on `["varname","typeOfLevel","stepType","level","valid_time"]`,
+  which only works because `level` is a real column.
 
-```python
-key = f"{varname}/{level_type}/{level}"   # level==0 for every pl message
-```
+Consequence for the realigner: `create_member_groups_from_index`'s
+`row.get('level', 0)` (L238) and `create_member_parquet`'s
+`key = f"{varname}/{level_type}/{level}"` (L296) **already pass the true
+level through** when fed a current-kerchunk dump. So the per-level
+collapse seen in the *legacy* HF template is an artifact of the **older
+kerchunk** used for that 2024 build (where the dump lacked a usable
+`level`), not of the realigner logic as it stands. A rebuild on current
+kerchunk + the Defect-1 member fix emits per-level keys without any
+change to L296.
 
-⇒ all 13 (49r1) / 14 (50r1) isobaric levels of a variable collapse into
-one key `u/isobaricInhPa/0`. This is the exact per-level bug the cGAN
-port reported. (`number`/member identity lives in the sibling `number/0`
-blob and is likewise absent — which is *why* the realigner reaches for
-the `.index` instead; see Defect 1.)
+### Hardening: cross-check level against the `.index` (authoritative)
 
-### Recovery source — no re-scan required
-
-The realigner **already reads the `.index`** in `parse_index_file`
-(L156–211), and ECMWF `.index` JSON-lines carry `levelist` and `levtype`
-per message — the same fields the runtime fix `59b89dd` uses. So both
-the member **and** the true level can be recovered from one `.index`
-read, keyed by line index. Extend `parse_index_file` to return richer
-per-idx metadata:
+Even though the dump carries `level`, the `.index` carries `levelist`
+**redundantly and authoritatively** — empirically present on 100% of pl
+lines and absent on 100% of non-pl lines (validated below). Since the
+realigner **already reads the `.index`** in `parse_index_file`
+(L156–211), it costs nothing to capture `levelist` there and use it as
+the source of truth (and a guard against a dump that was built by an old
+kerchunk with a missing/zero `level`):
 
 ```python
 # in parse_index_file, per line:
@@ -104,15 +117,14 @@ idx_meta[idx] = {
 }
 ```
 
-Then `create_member_groups_from_index` stamps the recovered level onto
-each row's group (overriding the dump's missing/0 value for pl), and
-`create_member_parquet`'s existing L296 key construction — already
-per-level-aware — emits `u/isobaricInhPa/250`, `…/500`, … correctly with
-**zero change to L296 itself**.
-
-This keeps the entire level fix inside the cheap Step 2 realigner. The
-Coiled scan dump producer (Step 1) is **not** touched, so no paid
-re-scan is triggered by this fix.
+Then `create_member_groups_from_index` sets
+`level = int(levelist) if levtype=='pl' and levelist else row.get('level', 0)`.
+This makes the level correct regardless of which kerchunk produced the
+dump, keeps the whole thing inside the cheap Step 2 realigner, and
+triggers **no** paid re-scan. (`number`/member identity is likewise in a
+`number/0` blob in the raw group, which is exactly why the realigner
+already takes members from the `.index` rather than the dump — see
+Defect 1.)
 
 ## Defect 3 — resolution stub (`create_member_parquet`, L309/315)
 
@@ -158,35 +170,40 @@ because:
    `{member, levtype, levelist}` per idx (superset of today's
    `idx_to_member`).
 2. `create_member_groups_from_index` (L213) → assign row `idx` to
-   `idx_meta[idx]['member']` (fixes Defect 1); stamp
-   `level = levelist if levtype=='pl' else 0` onto the group
-   (fixes Defect 2).
+   `idx_meta[idx]['member']` (fixes Defect 1, with the off-by-one
+   reconciliation below); set `level` from the `.index` `levelist` for
+   pl rows, falling back to the dump's `level` column (Defect-2
+   hardening).
 3. `create_member_parquet` (L309/315) → derive `[1,721,1440]` per var
    (fixes Defect 3); L296 key construction unchanged.
 
-## What still needs a live check before coding (cheap, no paid scan)
+## Empirical validation (2026-06-01) — the three live checks, now run
 
-These cannot be confirmed in this environment (kerchunk not installed,
-no dump fixture present), and must be checked against one real dump +
-one real `.index` before/while implementing:
+Run in a throwaway `uv` venv against the live 49r1 reference file
+`s3://ecmwf-forecasts/20240529/00z/ifs/0p25/enfo/20240529000000-0h-enfo-ef.{grib2,index}`
+(anonymous S3). Scripts in `/tmp/gate_*.py` during the session.
 
-1. **Dump columns** — confirm `df.columns` from one real
-   `e_sg_mdt_*_enfo_*.parquet` actually lacks a usable pl `level`
-   (expected: present as 0/NaN). `load_parquet_groups` already logs
-   `df.columns.tolist()` — capture it.
-2. **`.index` `levelist` coverage** — confirm every pl line has a
-   `levelist` and sfc/sol lines do not (so the `levtype=='pl'` guard is
-   safe). Trivially checkable on any S3 `.index`.
-3. **idx alignment** — confirm the dump's `idx` index is 0-based and
-   matches `.index` line order 1:1 (both derive from the same
-   `scan_grib` enumeration; `_map_grib_file_by_group` uses
-   `enumerate(scan_grib(...), start=1)` while `parse_index_file` uses
-   `enumerate(f)` starting at 0 — **watch this off-by-one**; reconcile
-   the index base before trusting the join).
+1. **Dump carries a real `level` column — CONFIRMED (overturns the
+   original Defect 2).** `extract_dataset_chunk_index(grib=True)` emits
+   `level`; `isobaricInhPa ∈ ECCODES_VERTICAL_LEVELS`. Empirically, the
+   real scan's `isobaricInhPa/0` coordinate for the first pl message
+   decodes (`base64:` → `<f8`) to **850.0 hPa** — i.e. the level value is
+   present and correct in the scanned group, not lost.
+2. **`.index` `levelist` coverage — CONFIRMED.** 5 559 messages in the
+   0h file; `levtype` counts `sfc=1428, pl=4131`; **pl lines missing
+   `levelist`: 0**, **non-pl lines with `levelist`: 0**. The
+   `levtype=='pl'` guard is safe. (51 members incl. control `-1`, uniform
+   per-member counts.)
+3. **Off-by-one — CONFIRMED REAL.** `.index` line **528** (0-based) is
+   `u @ 850 hPa`; the scan's group **529** (1-based, `enumerate(..., start=1)`)
+   decodes to 850.0 hPa — same message, indices differ by one. The
+   `idx_meta` join in `create_member_groups_from_index` must map dump
+   `idx` (1-based) to `.index` line `idx-1` (0-based), or every row
+   shifts by one member.
 
-Item 3 is the one real implementation hazard surfaced by the trace: the
-dump is 1-based (`start=1`, then `.set_index("idx")`), the index map is
-0-based. The join must align them or every row shifts by one member.
+Net effect on the fix: the level-recovery logic stays (now justified as
+authoritative cross-check + old-kerchunk guard, not as the sole source),
+and the off-by-one becomes a hard requirement rather than a caution.
 
 ## Gates (free) before any paid Coiled run
 
