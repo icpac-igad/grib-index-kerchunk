@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 import fsspec
 from ecmwf_par_to_ensemble_members import (
-    ECMWFParquetProcessor, ECMWF_0P25_FIELD_SHAPE,
+    ECMWFParquetProcessor, ECMWF_0P25_FIELD_SHAPE, ECMWF_0P4_FIELD_SHAPE,
 )
 
 import argparse
@@ -36,15 +36,17 @@ _ap.add_argument("--run", default="00", choices=["00", "06", "12", "18"])
 _ap.add_argument("--hour", default="0", help="forecast hour (default 0; use a non-0h to exercise full level coverage)")
 _ap.add_argument("--stream", default="enfo", choices=["enfo", "oper"],
                  help="enfo=perturbed (49r1 also bundles control); oper=50r1 control")
+_ap.add_argument("--res", default="0p25", choices=["0p25", "0p4"],
+                 help="0p25=ifs/0p25 (>=2024-02-29); 0p4=0p4-beta archive (2023-01-18..2024-02-28)")
 _args = _ap.parse_args()
-DATE, RUN, HOUR, STREAM = _args.date, _args.run, _args.hour, _args.stream
+DATE, RUN, HOUR, STREAM, RES = _args.date, _args.run, _args.hour, _args.stream, _args.res
 
-if STREAM == "oper":
-    GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/ifs/0p25/oper/"
-            f"{DATE}{RUN}0000-{HOUR}h-oper-fc.grib2")
-else:
-    GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/ifs/0p25/enfo/"
-            f"{DATE}{RUN}0000-{HOUR}h-enfo-ef.grib2")
+# Resolution -> path prefix and expected per-message field shape.
+_PREFIX = "0p4-beta" if RES == "0p4" else "ifs/0p25"
+EXPECTED_SHAPE = ECMWF_0P4_FIELD_SHAPE if RES == "0p4" else ECMWF_0P25_FIELD_SHAPE
+_suffix = "oper-fc" if STREAM == "oper" else "enfo-ef"
+GRIB = (f"s3://ecmwf-forecasts/{DATE}/{RUN}z/{_PREFIX}/{STREAM}/"
+        f"{DATE}{RUN}0000-{HOUR}h-{_suffix}.grib2")
 INDEX = GRIB.replace(".grib2", ".index")
 
 # levtype -> the typeOfLevel name scan_grib would put in the dump row
@@ -72,6 +74,7 @@ def build_faithful_dump(index_lines):
             "name": d.get("param", ""),
             "paramId": 0,
             "level": 0,                                     # FORCE recovery from .index
+            "uri": GRIB,                                    # real dumps carry this; drives resolution + .index
         })
     return pd.DataFrame(rows).set_index("idx")
 
@@ -156,11 +159,11 @@ def main():
         check("NO collapse to level 0 for pl",
               0 not in u_levels, f"u levels: {sorted(u_levels)}")
 
-        # 0.25 deg shape, not the 1 deg placeholder
+        # resolution-correct field shape, not the legacy 1 deg placeholder
         zarray_keys = [k for k in store if k.endswith(".zarray")]
         shapes = {tuple(json.loads(store[k])["shape"]) for k in zarray_keys}
-        check(".zarray shape is 0.25deg [1,721,1440] (not [1,181,360])",
-              shapes == {tuple(ECMWF_0P25_FIELD_SHAPE)},
+        check(f".zarray shape is {RES} {EXPECTED_SHAPE} (not [1,181,360])",
+              shapes == {tuple(EXPECTED_SHAPE)},
               f"distinct shapes: {shapes}")
 
         # member separation: a member's (var,level) group count must derive

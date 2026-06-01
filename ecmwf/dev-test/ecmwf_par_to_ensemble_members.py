@@ -38,10 +38,21 @@ warnings.filterwarnings('ignore')
 # Configuration
 ENSEMBLE_MEMBERS_TOTAL = 51  # Control (-1) + 50 perturbed members (1-50)
 
-# ECMWF open-data 0.25 deg grid: 721 latitudes x 1440 longitudes. One GRIB
-# message is a single 2-D field => one (var, level) zarr group is a single
-# [1, 721, 1440] chunk. Replaces the legacy [1, 181, 360] (1 deg) placeholder.
+# ECMWF open-data grid shapes. One GRIB message is a single 2-D field => one
+# (var, level) zarr group is a single [1, lat, lon] chunk. Replaces the legacy
+# [1, 181, 360] (1 deg) placeholder.
+#   0.25 deg (ifs/0p25, >= 2024-02-29): 721 lat x 1440 lon
+#   0.40 deg (0p4-beta, 2023-01-18 .. 2024-02-28): 451 lat x 900 lon
 ECMWF_0P25_FIELD_SHAPE = [1, 721, 1440]
+ECMWF_0P4_FIELD_SHAPE = [1, 451, 900]
+
+
+def field_shape_for_uri(grib_uri: str) -> list:
+    """Pick the per-message field shape from the resolution token in the path.
+    '0p4-beta' -> 0.4 deg; everything else (ifs/0p25) -> 0.25 deg."""
+    if grib_uri and ("0p4" in grib_uri or "0p40" in grib_uri):
+        return ECMWF_0P4_FIELD_SHAPE
+    return ECMWF_0P25_FIELD_SHAPE
 
 
 class ECMWFParquetProcessor:
@@ -61,6 +72,9 @@ class ECMWFParquetProcessor:
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
         self.run = run
+        # Per-message field shape, set per file from the GRIB URI resolution
+        # token (0.25 deg default; 0.4 deg for the 0p4-beta archive era).
+        self._field_shape = ECMWF_0P25_FIELD_SHAPE
 
     def log(self, message: str, level: str = "INFO"):
         """Log message with timestamp."""
@@ -156,6 +170,8 @@ class ECMWFParquetProcessor:
                                 f"enfo/{ts}-{forecast_hour}h-enfo-ef.grib2")
 
         self.log(f"  GRIB URI: {grib_uri}")
+        self._field_shape = field_shape_for_uri(grib_uri)
+        self.log(f"  Field shape (from resolution): {self._field_shape}")
         return df, grib_uri
 
     def parse_index_file(self, grib_uri: str) -> Dict[int, Dict]:
@@ -363,13 +379,13 @@ class ECMWFParquetProcessor:
             # template carried the wrong grid shape — see
             # 2026-06-01-step2-realigner-fix-scope.md Defect 3.)
             zarr_store[f"{var_key}/.zarray"] = json.dumps({
-                'chunks': ECMWF_0P25_FIELD_SHAPE,
+                'chunks': self._field_shape,
                 'compressor': None,
                 'dtype': '<f4',
                 'fill_value': 'NaN',
                 'filters': None,
                 'order': 'C',
-                'shape': ECMWF_0P25_FIELD_SHAPE,
+                'shape': self._field_shape,
                 'zarr_format': 2
             })
 
