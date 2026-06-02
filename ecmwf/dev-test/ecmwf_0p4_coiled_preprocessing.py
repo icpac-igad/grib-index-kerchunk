@@ -133,11 +133,13 @@ def main():
         return 0
 
     import coiled
-    import fsspec
+    from distributed import Client
+
+    date = args.date
 
     @coiled.function(
         vm_type=args.vm_type,          # 49r1 driver: n2-standard-2
-        software=args.software,        # 49r1 driver: gik-coiled-v6
+        software=args.software,        # gik-coiled-v6 (kerchunk 0.2.6 container)
         workspace=args.workspace,      # 49r1 driver: gcp-sewaa-nka
         name="func-ecmwf-0p4",         # distinct from func-ecmwf-49r1 / -50r1
         region=args.region,            # 49r1 driver: us-east1
@@ -145,22 +147,56 @@ def main():
         idle_timeout="30 minutes",     # 49r1 driver: 30 minutes
     )
     def scan_one(task):
-        from fmrc_utils import s3_ecmwf_scan_grib_storing
-        fs = fsspec.filesystem("s3", anon=True)
-        creds_path = os.path.join(
-            os.environ.get("DASK_WORKER_LOCAL_DIRECTORY", "."),
-            "coiled-data.json",
-        )
-        s3_ecmwf_scan_grib_storing(
-            fs, task["url"], args.date, "index", f"{task['hour']}h",
-            GCS_BUCKET, creds_path, stream=task["stream"],
-        )
-        return f"{task['stream']}/{task['hour']}h ok"
+        # gik-coiled-v6 ships kerchunk 0.2.6 (no kerchunk._grib_idx), so we use
+        # the image's BAKED-IN dynamic_zarr_store primitives rather than the
+        # newer fmrc_utils refactor. The image also bakes in stale AWS creds, so
+        # force ANONYMOUS s3 (public ECMWF bucket) via the fsspec protocol
+        # default — scan_grib() opens the url with no storage_options.
+        import os
+        import fsspec
+        import s3fs
+        fsspec.config.conf["s3"] = {"anon": True}
+        s3fs.S3FileSystem.clear_instance_cache()
+        os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+        os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/nonexistent"
+        import dynamic_zarr_store as dz
+
+        # locate coiled-data.json (uploaded to workers via client.upload_file)
+        creds = None
+        cands = []
+        try:
+            from distributed import get_worker
+            cands.append(get_worker().local_directory)
+        except Exception:
+            pass
+        cands += [os.environ.get("DASK_WORKER_LOCAL_DIRECTORY"), os.getcwd(), "."]
+        for c in cands:
+            if c and os.path.exists(os.path.join(c, "coiled-data.json")):
+                creds = os.path.join(c, "coiled-data.json")
+                break
+        if creds is None:
+            raise FileNotFoundError("coiled-data.json not found on worker")
+
+        out = f'e_sg_mdt_{date}_{task["stream"]}_{task["hour"]}h.parquet'
+        df = dz._map_grib_file_by_group(task["url"])     # scan_grib -> per-message dump
+        df.to_parquet(out, engine="pyarrow")
+
+        from google.oauth2 import service_account
+        from google.cloud import storage
+        cobj = service_account.Credentials.from_service_account_file(creds)
+        cl = storage.Client(credentials=cobj, project=cobj.project_id)
+        dest = f'fmrc/scan_grib{date}/{out}'
+        cl.bucket(GCS_BUCKET).blob(dest).upload_from_filename(out)
+        return f"{task['stream']}/{task['hour']}h ok ({len(df)} msgs)"
 
     cluster = scan_one.cluster
     cluster.adapt(min=1, max=args.max_workers)
+    # ship the GCS service-account key to every worker (image doesn't bake it in)
+    Client(cluster).upload_file("coiled-data.json")
     results = list(scan_one.map(tasks))
     print(f"completed {len(results)}/{len(tasks)}")
+    for r in results:
+        print("  ", r)
     return 0
 
 
