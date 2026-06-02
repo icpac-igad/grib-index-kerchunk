@@ -126,10 +126,20 @@ python3 ecmwf_par_to_ensemble_members.py \
     --run 00
 # enfo dumps -> ens01..ens50 ; oper dumps -> control ; into {H}h/{m}.par
 ```
-**GATE:** before trusting, diff one `control` rt000 vs the live 49r
-`/tmp/ins/.../ecmwf-2024052900-control-rt000.par` — expect the consolidated
-~2774-key shape (`zarr_consolidated_format`/`metadata`, `var/levtype/idx`),
-NOT a 375-key grib_tree skeleton. (Assistant can do this step + gate.)
+**GATE — now AUTOMATED.** Run `ecmwf/dev-test/gate_step2_realigner.py`
+(added 2026-06-01) against the live 50r1 `.index`, both streams:
+```bash
+cd ecmwf/dev-test
+python3 gate_step2_realigner.py --date 20260513 --run 00 --hour 12 --stream enfo  # 50 perturbed
+python3 gate_step2_realigner.py --date 20260513 --run 00 --hour 12 --stream oper  # control
+```
+Both PASS 8/8 as of 2026-06-01: per-level `u/isobaricInhPa/{hPa}` keys
+spanning the **full 14-level** set `[10,50,100,150,200,250,300,400,500,
+600,700,850,925,1000]`, `[1,721,1440]` 0.25° `.zarray` shapes, correct
+member counts (enfo=50 perturbed, oper=1 control), and no replicate-to-all.
+This supersedes the old "diff vs the legacy 9-level `20240529` control
+rt000" gate — the legacy artifact is the WRONG baseline (1° stub shape,
+collapsed levels). (Assistant can run this gate; it is free, anon-S3 only.)
 
 **▶ Step 3 — package & rename to the template layout** →
 `gik-fmrc/v2ecmwf_fmrc/{ens_control|ens_NN}/ecmwf-2026051300-{m}-rt{hhh}.par`

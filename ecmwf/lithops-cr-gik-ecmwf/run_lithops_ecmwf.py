@@ -119,8 +119,37 @@ HOURS_3H = list(range(0, 145, 3))       # 0-144h at 3h intervals (49 steps)
 HOURS_6H = list(range(150, 361, 6))     # 150-360h at 6h intervals (36 steps)
 ALL_FORECAST_HOURS = HOURS_3H + HOURS_6H  # Total: 85 steps
 
-REFERENCE_DATE = '20240529'
+REFERENCE_DATE = os.environ.get('ECMWF_REFERENCE_DATE', '20240529')
 S3_BUCKET = "ecmwf-forecasts"
+
+# Source-path resolution, selected at deploy time (same per-era image
+# strategy as the 49r1/50r1 cutover -- one env var, no per-date logic):
+#   0p25 (default): ifs/0p25/...   grid 721x1440, >= 2024-02-29
+#   0p4           : 0p4-beta/...    grid 451x900, 2023-01-18 .. 2024-02-28
+# A 0p4 deployment also sets ECMWF_REFERENCE_DATE to a 0.4deg date and
+# TEMPLATE_URL / ECMWF_TEMPLATE_PATH to the 0.4deg template artifact.
+ECMWF_RESOLUTION = os.environ.get('ECMWF_RESOLUTION', '0p25').lower()
+STREAM_PATH = '0p4-beta' if ECMWF_RESOLUTION in ('0p4', '0p40', '0p4-beta') else 'ifs/0p25'
+logger.info(f"Source resolution: {ECMWF_RESOLUTION} (path segment '{STREAM_PATH}'), "
+            f"reference date {REFERENCE_DATE}")
+
+
+def ecmwf_index_url(date_str: str, run: str, hour: int, stream: str = 'enfo') -> str:
+    """Build the S3 .index URL for one (date, run, hour), resolution-aware.
+
+    0.25deg -> s3://ecmwf-forecasts/{date}/{run}z/ifs/0p25/{stream}/...
+    0.4deg  -> s3://ecmwf-forecasts/{date}/{run}z/0p4-beta/{stream}/...
+    stream 'enfo' -> '-enfo-ef' (perturbed + bundled control for 0p4/49r1);
+    stream 'oper' -> '-oper-fc' (50r1 control). The companion GRIB URL is
+    this with '.index' stripped (consumer appends '.grib2' by convention).
+    """
+    suffix = 'oper-fc' if stream == 'oper' else 'enfo-ef'
+    return (
+        f"s3://{S3_BUCKET}/{date_str}/{run}z/{STREAM_PATH}/{stream}/"
+        f"{date_str}{run}0000-{hour}h-{suffix}.index"
+    )
+
+
 # Use baked-in template from Docker image if available, fallback to /tmp download
 TEMPLATE_CACHE_PATH = os.environ.get(
     'ECMWF_TEMPLATE_PATH',
@@ -267,6 +296,13 @@ def parse_grib_index(idx_url: str, member_filter: Optional[str] = None) -> List[
                     'byte_length': entry_data['_length'],
                     'variable': entry_data.get('param', ''),
                     'level': entry_data.get('levtype', ''),
+                    # `levelist` is the actual level value (e.g. '250' for pl,
+                    # layer string for sol). Pre-fix this was dropped and the
+                    # key collapsed all 13/14 isobaric levels into one per
+                    # (var, step, member) -- the cGAN per-level bug. See
+                    # cGAN_tutorial GIK_PARQUET_PER_LEVEL_KEYS_NEEDED.md and
+                    # 2026-05-29-per-level-keys-fix-and-template-implications.md.
+                    'level_value': str(entry_data.get('levelist', '')),
                     'step': entry_data.get('step', '0'),
                     'member': member,
                     'date': entry_data.get('date', ''),
@@ -297,7 +333,18 @@ def create_references_from_index(grib_url: str, idx_entries: List[Dict]) -> Dict
         level_name = entry['level'].replace(' ', '_')
         member_name = entry['member']
 
-        key = f"{var_name}/{level_name}/{member_name}/0.0.0"
+        # Per-pressure-level fix: pl messages get the hPa value embedded in
+        # the key so each isobaric level becomes its own reference; sfc/sol
+        # keep their old shape. See cGAN_tutorial GIK_MAINTAINER_REQUEST.md.
+        # This mirrors the same fix landed in ecmwf/ecmwf_index_processor.py
+        # via 4ca1c21 -- the inline copy here is what the Cloud Run runtime
+        # actually executes (run_lithops_ecmwf.py is self-contained per
+        # CLAUDE.md design), so the ecmwf_index_processor.py fix alone did
+        # NOT reach production. This edit closes that gap.
+        if level_name == 'pl' and entry.get('level_value'):
+            key = f"{var_name}/pl/{entry['level_value']}/{member_name}/0.0.0"
+        else:
+            key = f"{var_name}/{level_name}/{member_name}/0.0.0"
         references[key] = [grib_url, start, length]
 
     references['.zgroup'] = json.dumps({"zarr_format": 2})
@@ -318,11 +365,9 @@ def build_refs_from_indices(
 
     for hour in hours:
         try:
-            # Include run hour in timestamp: 00z→000000, 18z→180000
-            idx_url = (
-                f"s3://{S3_BUCKET}/{date_str}/{run}z/ifs/0p25/enfo/"
-                f"{date_str}{run}0000-{hour}h-enfo-ef.index"
-            )
+            # Include run hour in timestamp: 00z→000000, 18z→180000.
+            # Resolution-aware path (ifs/0p25 vs 0p4-beta) via ECMWF_RESOLUTION.
+            idx_url = ecmwf_index_url(date_str, run, hour, stream='enfo')
             grib_url = idx_url.replace('.index', '')
 
             idx_entries = parse_grib_index(idx_url, member_filter=member_name)
@@ -596,11 +641,9 @@ def upload_to_gcs(output_dir: Path, date_str: str, run: str) -> Optional[str]:
 
 def validate_index_availability(date_str: str, run: str) -> Tuple[bool, int, int]:
     """Check that .index files are available on S3 for the target date."""
-    # Include run hour in timestamp: 00z→000000, 18z→180000
-    idx_url = (
-        f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/enfo/"
-        f"{date_str}{run}0000-0h-enfo-ef.index"
-    )
+    # Include run hour in timestamp: 00z→000000, 18z→180000.
+    # Resolution-aware path (ifs/0p25 vs 0p4-beta) via ECMWF_RESOLUTION.
+    idx_url = ecmwf_index_url(date_str, run, 0, stream='enfo')
 
     try:
         fs = fsspec.filesystem("s3", anon=True)
