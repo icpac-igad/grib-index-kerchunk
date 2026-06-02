@@ -85,10 +85,13 @@ they share the entire pipeline path (single-stream, control bundled,
 
 ## What remains to actually build a 0.4° template
 
-1. **A 0.4° Coiled scan driver** — a one-line-prefix variant of
-   `ecmwf_49r1_coiled_preprocessing.py` (single-stream, 85 tasks), with
-   the URL built as `…/0p4-beta/enfo/…` instead of `…/ifs/0p25/enfo/…`.
-   ~5-line delta. (Not written yet.)
+1. **A 0.4° Coiled scan driver** — **DONE**:
+   `ecmwf/dev-test/ecmwf_0p4_coiled_preprocessing.py` (single-stream, 85
+   tasks), URL built as `…/0p4-beta/enfo/…`, with an out-of-era guard
+   (2023-01-18 .. 2024-02-28). Dry-run validated and all generated URLs
+   (0h/126h/360h) confirmed live on S3 (grib + index). Output naming is
+   identical to the 49r1 driver so the dumps flow into the same realigner.
+   Still PAID/user-launched (needs Coiled auth + `coiled-data.json`).
 2. **Reference date** — any 0.4° date works (era is homogeneous); pick a
    clean mid-era 00z, e.g. `20230601`.
 3. **Realigner** — no change needed; it is already resolution-aware and
