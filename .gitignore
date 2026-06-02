@@ -10,3 +10,6 @@ gcp-*-key.json
 **/.ipynb_checkpoints/
 __pycache__/
 *.pyc
+
+# secrets
+.env
