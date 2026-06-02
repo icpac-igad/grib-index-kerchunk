@@ -1,0 +1,95 @@
+# gate_step2_realigner.py — validation matrix
+# Run: 2026-06-02 | branch ecmwf-50r1-template
+# All forecast hour 12h (non-0h) except where noted. Free: anon S3 .index reads only.
+# Covers all FOUR ECMWF template eras + both 50r1 streams. Every run PASSES 8/8.
+
+===================================================================
+$ python3 gate_step2_realigner.py --date 20230601 --hour 12 --res 0p4
+===================================================================
+GATE: Step 2 realigner fix
+  index: s3://ecmwf-forecasts/20230601/00z/0p4-beta/enfo/20230601000000-12h-enfo-ef.index
+  .index messages: 4233
+  expected members: 51 (control=True); pl levels: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  produced 51 member files: ['control', 'ens01', 'ens02'] ... ['ens49', 'ens50']
+  [PASS] member count == .index member count — 51 vs 51
+  [PASS] control present iff .index has it — control in output=True, .index has control=True
+  [PASS] pl keys are PER-LEVEL (u has multiple isobaric levels) — u levels in control: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] FULL level coverage: u carries ALL 9 published levels — u=[50, 200, 250, 300, 500, 700, 850, 925, 1000] vs published=[50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] recovered pl levels are a subset of .index levelist set — recovered [50, 200, 250, 300, 500, 700, 850, 925, 1000] ⊆ [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] NO collapse to level 0 for pl — u levels: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] .zarray shape is 0p4 [1, 451, 900] (not [1,181,360]) — distinct shapes: {(1, 451, 900)}
+  [PASS] per-member key set derives from own messages only (no replicate-to-all) — control groups=83, own msgs=83, total msgs=4233, members=51
+GATE PASS: 8/8 checks passed
+
+===================================================================
+$ python3 gate_step2_realigner.py --date 20240529 --hour 12
+===================================================================
+GATE: Step 2 realigner fix
+  index: s3://ecmwf-forecasts/20240529/00z/ifs/0p25/enfo/20240529000000-12h-enfo-ef.index
+  .index messages: 5559
+  expected members: 51 (control=True); pl levels: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  produced 51 member files: ['control', 'ens01', 'ens02'] ... ['ens49', 'ens50']
+  [PASS] member count == .index member count — 51 vs 51
+  [PASS] control present iff .index has it — control in output=True, .index has control=True
+  [PASS] pl keys are PER-LEVEL (u has multiple isobaric levels) — u levels in control: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] FULL level coverage: u carries ALL 9 published levels — u=[50, 200, 250, 300, 500, 700, 850, 925, 1000] vs published=[50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] recovered pl levels are a subset of .index levelist set — recovered [50, 200, 250, 300, 500, 700, 850, 925, 1000] ⊆ [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] NO collapse to level 0 for pl — u levels: [50, 200, 250, 300, 500, 700, 850, 925, 1000]
+  [PASS] .zarray shape is 0p25 [1, 721, 1440] (not [1,181,360]) — distinct shapes: {(1, 721, 1440)}
+  [PASS] per-member key set derives from own messages only (no replicate-to-all) — control groups=109, own msgs=109, total msgs=5559, members=51
+GATE PASS: 8/8 checks passed
+
+===================================================================
+$ python3 gate_step2_realigner.py --date 20250515 --hour 12
+===================================================================
+GATE: Step 2 realigner fix
+  index: s3://ecmwf-forecasts/20250515/00z/ifs/0p25/enfo/20250515000000-12h-enfo-ef.index
+  .index messages: 8007
+  expected members: 51 (control=True); pl levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  produced 51 member files: ['control', 'ens01', 'ens02'] ... ['ens49', 'ens50']
+  [PASS] member count == .index member count — 51 vs 51
+  [PASS] control present iff .index has it — control in output=True, .index has control=True
+  [PASS] pl keys are PER-LEVEL (u has multiple isobaric levels) — u levels in control: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] FULL level coverage: u carries ALL 13 published levels — u=[50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] vs published=[50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] recovered pl levels are a subset of .index levelist set — recovered [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] ⊆ [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] NO collapse to level 0 for pl — u levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] .zarray shape is 0p25 [1, 721, 1440] (not [1,181,360]) — distinct shapes: {(1, 721, 1440)}
+  [PASS] per-member key set derives from own messages only (no replicate-to-all) — control groups=151, own msgs=157, total msgs=8007, members=51
+GATE PASS: 8/8 checks passed
+
+===================================================================
+$ python3 gate_step2_realigner.py --date 20260513 --hour 12
+===================================================================
+GATE: Step 2 realigner fix
+  index: s3://ecmwf-forecasts/20260513/00z/ifs/0p25/enfo/20260513000000-12h-enfo-ef.index
+  .index messages: 8500
+  expected members: 50 (control=False); pl levels: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  produced 50 member files: ['ens01', 'ens02', 'ens03'] ... ['ens49', 'ens50']
+  [PASS] member count == .index member count — 50 vs 50
+  [PASS] control present iff .index has it — control in output=False, .index has control=False
+  [PASS] pl keys are PER-LEVEL (u has multiple isobaric levels) — u levels in ens01: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] FULL level coverage: u carries ALL 14 published levels — u=[10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] vs published=[10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] recovered pl levels are a subset of .index levelist set — recovered [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] ⊆ [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] NO collapse to level 0 for pl — u levels: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] .zarray shape is 0p25 [1, 721, 1440] (not [1,181,360]) — distinct shapes: {(1, 721, 1440)}
+  [PASS] per-member key set derives from own messages only (no replicate-to-all) — ens01 groups=164, own msgs=170, total msgs=8500, members=50
+GATE PASS: 8/8 checks passed
+
+===================================================================
+$ python3 gate_step2_realigner.py --date 20260513 --hour 12 --stream oper
+===================================================================
+GATE: Step 2 realigner fix
+  index: s3://ecmwf-forecasts/20260513/00z/ifs/0p25/oper/20260513000000-12h-oper-fc.index
+  .index messages: 184
+  expected members: 1 (control=True); pl levels: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  produced 1 member files: ['control'] ... ['control']
+  [PASS] member count == .index member count — 1 vs 1
+  [PASS] control present iff .index has it — control in output=True, .index has control=True
+  [PASS] pl keys are PER-LEVEL (u has multiple isobaric levels) — u levels in control: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] FULL level coverage: u carries ALL 14 published levels — u=[10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] vs published=[10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] recovered pl levels are a subset of .index levelist set — recovered [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000] ⊆ [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] NO collapse to level 0 for pl — u levels: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  [PASS] .zarray shape is 0p25 [1, 721, 1440] (not [1,181,360]) — distinct shapes: {(1, 721, 1440)}
+  [PASS] per-member key set derives from own messages only (no replicate-to-all) — control groups=178, own msgs=184, total msgs=184, members=1
+GATE PASS: 8/8 checks passed
+
