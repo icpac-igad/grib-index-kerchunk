@@ -96,11 +96,17 @@ they share the entire pipeline path (single-stream, control bundled,
    clean mid-era 00z, e.g. `20230601`.
 3. **Realigner** — no change needed; it is already resolution-aware and
    the GATE passes on real 0.4° data.
-4. **Runtime (`run_lithops_ecmwf.py`)** — Stage 2 `.index` URL builder
-   needs a `0p4-beta` path branch, and `REFERENCE_DATE` / template name
-   set to the 0.4° artifact, same dual-image cutover strategy as 49r1/50r1
-   (separate Cloud Run image per era, swapped by revision at the
-   2024-02-29 boundary).
+4. **Runtime (`run_lithops_ecmwf.py`)** — **DONE**: added an
+   `ECMWF_RESOLUTION` env switch (`0p25` default | `0p4`) and a single
+   `ecmwf_index_url()` helper that both Stage 2 (`build_refs_from_indices`)
+   and `validate_index_availability` now use, so the `.index`/grib path
+   becomes `…/0p4-beta/…` when `ECMWF_RESOLUTION=0p4`. `REFERENCE_DATE` is
+   now env-overridable (`ECMWF_REFERENCE_DATE`). A 0.4° deployment sets
+   `ECMWF_RESOLUTION=0p4`, `ECMWF_REFERENCE_DATE=20230601`, and
+   `TEMPLATE_URL`/`ECMWF_TEMPLATE_PATH` to the 0.4° artifact — same
+   per-era image strategy, swapped at the 2024-02-29 boundary. Default
+   (`0p25`) behaviour is unchanged. Validated: helper emits live S3 URLs
+   for both eras (`.index` + `.grib2` confirmed present for 0.4°).
 5. **Cost** — identical shape to the 49r1 single-stream preprocessing
    (~1 h Coiled, 85 tasks), since 0.4° files are smaller (~2.6 GB) the
    scan is if anything slightly faster.
