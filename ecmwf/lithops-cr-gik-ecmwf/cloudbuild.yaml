@@ -1,43 +1,50 @@
-# Cloud Build configuration for Lithops ECMWF Runtime
+# Cloud Build configuration for Lithops ECMWF Runtime (PER-ERA)
 #
-# Build and push Docker image to GCR for use as Lithops Cloud Run runtime.
+# Builds + pushes the per-era runtime image. Era selected via --substitutions;
+# defaults = 50r1 (current ongoing ops). The Dockerfile bakes the matching
+# HF template + ECMWF_* runtime env from these build args.
 #
-# Usage:
-#   gcloud builds submit \
-#     --config=cloudbuild.yaml \
-#     --project=e4drr-crafd \
+# Usage (50r1 = defaults):
+#   gcloud builds submit --config=cloudbuild.yaml --project=e4drr-crafd \
 #     --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com
+#
+#   # 49r1 13-level (covers MAM 2025 + MAM 2026 -> cGAN):
+#   ... --substitutions=_ERA=49r1,_TEMPLATE_ARTIFACT=gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz,_REFERENCE_DATE=20250515,_RESOLUTION=0p25,_CONTROL_STREAM=enfo
+#   # 0.4-beta 9-level:
+#   ... --substitutions=_ERA=0p4,_TEMPLATE_ARTIFACT=gik-fmrc-v2ecmwf_fmrc-0p4-beta.tar.gz,_REFERENCE_DATE=20230601,_RESOLUTION=0p4,_CONTROL_STREAM=enfo
+
+substitutions:
+  _ERA: '50r1'
+  _TEMPLATE_ARTIFACT: 'gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz'
+  _REFERENCE_DATE: '20260513'
+  _RESOLUTION: '0p25'
+  _CONTROL_STREAM: 'oper'
 
 steps:
-  # Build the Lithops runtime image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--build-arg=TEMPLATE_ARTIFACT=${_TEMPLATE_ARTIFACT}'
+      - '--build-arg=ECMWF_REFERENCE_DATE=${_REFERENCE_DATE}'
+      - '--build-arg=ECMWF_RESOLUTION=${_RESOLUTION}'
+      - '--build-arg=ECMWF_CONTROL_STREAM=${_CONTROL_STREAM}'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:$BUILD_ID'
+      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}-$BUILD_ID'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:latest'
+      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}'
       - '.'
-    timeout: 1200s  # 20 minutes for build
-
-  # Push versioned tag
+    timeout: 1200s
   - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:$BUILD_ID'
-
-  # Push latest tag
+    args: ['push', 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}-$BUILD_ID']
   - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:latest'
+    args: ['push', 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}']
 
 images:
-  - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:$BUILD_ID'
-  - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:latest'
+  - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}-$BUILD_ID'
+  - 'gcr.io/$PROJECT_ID/ecmwf-lithops-runtime:${_ERA}'
 
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: 'E2_HIGHCPU_8'
   diskSizeGb: 100
-timeout: 1800s  # 30 minutes total
+timeout: 1800s

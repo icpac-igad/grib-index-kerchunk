@@ -36,6 +36,7 @@ FROM_MONTH="2024-03"
 TO_MONTH="2025-12"
 DRY_RUN_FLAG=""
 MAX_WORKERS=35
+ERA="49r1"
 
 # --- Argument parsing ---
 while [[ $# -gt 0 ]]; do
@@ -44,10 +45,28 @@ while [[ $# -gt 0 ]]; do
         --from)      FROM_MONTH="$2";  shift ;;
         --to)        TO_MONTH="$2";    shift ;;
         --workers)   MAX_WORKERS="$2"; shift ;;
+        --era)       ERA="$2";         shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
     shift
 done
+
+
+# --- Per-era env (MUST match the DEPLOYED Cloud Run image's era) -------------
+# Era selects template + source path + control stream. Default 49r1 (the
+# 13-level era covers the 2024-2025 backfill range, incl. MAM 2025/2026).
+ERA="${ERA:-49r1}"
+_HF="https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main"
+case "$ERA" in
+  49r1) export ECMWF_REFERENCE_DATE=20250515 ECMWF_RESOLUTION=0p25 ECMWF_CONTROL_STREAM=enfo
+        export TEMPLATE_URL="$_HF/gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz" ;;
+  50r1) export ECMWF_REFERENCE_DATE=20260513 ECMWF_RESOLUTION=0p25 ECMWF_CONTROL_STREAM=oper
+        export TEMPLATE_URL="$_HF/gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz" ;;
+  0p4)  export ECMWF_REFERENCE_DATE=20230601 ECMWF_RESOLUTION=0p4  ECMWF_CONTROL_STREAM=enfo
+        export TEMPLATE_URL="$_HF/gik-fmrc-v2ecmwf_fmrc-0p4-beta.tar.gz" ;;
+  *) echo "Unknown --era: $ERA (use 49r1|50r1|0p4)"; exit 1 ;;
+esac
+echo "  Era        : $ERA  (ref $ECMWF_REFERENCE_DATE, res $ECMWF_RESOLUTION, control $ECMWF_CONTROL_STREAM)"
 
 # Build ordered list of YYYY-MM months between FROM and TO (inclusive)
 mapfile -t MONTHS < <(python3 -c "
