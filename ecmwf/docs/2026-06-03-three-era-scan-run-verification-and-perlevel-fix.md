@@ -201,3 +201,95 @@ GCS dumps  →  ecmwf_par_to_ensemble_members.py  →  {H}h/{member}.par (51 or 
            →  tar czf gik-fmrc-v2ecmwf_fmrc-<era>.tar.gz
            →  upload to HF E4DRR/grib-index-kerchunk-templates
 ```
+
+---
+
+## 6. Realigner → verify → package → HF runbook (executed)
+
+Run with the `.venv-gate` Python (has pandas/pyarrow/fsspec/s3fs/kerchunk;
+the realigner does NOT use Coiled). `coiled-data.json` is the GCS key; HF
+upload reads `HF_TOKEN` from the repo-root `.env` (gitignored).
+
+### 6.0 Realigner 0h fix (prerequisite, committed)
+
+At step 0, `scan_grib` stores some constant fields (e.g. `lsm`) **inline
+with `uri=NaN`**, which can be the first dump row → `df['uri'].iloc[0]`
+was NaN → `field_shape_for_uri(NaN)` raised `argument of type 'float' is
+not iterable`, dropping the entire 0h hour (= `rt000`, the hour the runtime
+reads). Fixed in `ecmwf_par_to_ensemble_members.py`: take the first
+non-null uri (`dropna`), coerce non-str → None, and `isinstance(str)`
+guard in `field_shape_for_uri`. Without this, every era loses rt000.
+
+### 6.1 Download dumps + run the realigner (per era)
+
+```bash
+# download that era's dumps from GCS -> local in/   (gik-coiled creds)
+python - <<'PY'
+from google.oauth2 import service_account; from google.cloud import storage; import os
+c=service_account.Credentials.from_service_account_file("ecmwf/coiled-data.json")
+cl=storage.Client(credentials=c, project=c.project_id)
+dst=f"/scratch/realign/<era>_<date>/in"; os.makedirs(dst, exist_ok=True)
+for b in cl.list_blobs("gik-ecmwf-aws-tf", prefix="fmrc/scan_grib<date>/"):
+    if b.name.endswith(".parquet"): b.download_to_filename(dst+"/"+b.name.split("/")[-1])
+PY
+
+# realign: dumps -> {H}h/{member}.par  (enfo->ens01..50[+control if bundled]; oper->control)
+cd ecmwf/dev-test
+AWS_NO_SIGN_REQUEST=YES <venv>/bin/python ecmwf_par_to_ensemble_members.py \
+    --input-dir /scratch/realign/<era>_<date>/in \
+    --output-dir /scratch/realign/<era>_<date>/out --run 00
+```
+
+### 6.2 Verify (per-level keys, shape, completeness)
+
+```python
+# expect: u carries the FULL era level set; shapes == era field shape;
+#         total .par == 85 * 51 = 4335 ; 0h present (51 members)
+import pandas as pd, json
+out=".../out"; EXP={…era levels…}
+df=pd.read_parquet(f"{out}/0h/control.par"); s=dict(zip(df.key,df.value))
+u={int(float(k.split('/')[2])) for k in s if k.startswith('u/isobaricInhPa/') and k.endswith('.zarray')}
+assert u==EXP and {tuple(json.loads(s[k])['shape']) for k in s if k.endswith('.zarray')}=={era_shape}
+```
+
+### 6.3 Package to template layout + tar
+
+```python
+import tarfile, os
+HOURS=list(range(0,145,3))+list(range(150,361,6))            # 85
+members=["control"]+[f"ens{i:02d}" for i in range(1,51)]     # 51
+mdir=lambda m: "ens_control" if m=="control" else f"ens_{int(m[3:]):02d}"
+with tarfile.open(TARPATH,"w:gz") as t:
+    for H in HOURS:
+        for m in members:
+            t.add(f"{out}/{H}h/{m}.par",
+                  arcname=f"gik-fmrc/v2ecmwf_fmrc/{mdir(m)}/ecmwf-{date}00-{m}-rt{H:03d}.par")
+# runtime reads only rt000.par per member; full 000..360 shipped to match legacy
+```
+
+### 6.4 Upload to HF `E4DRR/grib-index-kerchunk-templates`
+
+```python
+from huggingface_hub import upload_file
+tok=<HF_TOKEN from .env>
+upload_file(path_or_fileobj=TARPATH, path_in_repo=os.path.basename(TARPATH),
+            repo_id="E4DRR/grib-index-kerchunk-templates", repo_type="dataset", token=tok)
+```
+
+### 6.5 Per-era status & artifacts
+
+| Era | ref date | realign | per-level verify | tar | HF artifact |
+|---|---|---|---|---|---|
+| 49r1 13-level | 20250515 | 4335/4335 ✅ | u=13 lvls, [1,721,1440] ✅ | 14.1 MB | `gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz` ✅ |
+| 50r1 14-level | 20260513 | 4335/4335 ✅ | u=14 lvls, [1,721,1440] ✅ (ctrl has `z`) | 14.6 MB | `gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz` ✅ |
+| 0.4°-beta 9-level | 20230601 | 4335/4335 ✅ | u=9 lvls, [1,451,900] ✅ | 3.8 MB | `gik-fmrc-v2ecmwf_fmrc-0p4-beta.tar.gz` ✅ |
+
+All three rebuilt per-era templates are live on HF
+`E4DRR/grib-index-kerchunk-templates`. (The 4th era — 49r1 9-level,
+2024-02-29→2025-01-14 00z — is covered by the 13-level template as a safe
+superset, so no separate build unless a consumer needs the exact 9-level
+metadata.)
+
+Runtime wiring (deploy-time, not in this doc's scope): `run_lithops_ecmwf.py`
+selects an era via `ECMWF_REFERENCE_DATE` + `ECMWF_RESOLUTION` +
+`TEMPLATE_URL`/`ECMWF_TEMPLATE_PATH` pointing at the matching artifact.
