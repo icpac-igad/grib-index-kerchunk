@@ -1,0 +1,50 @@
+# Pinned conda environment for the ECMWF scan_grib Coiled software env.
+#
+# These are the EXACT versions captured from a live `gik-coiled-v6` worker
+# (container gik-coiled:v4, built 2024-10-30) on 2026-06-03 — the only stack
+# the scan_grib -> _map_grib_file_by_group path is known to work on. See
+# ecmwf/docs/2026-06-03-coiled-scangrib-env-dependency-pinning.md for why
+# these specific pins matter (kerchunk 0.2.6 + zarr 2.18; newer kerchunk
+# needs zarr 3, which breaks the reference-FS datatree open in scan).
+#
+# Build/register:
+#   docker build -f devops/Dockerfile.gik-coiled-pinned -t <registry>/gik-coiled:pinned .
+#   coiled software create gik-coiled-pinned --container <registry>/gik-coiled:pinned \
+#       --workspace gcp-sewaa-nka
+# The local Coiled CLIENT must match distributed/dask (2024.10.0) — see the MD.
+name: gik
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.7
+  # --- scan_grib core (the version-sensitive trio) ---
+  - kerchunk=0.2.6           # has _map_grib_file_by_group; NO kerchunk._grib_idx
+  - zarr=2.18.3              # zarr 2.x: newer kerchunk needs zarr 3 -> breaks scan
+  - numcodecs=0.13.1
+  - cfgrib=0.9.14.1
+  - eccodes=2.37.0
+  - xarray=2024.9.0
+  # --- dask/distributed (must match the local client) ---
+  - dask=2024.10.0
+  - distributed=2024.10.0
+  - cloudpickle=3.1.0
+  - msgpack-python=1.1.0
+  - lz4=4.3.3
+  - tornado=6.4.1
+  - toolz=1.0.0
+  # --- io / storage ---
+  - fsspec=2024.10.0
+  - s3fs=2024.10.0
+  - gcsfs=2024.10.0
+  - aiohttp=3.10.10
+  - botocore=1.35.23
+  - google-cloud-storage=2.18.2
+  - ujson=5.10.0
+  # --- data ---
+  - numpy=2.1.2
+  - pandas=2.2.3
+  - pyarrow=17.0.0
+  # coiled is NOT required inside the worker senv for the scan function
+  # (it only imports dynamic_zarr_store / fsspec / google.cloud). Add it only
+  # if you also use this env as the local client:
+  #   - coiled
