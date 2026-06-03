@@ -89,8 +89,11 @@ def main():
     # did NOT set a workspace (it used the `coiled login` default); the run
     # the user referenced was workspace gcp-sewaa-nka — made explicit here so
     # the scan can't accidentally land in the wrong workspace.
-    ap.add_argument("--software", default="gik-coiled-v6",
-                    help="Coiled software environment (notebook: gik-coiled-v6)")
+    ap.add_argument("--software", default="gik-coiled-pinned",
+                    help="Coiled software env. Default gik-coiled-pinned = the "
+                         "reproducible build (devops/Dockerfile.gik-coiled-pinned); "
+                         "build+register it first. Existing fallback with identical "
+                         "pins: --software gik-coiled-v6.")
     ap.add_argument("--workspace", default="gcp-sewaa-nka",
                     help="Coiled workspace/account (notebook used login default)")
     ap.add_argument("--vm-type", default="n2-standard-2")

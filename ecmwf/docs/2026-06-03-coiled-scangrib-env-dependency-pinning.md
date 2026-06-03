@@ -120,9 +120,10 @@ python ecmwf_49r1_coiled_preprocessing.py --date 20250515 --run 00 --software gi
 python ecmwf_50r1_coiled_preprocessing.py --date 20260513 --run 00 --software gik-coiled-pinned ...
 ```
 
-The three drivers default to `--software gik-coiled-v6`; pass
-`--software gik-coiled-pinned` to use the rebuilt one. Because the pins are
-identical, behaviour matches the original image exactly.
+The three drivers now **default to `--software gik-coiled-pinned`** — so you
+must build+register that image (above) before running with defaults. Until
+then, pass `--software gik-coiled-v6` (the existing prebuilt image with
+identical pins). Because the pins are identical, behaviour matches exactly.
 
 ## 7. Why we did NOT modernize instead
 

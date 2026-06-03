@@ -109,8 +109,11 @@ def main():
     # Coiled config — defaults follow the 49r1/50r1 drivers (which followed
     # the notebook). Workspace is made explicit so the ~1 h paid run can't
     # accidentally land in the wrong workspace.
-    ap.add_argument("--software", default="gik-coiled-v6",
-                    help="Coiled software environment (49r1 driver: gik-coiled-v6)")
+    ap.add_argument("--software", default="gik-coiled-pinned",
+                    help="Coiled software env. Default gik-coiled-pinned = the "
+                         "reproducible build (devops/Dockerfile.gik-coiled-pinned); "
+                         "build+register it first. Existing fallback with identical "
+                         "pins: --software gik-coiled-v6.")
     ap.add_argument("--workspace", default="gcp-sewaa-nka",
                     help="Coiled workspace/account (49r1 driver: gcp-sewaa-nka)")
     ap.add_argument("--vm-type", default="n2-standard-2")
