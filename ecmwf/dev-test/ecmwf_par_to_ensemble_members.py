@@ -50,7 +50,7 @@ ECMWF_0P4_FIELD_SHAPE = [1, 451, 900]
 def field_shape_for_uri(grib_uri: str) -> list:
     """Pick the per-message field shape from the resolution token in the path.
     '0p4-beta' -> 0.4 deg; everything else (ifs/0p25) -> 0.25 deg."""
-    if grib_uri and ("0p4" in grib_uri or "0p40" in grib_uri):
+    if isinstance(grib_uri, str) and ("0p4" in grib_uri or "0p40" in grib_uri):
         return ECMWF_0P4_FIELD_SHAPE
     return ECMWF_0P25_FIELD_SHAPE
 
@@ -147,8 +147,17 @@ class ECMWFParquetProcessor:
 
         for col in possible_uri_columns:
             if col in df.columns and len(df) > 0:
-                grib_uri = df[col].iloc[0]
-                break
+                # Use the first NON-NULL uri: at step 0, inline-stored constant
+                # fields (e.g. lsm) have uri=NaN, and they can be the first row,
+                # so df[col].iloc[0] may be NaN. dropna() gets a real message url.
+                nonnull = df[col].dropna()
+                if len(nonnull) > 0:
+                    grib_uri = nonnull.iloc[0]
+                    break
+
+        # guard against NaN / non-string sneaking through -> trigger reconstruction
+        if grib_uri is not None and not isinstance(grib_uri, str):
+            grib_uri = None
 
         if grib_uri is None:
             # Reconstruct from filename — 50r1 stream-aware:
