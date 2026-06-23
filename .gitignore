@@ -4,6 +4,9 @@
 **/*-key.json
 *-deployer-key.json
 gcp-*-key.json
+# .env files (HF tokens etc.)
+.env
+**/.env
 
 # --- Notebook / tooling noise ---
 .ipynb_checkpoints/

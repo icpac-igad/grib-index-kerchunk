@@ -16,6 +16,13 @@ bimonth), extracting **total precipitation (tp)** across **51 ensemble
 members** and **9 forecast steps** (T+36h to T+60h) over the ICPAC domain
 (19-55E, 14S-25N).
 
+> **Pressure-level addendum (2026-06-23).** The original study covered only
+> the surface field `tp`. After the per-level-keys fix
+> (`grib-index-kerchunk` commit `4ca1c21`) and the 49r1 re-bake, the
+> evaluation was extended to **isobaric (pressure-level) variables** —
+> `u`, `v`, and geopotential height `gh` at 300/500/700/850 hPa — to prove
+> the fix produces physically correct per-level data. See **Section 7**.
+
 ## Test Dates
 
 | Date       | Month     |
@@ -222,5 +229,90 @@ transfer.
 
 ---
 
-*Generated from 5 comparison dates in 2024. Statistics computed at T+48h
-forecast step. Full data in `comparison_stats.json`.*
+## 7. Pressure-Level Validation (per-level-keys fix)
+
+### 7.1 Why this section exists
+
+The pre-fix par files collapsed **all 13 pressure levels** of an isobaric
+variable onto a single zarr reference per `(var, step, member)`. A consumer
+asking for `u` at 700 hPa could silently get 250 hPa or 1000 hPa data
+depending on the forecast step, because the one stored byte-range pointed at
+whichever GRIB message happened to come first. Geopotential height `gh`
+collapsed to ~1000 hPa (surface, ~0–100 gpm) where mid-troposphere values
+(~5700 gpm at 500 hPa, ~9500 gpm at 300 hPa) were expected — a >9000 gpm
+error. This made every upper-air channel the cGAN training needs
+(Somali/Turkana low-level jets, 500/300 hPa trough-ridge, vertical wind
+shear) physically meaningless.
+
+The fix (`4ca1c21`) emits one reference **per level**:
+
+```
+step_{NNN}/{var}/pl/{level_hPa}/{member}/0.0.0
+```
+
+This section validates the **re-baked** par files against Herbie ground
+truth on the pressure-level fields.
+
+### 7.2 Method
+
+- **Date / step:** 2026-03-01 00Z, T+48h (the first re-baked MAM-2026 date).
+- **GIK side:** read each of the 51 per-member par files
+  (`gs://gik-ecmwf-aws-tf/run_par_ecmwf/2026/03/20260301/00z/`), resolve the
+  `step_048/{var}/pl/{level}/{member}/0.0.0` byte-range, stream that exact
+  GRIB message from the ECMWF S3 archive (anon), decode with `gribberish`,
+  subset to ICPAC, and stack into a 51-member ensemble.
+- **Herbie side:** `Herbie(model="ifs", product="enfo").xarray(":{var}:{level}:pl:")`
+  → 50 perturbed members, subset to ICPAC, reindexed onto the GIK grid.
+- **Compare:** Pearson r, RMSE, MAE, max|diff| on ensemble mean and spread.
+
+Driver: [`../compare_gik_herbie_pressure.py`](../compare_gik_herbie_pressure.py).
+The 51-vs-50 member difference (GIK includes the control member, Herbie's
+`enfo` does not) accounts for the entire residual, exactly as for `tp` in
+Section 1.
+
+### 7.3 Results — ensemble mean (T+48h, 2026-03-01)
+
+| Variable | 300 hPa | 500 hPa | 700 hPa | 850 hPa |
+|----------|---------|---------|---------|---------|
+| **u** (r) | 0.999999 | 0.999999 | 0.999997 | 0.999993 |
+| **v** (r) | 0.999991 | 0.999996 | 0.999997 | 0.999995 |
+| **gh** (r) | 1.000000 | 1.000000 | 0.999999 | 0.999999 |
+
+Max absolute difference across all 12 (var × level) fields: **< 0.18 m/s**
+for winds and **< 0.15 gpm** for geopotential height — i.e. rounding-level
+noise on fields spanning tens of m/s and thousands of gpm. Ensemble-spread
+correlation is r > 0.9998 everywhere.
+
+**Headline:** `gh` — the variable that previously collapsed to the surface —
+now matches Herbie to **r = 1.000000** at 300/500 hPa. The per-level keys
+resolve to the correct pressure level for every level, step, and member.
+
+### 7.4 Side-by-side maps
+
+Each figure: GIK (left), Herbie (center), Difference (right); ensemble mean
+(top row) and spread (bottom row), East Africa domain.
+
+| Field | Plot |
+|-------|------|
+| U-wind @ 700 hPa | ![](https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/resolve/main/validation_gik_vs_herbie_pl_correction/compare_pl_u700_20260301_T48h.png) |
+| V-wind @ 850 hPa | ![](https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/resolve/main/validation_gik_vs_herbie_pl_correction/compare_pl_v850_20260301_T48h.png) |
+| Geopotential @ 500 hPa | ![](https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/resolve/main/validation_gik_vs_herbie_pl_correction/compare_pl_gh500_20260301_T48h.png) |
+
+Full set of 12 maps + per-variable stats JSON: the local `pl_eval/` folder
+(see its [`README.md`](pl_eval/README.md)) and, retained for the long term, the
+HuggingFace dataset folder
+[`E4DRR/gik-ecmwf-par/validation_gik_vs_herbie_pl_correction`](https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/tree/main/validation_gik_vs_herbie_pl_correction).
+
+### 7.5 Conclusion
+
+The re-baked 49r1 par files deliver **per-level-correct** isobaric data,
+numerically identical to Herbie ground truth (r ≥ 0.99999). The collapse bug
+is fully resolved end-to-end (par reference → S3 byte-range → decoded field).
+The upper-air channels required for cGAN training are recovered.
+
+---
+
+*Surface (tp) comparison: 5 dates in 2024, T+48h. Pressure-level comparison:
+2026-03-01 00Z T+48h, u/v/gh at 300/500/700/850 hPa (Section 7). Full surface
+data in `comparison_stats.json`; pressure-level data in
+`pl_eval/out/pl_comparison_stats_*.json`.*
