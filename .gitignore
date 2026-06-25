@@ -13,3 +13,15 @@ gcp-*-key.json
 **/.ipynb_checkpoints/
 __pycache__/
 *.pyc
+
+# secrets
+.env
+coiled-data.json
+**/coiled-data.json
+
+# session transcripts / conversation exports (keep local, do not commit)
+/2026-06-01-gik-template-creation-realign-different-layers.txt
+/2026-06-02-gik-ecmwf-scan-202301.txt
+/2026-06-03-ecmwf-gik-3era-coiled-docker-kerchunk-break-version-pin-resolved.txt
+/2026-06-03-ecmwf-gik-three-era-function-complete.txt
+/ecmwf/dev-test/2026-06-02-gik-three-era-scan-grib-template-creation-ready.txt

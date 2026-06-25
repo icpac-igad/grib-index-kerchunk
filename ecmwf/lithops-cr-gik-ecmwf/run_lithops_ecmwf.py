@@ -130,8 +130,15 @@ S3_BUCKET = "ecmwf-forecasts"
 # TEMPLATE_URL / ECMWF_TEMPLATE_PATH to the 0.4deg template artifact.
 ECMWF_RESOLUTION = os.environ.get('ECMWF_RESOLUTION', '0p25').lower()
 STREAM_PATH = '0p4-beta' if ECMWF_RESOLUTION in ('0p4', '0p40', '0p4-beta') else 'ifs/0p25'
+
+# Which stream carries the CONTROL member.
+#   0p4-beta / 49r1: control is bundled in enfo/ef as number=0 -> 'enfo'.
+#   50r1 (>= 2026-05-12 06z): control moved to oper/fc -> set 'oper'.
+# Perturbed members 1..50 always come from enfo/ef. Deploy-time, no per-date
+# logic (matches the per-era image strategy).
+CONTROL_STREAM = os.environ.get('ECMWF_CONTROL_STREAM', 'enfo').lower()
 logger.info(f"Source resolution: {ECMWF_RESOLUTION} (path segment '{STREAM_PATH}'), "
-            f"reference date {REFERENCE_DATE}")
+            f"reference date {REFERENCE_DATE}, control stream '{CONTROL_STREAM}'")
 
 
 def ecmwf_index_url(date_str: str, run: str, hour: int, stream: str = 'enfo') -> str:
@@ -367,7 +374,10 @@ def build_refs_from_indices(
         try:
             # Include run hour in timestamp: 00z→000000, 18z→180000.
             # Resolution-aware path (ifs/0p25 vs 0p4-beta) via ECMWF_RESOLUTION.
-            idx_url = ecmwf_index_url(date_str, run, hour, stream='enfo')
+            # Control reads from CONTROL_STREAM (oper for 50r1, else enfo);
+            # perturbed members always from enfo/ef.
+            stream = CONTROL_STREAM if member_name == 'control' else 'enfo'
+            idx_url = ecmwf_index_url(date_str, run, hour, stream=stream)
             grib_url = idx_url.replace('.index', '')
 
             idx_entries = parse_grib_index(idx_url, member_filter=member_name)
