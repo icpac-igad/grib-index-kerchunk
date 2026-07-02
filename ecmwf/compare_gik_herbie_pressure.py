@@ -82,9 +82,19 @@ warnings.filterwarnings("ignore")
 os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
 
 # ── Domain / grid (must match the GIK streaming pipeline) ─────────────
-ECMWF_GRID_SHAPE = (721, 1440)
-ECMWF_LATS = np.linspace(90, -90, 721)
-ECMWF_LONS = np.linspace(-180, 179.75, 1440)
+# Grid is era-dependent: 0p25 (49r1/50r1, 721x1440) vs 0p4 (0.4-beta, 451x900).
+# Defaults below are 0p25; set_grid() reassigns them for --grid 0p4.
+GRIDS = {
+    "0p25": {"shape": (721, 1440),
+             "lats": np.linspace(90, -90, 721),
+             "lons": np.linspace(-180, 179.75, 1440)},
+    "0p4":  {"shape": (451, 900),
+             "lats": np.linspace(90, -90, 451),
+             "lons": np.linspace(-180, 179.6, 900)},
+}
+ECMWF_GRID_SHAPE = GRIDS["0p25"]["shape"]
+ECMWF_LATS = GRIDS["0p25"]["lats"]
+ECMWF_LONS = GRIDS["0p25"]["lons"]
 LAT_MIN, LAT_MAX = -14, 25
 LON_MIN, LON_MAX = 19, 55
 
@@ -111,6 +121,15 @@ def icpac_grid():
 
 
 LAT_SLICE, LON_SLICE, ICPAC_LATS, ICPAC_LONS = icpac_grid()
+
+
+def set_grid(name):
+    """Reassign the module-level grid globals for the chosen era (0p25|0p4)."""
+    global ECMWF_GRID_SHAPE, ECMWF_LATS, ECMWF_LONS
+    global LAT_SLICE, LON_SLICE, ICPAC_LATS, ICPAC_LONS
+    g = GRIDS[name]
+    ECMWF_GRID_SHAPE, ECMWF_LATS, ECMWF_LONS = g["shape"], g["lats"], g["lons"]
+    LAT_SLICE, LON_SLICE, ICPAC_LATS, ICPAC_LONS = icpac_grid()
 
 
 # ── GIK: read par files -> ensemble field ────────────────────────────
@@ -315,10 +334,13 @@ def main():
     ap.add_argument("--levels", default=",".join(map(str, DEFAULT_LEVELS)),
                     help="comma-separated hPa levels")
     ap.add_argument("--max-members", type=int, default=None)
+    ap.add_argument("--grid", choices=["0p25", "0p4"], default="0p25",
+                    help="source grid/era: 0p25 (49r1/50r1) or 0p4 (0.4-beta)")
     ap.add_argument("--no-herbie", action="store_true", help="GIK-only (skip Herbie)")
     ap.add_argument("--output-dir", default="gik_vs_herbie")
     args = ap.parse_args()
 
+    set_grid(args.grid)
     levels = [int(x) for x in args.levels.split(",")]
     out_dir = Path(args.output_dir)
     members = list_member_pars(par_dir=args.par_dir, gcs_path=args.gcs_path)
