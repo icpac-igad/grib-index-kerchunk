@@ -1,0 +1,41 @@
+# Reproducible rebuild of the ECMWF scan_grib Coiled image (gik-coiled-v6 /
+# gik-coiled:v4 equivalent), with PINNED libraries so it can be recreated if
+# the prebuilt 2024-10-30 image is ever lost. See
+# ecmwf/docs/2026-06-03-coiled-scangrib-env-dependency-pinning.md.
+#
+# Build:
+#   docker build -f devops/Dockerfile.gik-coiled-pinned \
+#       -t us-east1-docker.pkg.dev/sewaa-416306/coiled/gik-coiled:pinned .
+#   docker push  us-east1-docker.pkg.dev/sewaa-416306/coiled/gik-coiled:pinned
+# Register as a Coiled software env:
+#   coiled software create gik-coiled-pinned \
+#       --container us-east1-docker.pkg.dev/sewaa-416306/coiled/gik-coiled:pinned \
+#       --workspace gcp-sewaa-nka
+FROM mambaorg/micromamba:bookworm-slim
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+ENV MAMBA_ROOT_PREFIX=/opt/conda
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/matplotlib XDG_CACHE_HOME=/tmp/.cache
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /tmp && chmod -R 777 /tmp
+
+# Pinned environment (installs into the base env -> /opt/conda)
+COPY devops/environment-gik-coiled-pinned.yml /tmp/environment.yml
+RUN micromamba install -y -n base -f /tmp/environment.yml && micromamba clean -a -y
+
+# Bake in the scan primitives the worker imports (`dynamic_zarr_store`), so the
+# Coiled function's `import dynamic_zarr_store` resolves on the worker. This is
+# the kerchunk-0.2.6-compatible module that defines _map_grib_file_by_group +
+# s3_parse_ecmwf_grib_idx. Keep it on the import path (/app).
+WORKDIR /app
+COPY gfs/dynamic_zarr_store.py /app/dynamic_zarr_store.py
+ENV PYTHONPATH=/app
+
+# NOTE on credentials: the scan_grib driver forces ANONYMOUS s3 at runtime
+# (fsspec.config), so this image does NOT need baked AWS keys. The GCS
+# service-account key (coiled-data.json) is shipped to workers at run time via
+# Client(cluster).upload_file(...) by the driver — do NOT bake it into the image.
+
+ENV PATH=/opt/conda/bin:$PATH
+SHELL ["/bin/bash", "-c"]

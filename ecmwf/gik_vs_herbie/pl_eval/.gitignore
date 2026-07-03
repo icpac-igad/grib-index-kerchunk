@@ -1,0 +1,7 @@
+# Downloaded par files (22 MB of binary data; re-fetch via _download_par.py)
+par_local/
+# Run logs
+*.log
+# Plots are retained on HuggingFace (validation_gik_vs_herbie_pl_correction/);
+# keep the small stats JSON in git, not the 7 MB of PNGs.
+out/*.png

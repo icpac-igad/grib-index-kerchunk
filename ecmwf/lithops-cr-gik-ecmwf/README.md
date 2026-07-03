@@ -254,7 +254,7 @@ gcloud builds submit \
 ```
 
 **Build time**: ~2 minutes
-**Output**: `gcr.io/e4drr-crafd/ecmwf-lithops-runtime:latest`
+**Output**: `gcr.io/e4drr-crafd/ecmwf-lithops-runtime:${_ERA}` (per-era tag; default `50r1`). See "Three template eras" below for `--substitutions` per era.
 
 ### Step 3: Deploy Lithops Runtime
 
@@ -273,6 +273,31 @@ This creates a Cloud Run service named `lithops-worker-363-*` in `europe-west3` 
 **Note**: If you skip this step, Lithops will auto-deploy the runtime on the first `fexec.map()` call.
 
 ---
+
+## Three template eras (per-era deploy)
+
+ECMWF open data spans **4 schema eras**; each needs its own per-level template
++ runtime env. One Cloud Run image per era (select at build via Cloud Build
+`--substitutions`; deploy the matching tag). See
+`ecmwf/docs/2026-06-03-per-era-deploy-prep.md` (public repo) for the full
+matrix and re-bake order.
+
+| Era | TEMPLATE_ARTIFACT | REFERENCE_DATE | RESOLUTION | CONTROL_STREAM | Dates covered |
+|---|---|---|---|---|---|
+| 49r1 13-level | `gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz` | 20250515 | 0p25 | enfo | 2025-01-14 06z → 2026-05-12 00z (+9-level era as superset from 2024-02-29) |
+| 50r1 14-level | `gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz` (default) | 20260513 | 0p25 | oper | 2026-05-12 06z → present |
+| 0.4-beta 9-level | `gik-fmrc-v2ecmwf_fmrc-0p4-beta.tar.gz` | 20230601 | 0p4 | enfo | 2023-01-18 → 2024-02-28 |
+
+Build a given era (49r1 example):
+```bash
+gcloud builds submit --config=cloudbuild.yaml --project=e4drr-crafd \
+  --service-account=projects/e4drr-crafd/serviceAccounts/ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com \
+  --substitutions=_ERA=49r1,_TEMPLATE_ARTIFACT=gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz,_REFERENCE_DATE=20250515,_RESOLUTION=0p25,_CONTROL_STREAM=enfo
+# -> gcr.io/e4drr-crafd/ecmwf-lithops-runtime:49r1 ; deploy that tag, then:
+bash run_backfill_00z.sh --era 49r1 --from 2026-03 --to 2026-05   # MAM 2026 (cGAN)
+```
+**MAM 2026 is in the 49r1 era** (50r1 starts 2026-05-12 06z), so the 49r1 image
+unblocks the cGAN MAM 2025+2026 windows; deploy it first.
 
 ## Running
 
@@ -354,6 +379,10 @@ gcp_storage:
 | `PORT` | `8080` | Gunicorn listen port (Cloud Run requirement) |
 | `CONCURRENCY` | `1` | One worker process per container |
 | `TIMEOUT` | `3600` | Gunicorn timeout (1 hour) |
+| `ECMWF_REFERENCE_DATE` | era-specific | Template reference date (49r1=20250515, 50r1=20260513, 0p4=20230601) |
+| `ECMWF_RESOLUTION` | `0p25`/`0p4` | Source path: ifs/0p25 vs 0p4-beta |
+| `ECMWF_CONTROL_STREAM` | `enfo`/`oper` | Control member stream (50r1=oper; 49r1/0p4=enfo, bundled) |
+| `TEMPLATE_URL` / `ECMWF_TEMPLATE_PATH` | era artifact | Per-era HF template (baked via Dockerfile build-arg) |
 
 ### Processing Constants (in run_lithops_ecmwf.py)
 

@@ -38,21 +38,43 @@ warnings.filterwarnings('ignore')
 # Configuration
 ENSEMBLE_MEMBERS_TOTAL = 51  # Control (-1) + 50 perturbed members (1-50)
 
+# ECMWF open-data grid shapes. One GRIB message is a single 2-D field => one
+# (var, level) zarr group is a single [1, lat, lon] chunk. Replaces the legacy
+# [1, 181, 360] (1 deg) placeholder.
+#   0.25 deg (ifs/0p25, >= 2024-02-29): 721 lat x 1440 lon
+#   0.40 deg (0p4-beta, 2023-01-18 .. 2024-02-28): 451 lat x 900 lon
+ECMWF_0P25_FIELD_SHAPE = [1, 721, 1440]
+ECMWF_0P4_FIELD_SHAPE = [1, 451, 900]
+
+
+def field_shape_for_uri(grib_uri: str) -> list:
+    """Pick the per-message field shape from the resolution token in the path.
+    '0p4-beta' -> 0.4 deg; everything else (ifs/0p25) -> 0.25 deg."""
+    if isinstance(grib_uri, str) and ("0p4" in grib_uri or "0p40" in grib_uri):
+        return ECMWF_0P4_FIELD_SHAPE
+    return ECMWF_0P25_FIELD_SHAPE
+
 
 class ECMWFParquetProcessor:
     """Process ECMWF scan_grib parquet files to create individual ensemble member files."""
 
-    def __init__(self, input_dir: str, output_base_dir: str):
+    def __init__(self, input_dir: str, output_base_dir: str, run: str = "00"):
         """
         Initialize the processor.
 
         Args:
             input_dir: Directory containing scan_grib parquet files
             output_base_dir: Base directory for output ensemble member files
+            run: model run hour (00/06/12/18) — used to reconstruct the
+                 GRIB/.index S3 URI when the dump has no uri column.
         """
         self.input_dir = Path(input_dir)
         self.output_base_dir = Path(output_base_dir)
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
+        self.run = run
+        # Per-message field shape, set per file from the GRIB URI resolution
+        # token (0.25 deg default; 0.4 deg for the 0p4-beta archive era).
+        self._field_shape = ECMWF_0P25_FIELD_SHAPE
 
     def log(self, message: str, level: str = "INFO"):
         """Log message with timestamp."""
@@ -63,20 +85,21 @@ class ECMWFParquetProcessor:
         """
         Parse parquet filename to extract metadata.
 
-        Example: e_sg_mdt_20240529_0h.parquet
+        50r1 format:  e_sg_mdt_20260513_enfo_0h.parquet  (stream-tagged)
+        legacy format: e_sg_mdt_20240529_0h.parquet      (stream -> 'enfo')
 
         Returns:
-            Dict with date and forecast_hour, or None if parse fails
+            Dict with date, stream, forecast_hour, or None if parse fails
         """
-        pattern = r'e_sg_mdt_(\d{8})_(\d+)h\.parquet'
-        match = re.search(pattern, filename)
-
-        if match:
-            return {
-                'date': match.group(1),
-                'forecast_hour': int(match.group(2)),
-                'filename': filename
-            }
+        m = re.search(r'e_sg_mdt_(\d{8})_(enfo|oper)_(\d+)h\.parquet', filename)
+        if m:
+            return {'date': m.group(1), 'stream': m.group(2),
+                    'forecast_hour': int(m.group(3)), 'filename': filename}
+        # legacy (pre-50r1, no stream tag) -> enfo perturbed dump
+        m = re.search(r'e_sg_mdt_(\d{8})_(\d+)h\.parquet', filename)
+        if m:
+            return {'date': m.group(1), 'stream': 'enfo',
+                    'forecast_hour': int(m.group(2)), 'filename': filename}
         return None
 
     def extract_ensemble_number(self, group: Dict) -> int:
@@ -124,27 +147,57 @@ class ECMWFParquetProcessor:
 
         for col in possible_uri_columns:
             if col in df.columns and len(df) > 0:
-                grib_uri = df[col].iloc[0]
-                break
+                # Use the first NON-NULL uri: at step 0, inline-stored constant
+                # fields (e.g. lsm) have uri=NaN, and they can be the first row,
+                # so df[col].iloc[0] may be NaN. dropna() gets a real message url.
+                nonnull = df[col].dropna()
+                if len(nonnull) > 0:
+                    grib_uri = nonnull.iloc[0]
+                    break
+
+        # guard against NaN / non-string sneaking through -> trigger reconstruction
+        if grib_uri is not None and not isinstance(grib_uri, str):
+            grib_uri = None
 
         if grib_uri is None:
-            # If no URI found, we need to reconstruct it from filename info
+            # Reconstruct from filename — 50r1 stream-aware:
+            #   enfo -> .../enfo/{ts}-{h}h-enfo-ef.grib2  (perturbed 1..50)
+            #   oper -> .../oper/{ts}-{h}h-oper-fc.grib2  (control; .index has
+            #           no `number` so parse_index_file yields -1 = control)
             file_info = self.parse_filename(parquet_path.name)
             if file_info:
                 date_str = file_info['date']
                 forecast_hour = file_info['forecast_hour']
-                # Construct likely ECMWF S3 path
-                grib_uri = f"s3://ecmwf-forecasts/{date_str}/00z/ifs/0p25/enfo/{date_str}000000-{forecast_hour}h-enfo-ef.grib2"
+                stream = file_info.get('stream', 'enfo')
+                run = self.run
+                ts = f"{date_str}{run}0000"
+                if stream == 'oper':
+                    grib_uri = (f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/"
+                                f"oper/{ts}-{forecast_hour}h-oper-fc.grib2")
+                else:
+                    grib_uri = (f"s3://ecmwf-forecasts/{date_str}/{run}z/ifs/0p25/"
+                                f"enfo/{ts}-{forecast_hour}h-enfo-ef.grib2")
 
         self.log(f"  GRIB URI: {grib_uri}")
+        self._field_shape = field_shape_for_uri(grib_uri)
+        self.log(f"  Field shape (from resolution): {self._field_shape}")
         return df, grib_uri
 
-    def parse_index_file(self, grib_uri: str) -> Dict[int, int]:
+    def parse_index_file(self, grib_uri: str) -> Dict[int, Dict]:
         """
-        Parse ECMWF .index file to get index-to-ensemble-member mapping.
+        Parse ECMWF .index file to get per-message metadata, keyed by the
+        0-based line position (== GRIB message order).
+
+        The .index is the authoritative per-message source: it carries the
+        ensemble `number`, the `levtype` (pl|sfc|sol), and — for pressure
+        levels — the real `levelist` (hPa). Empirically (2026-06-01) every
+        pl line has a `levelist` and no sfc/sol line does, so `levtype=='pl'`
+        is a safe guard for stamping the true level value.
 
         Returns:
-            Dictionary mapping index position to ensemble member number
+            Dict mapping 0-based line index ->
+                {'member': int, 'levtype': str|None, 'levelist': int|None}
+            (control member is normalised to -1.)
         """
         import fsspec
 
@@ -153,7 +206,7 @@ class ECMWFParquetProcessor:
         self.log(f"  Parsing index: {index_url}")
 
         fs = fsspec.filesystem("s3", anon=True)
-        idx_to_member = {}
+        idx_meta: Dict[int, Dict] = {}
 
         try:
             with fs.open(index_url, 'r') as f:
@@ -171,18 +224,31 @@ class ECMWFParquetProcessor:
                         else:
                             ens_number = int(float(ens_number))
 
-                        idx_to_member[idx] = ens_number
+                        levtype = data.get('levtype')
+                        levelist = data.get('levelist')
+                        try:
+                            levelist = int(levelist) if levelist is not None else None
+                        except (TypeError, ValueError):
+                            levelist = None
+
+                        idx_meta[idx] = {
+                            'member': ens_number,
+                            'levtype': levtype,
+                            'levelist': levelist,
+                        }
 
                     except Exception as e:
                         # Default to control for parse errors
-                        idx_to_member[idx] = -1
+                        idx_meta[idx] = {'member': -1, 'levtype': None,
+                                         'levelist': None}
 
-            self.log(f"  Parsed {len(idx_to_member)} index entries")
+            self.log(f"  Parsed {len(idx_meta)} index entries")
 
             # Show ensemble distribution
             member_counts = {}
-            for member in idx_to_member.values():
-                member_counts[member] = member_counts.get(member, 0) + 1
+            for meta in idx_meta.values():
+                m = meta['member']
+                member_counts[m] = member_counts.get(m, 0) + 1
 
             self.log(f"  Ensemble distribution from index:")
             for member in sorted(member_counts.keys()):
@@ -190,54 +256,78 @@ class ECMWFParquetProcessor:
                 count = member_counts[member]
                 self.log(f"    {name}: {count} messages")
 
-            return idx_to_member
+            return idx_meta
 
         except Exception as e:
             self.log(f"  Error parsing index file: {e}", "ERROR")
             return {}
 
-    def create_member_groups_from_index(self, df: pd.DataFrame, idx_to_member: Dict[int, int]) -> Dict[int, List[Dict]]:
+    def create_member_groups_from_index(self, df: pd.DataFrame, idx_meta: Dict[int, Dict]) -> Dict[int, List[Dict]]:
         """
-        Create groups for each ensemble member based on index mapping.
+        Assign each scan-dump row to the single ensemble member that owns it,
+        using the per-message metadata from the .index.
+
+        Each dump row is exactly one GRIB message (one (member, var, level)).
+        The dump is indexed by `idx` from `enumerate(scan_grib(...), start=1)`
+        (1-based), while the .index is enumerated 0-based — so dump row `idx`
+        corresponds to .index line `idx - 1`. We reconcile that off-by-one
+        explicitly; a row whose reconciled line is missing falls back to the
+        raw idx, and is skipped if neither resolves (so we never silently
+        misassign).
+
+        For pressure-level rows the true level (hPa) is taken from the
+        .index `levelist` (authoritative), falling back to the dump's own
+        `level` column. This keeps levels correct regardless of which
+        kerchunk built the dump.
 
         Returns:
-            Dictionary mapping member number to list of groups
+            Dictionary mapping member number to list of per-message groups.
         """
-        member_dict = {}
+        member_dict: Dict[int, List[Dict]] = {}
+        unresolved = 0
 
-        # Create groups for each row in the dataframe
         for row_idx, row in df.iterrows():
-            # Each row represents a variable, we need to replicate it for each ensemble member
-            # that contains this variable
+            # Reconcile dump idx (1-based) -> .index line (0-based).
+            meta = idx_meta.get(row_idx - 1)
+            if meta is None:
+                meta = idx_meta.get(row_idx)  # tolerate a 0-based dump
+            if meta is None:
+                unresolved += 1
+                continue
 
-            # Get unique ensemble members from index
-            unique_members = set(idx_to_member.values())
+            member_num = meta['member']
 
-            for member_num in unique_members:
-                # Create a group for this variable for this member
-                group = {
+            # Level: prefer the authoritative .index levelist for pl rows;
+            # otherwise fall back to the dump's level column.
+            if meta.get('levtype') == 'pl' and meta.get('levelist') is not None:
+                level = meta['levelist']
+            else:
+                level = row.get('level', 0)
+
+            group = {
+                'varname': row.get('varname', 'unknown'),
+                'typeOfLevel': row.get('typeOfLevel', 'unknown'),
+                'stepType': row.get('stepType', 'instant'),
+                'name': row.get('name', ''),
+                'paramId': row.get('paramId', 0),
+                'level': level,
+                'ens_number': member_num,
+                'attrs': {
                     'varname': row.get('varname', 'unknown'),
                     'typeOfLevel': row.get('typeOfLevel', 'unknown'),
                     'stepType': row.get('stepType', 'instant'),
                     'name': row.get('name', ''),
                     'paramId': row.get('paramId', 0),
-                    'level': row.get('level', 0),
+                    'level': level,
                     'ens_number': member_num,
-                    'attrs': {
-                        'varname': row.get('varname', 'unknown'),
-                        'typeOfLevel': row.get('typeOfLevel', 'unknown'),
-                        'stepType': row.get('stepType', 'instant'),
-                        'name': row.get('name', ''),
-                        'paramId': row.get('paramId', 0),
-                        'level': row.get('level', 0),
-                        'ens_number': member_num,
-                    }
                 }
+            }
 
-                if member_num not in member_dict:
-                    member_dict[member_num] = []
+            member_dict.setdefault(member_num, []).append(group)
 
-                member_dict[member_num].append(group)
+        if unresolved:
+            self.log(f"  WARNING: {unresolved} rows had no matching .index "
+                     f"line and were skipped", "WARN")
 
         # Log distribution
         self.log(f"  Created ensemble member groups:")
@@ -290,15 +380,21 @@ class ECMWFParquetProcessor:
             # Use the first group as representative
             rep_group = var_group_list[0]
 
-            # Create zarr metadata for this variable
+            # Create zarr metadata for this variable.
+            # ECMWF open-data ENS is 0.25 deg => 721 lat x 1440 lon. Each GRIB
+            # message is a single 2-D field, so one (var, level) group is a
+            # single [1, 721, 1440] chunk. (The legacy template hardcoded a
+            # [1, 181, 360] = 1 deg PLACEHOLDER here, which is why the live
+            # template carried the wrong grid shape — see
+            # 2026-06-01-step2-realigner-fix-scope.md Defect 3.)
             zarr_store[f"{var_key}/.zarray"] = json.dumps({
-                'chunks': [1, 181, 360],  # Example chunking
+                'chunks': self._field_shape,
                 'compressor': None,
                 'dtype': '<f4',
                 'fill_value': 'NaN',
                 'filters': None,
                 'order': 'C',
-                'shape': [1, 181, 360],  # Example shape
+                'shape': self._field_shape,
                 'zarr_format': 2
             })
 
@@ -365,14 +461,14 @@ class ECMWFParquetProcessor:
         if grib_uri is None:
             raise ValueError(f"Could not determine GRIB URI for {parquet_file}")
 
-        # Parse index file to get ensemble member mapping
-        idx_to_member = self.parse_index_file(grib_uri)
+        # Parse index file to get per-message metadata (member, levtype, levelist)
+        idx_meta = self.parse_index_file(grib_uri)
 
-        if not idx_to_member:
+        if not idx_meta:
             raise ValueError(f"Could not parse index file for {grib_uri}")
 
         # Create groups for each ensemble member
-        member_dict = self.create_member_groups_from_index(df, idx_to_member)
+        member_dict = self.create_member_groups_from_index(df, idx_meta)
 
         # Process each member
         results = {
@@ -512,11 +608,18 @@ def main():
         default=None,
         help="Process specific forecast hours (e.g., --forecast-hours 0 3 6 9)"
     )
+    parser.add_argument(
+        "--run",
+        type=str,
+        default=os.getenv("ECMWF_RUN", "00"),
+        choices=["00", "06", "12", "18"],
+        help="Model run hour for S3 URI reconstruction (default: 00)"
+    )
 
     args = parser.parse_args()
 
     # Initialize processor
-    processor = ECMWFParquetProcessor(args.input_dir, args.output_dir)
+    processor = ECMWFParquetProcessor(args.input_dir, args.output_dir, run=args.run)
 
     if args.forecast_hours is not None:
         # Process specific forecast hours

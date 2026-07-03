@@ -151,13 +151,24 @@ def s3_parse_ecmwf_grib_idx(fs: fsspec.AbstractFileSystem, basename: str, suffix
     return result.set_index("idx")
 
 
-def s3_ecmwf_scan_grib_storing(fs, basename, date_str, suffix, ecmwf_hr, gcs_bucket_name, gcp_service_account_json):
+def s3_ecmwf_scan_grib_storing(fs, basename, date_str, suffix, ecmwf_hr,
+                               gcs_bucket_name, gcp_service_account_json,
+                               stream='enfo'):
+    """Scan one GRIB file and store the per-hour all-member dump.
+
+    `stream` ('enfo' perturbed | 'oper' control) is tagged into the output
+    filename. IFS 50r1 split the ENS open data into two streams scanned for
+    the SAME forecast hour; without the tag the enfo and oper/fc dumps would
+    collide. scan_grib / index parsing are stream-agnostic (oper/fc `.index`
+    has no `number` -> s3_parse_ecmwf_grib_idx defaults it to -1 = control).
+    Default 'enfo' keeps pre-50r1 behaviour.
+    """
     idx_file_index = s3_parse_ecmwf_grib_idx(fs, basename, suffix)
     total_groups = len(idx_file_index.index)
     logger.info(total_groups)
     dd = _map_grib_file_by_group(basename, total_groups)
     logger.info(len(dd.index))
-    output_parquet_file = f'e_sg_mdt_{date_str}_{ecmwf_hr}.parquet'
+    output_parquet_file = f'e_sg_mdt_{date_str}_{stream}_{ecmwf_hr}.parquet'
     dd.to_parquet(output_parquet_file, engine='pyarrow')
 
     destination_blob_name = f'fmrc/scan_grib{date_str}/{output_parquet_file}'

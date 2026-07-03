@@ -93,6 +93,11 @@ def parse_grib_index(idx_url: str, member_filter: Optional[str] = None) -> List[
                     'byte_length': entry_data['_length'],
                     'variable': entry_data.get('param', ''),
                     'level': entry_data.get('levtype', ''),
+                    # `levelist` is the actual level value (e.g. '250' for pl,
+                    # layer string for sol). Pre-fix this was dropped and the
+                    # key collapsed all 13 isobaric levels into one — see
+                    # cGAN_tutorial GIK_PARQUET_PER_LEVEL_KEYS_NEEDED.md.
+                    'level_value': str(entry_data.get('levelist', '')),
                     'step': entry_data.get('step', '0'),
                     'member': member,
                     'date': entry_data.get('date', ''),
@@ -153,8 +158,13 @@ def create_references_from_index(
         level_name = entry['level'].replace(' ', '_')
         member_name = entry['member']
 
-        # Build zarr-style key
-        key = f"{var_name}/{level_name}/{member_name}/0.0.0"
+        # Per-pressure-level fix: pl messages get the hPa value embedded in
+        # the key so each isobaric level becomes its own reference; sfc/sol
+        # keep their old shape. See cGAN_tutorial GIK_MAINTAINER_REQUEST.md.
+        if level_name == 'pl' and entry.get('level_value'):
+            key = f"{var_name}/pl/{entry['level_value']}/{member_name}/0.0.0"
+        else:
+            key = f"{var_name}/{level_name}/{member_name}/0.0.0"
 
         # Store reference [url, offset, length]
         references[key] = [grib_url, start, length]

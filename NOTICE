@@ -1,0 +1,27 @@
+Grib-Index-Kerchunk (GIK)
+Copyright 2024-2026 IGAD Climate Prediction and Applications Centre (ICPAC)
+
+This product is developed and maintained at ICPAC (https://www.icpac.net/)
+for continuous risk monitoring and assessment over East Africa, under the
+following funded programmes:
+
+  - E4DRR — Hazard modelling, impact estimation, and climate storylines
+            for the East Africa drought / flood event catalogue.
+            United Nations | Complex Risk Analytics Fund (CRAF'd).
+            https://icpac-igad.github.io/e4drr/
+
+  - SEWAA — Strengthening Early Warning Systems for Anticipatory Action.
+            https://cgan.icpac.net/
+
+The Grib-Index-Kerchunk method extends the dynamic GRIB chunking approach
+originally prototyped in nextgen-dmac
+(https://github.com/asascience-open/nextgen-dmac, commit 6b3286627070).
+
+Portions of gfs/dynamic_zarr_store.py and gfs/test_dynamic_zarr_store.py
+are derived from upstream code copyright 2023 Camus Energy, licensed
+under the MIT License. The original copyright notice is preserved in
+the source headers of those files.
+
+This product depends on, but does not redistribute, the following
+upstream open-source libraries: kerchunk (MIT), fsspec (BSD-3),
+xarray (Apache-2.0), gribberish (MIT), Herbie (MIT), Lithops (Apache-2.0).
