@@ -1,5 +1,10 @@
 # 49r1 era — build state, GCS coverage, and backfill plan
 
+> **UPDATE 2026-07-03 — DONE.** The single missing edge date `20240229` was
+> filled (`:49r1`, enfo, prefix `v20260623_run_par_ecmwf`; 51/51 members). The
+> 49r1 window `20240229 → 20260512` is now fully covered at 00z (804 dates, no
+> gaps). Off-00z (06/12/18z) remains optional/absent as noted below.
+
 **Date:** 2026-07-02
 **Era:** `49r1` (0.25°, control bundled in `enfo` as `number=0`; 9 pl levels
 until 2025-01-14 00z, 13 pl levels from 2025-01-14 06z — the 13-level template

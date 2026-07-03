@@ -1,5 +1,12 @@
 # 50r1 era — build state, GCS coverage, and backfill plan
 
+> **UPDATE 2026-07-03 — DONE (as of 20260702).** The rolling tail `20260701`
+> and `20260702` were filled (`:50r1`, oper, prefix `v20260623_run_par_ecmwf`;
+> 51/51 members). 50r1 now covers `20260513 → 20260702` at 00z. **Whole-catalog
+> verification:** 1256 contiguous 00z dates `20230118 → 20260702`, all 51/51,
+> zero unexpected gaps (only the 6 S3-absent 0p4 dates remain). Ongoing daily
+> forward-fill still applies (`--era 50r1`, config runtime left at `:50r1`).
+
 **Date:** 2026-07-02
 **Era:** `50r1` (0.25°, 14 pl levels, **dual-stream**: 50 perturbed members from
 `enfo/ef` + control from `oper/fc`)

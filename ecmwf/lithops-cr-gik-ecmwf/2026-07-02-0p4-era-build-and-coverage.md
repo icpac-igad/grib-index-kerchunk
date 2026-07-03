@@ -1,5 +1,13 @@
 # 0p4 era — build state, GCS coverage, and backfill plan
 
+> **UPDATE 2026-07-03 — DONE.** The full 0p4 wave ran
+> (`run_backfill_00z.sh --era 0p4 --from 2023-01 --to 2024-02`, `:0p4` runtime,
+> prefix `v20260623_run_par_ecmwf`). **401/401 publishable dates written**
+> (`20230118 → 20240228`), all 51/51 members. The only 6 absent dates
+> (`20230427–20230502`) are **404 on S3** — ECMWF never published them at 0.4°,
+> so nothing to fill. Era is complete. Value validated against Herbie first
+> (see `../gik_vs_herbie/0p4_eval/`).
+
 **Date:** 2026-07-02
 **Era:** `0p4` (0.4° beta, 9 pressure levels, 51 members with control bundled in `enfo` as `number=0`)
 **Verification:** GCS bucket `gik-ecmwf-aws-tf` enumerated with service account
