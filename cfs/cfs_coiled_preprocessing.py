@@ -26,13 +26,24 @@ Difference from the ECMWF driver:
     `validate=False` (a few CFS messages don't decode), matching
     `run_cfs_template_creation.py`.
 
-  CFS task grid:  members 01[,02,03,04] × forecast hours 0..MAX step 6.
-  One reference (date, run); the mapping is date-independent and reused for all
-  forecast dates (same as the GEFS/ECMWF templates).
+  CFS task grid:  members 01[,02,03,04] × forecast hours DISCOVERED from S3.
+  The per-(member,hour) step count is date-dependent (fixed calendar horizon),
+  so the grid is read from the actual flxf listing, NOT a flat 0..5160h range —
+  member 01 ~849-857 steps, members 02-04 ~481-493, cfs.20181031 a short 729
+  (see cfs_corpus_scoping/CFS_CORPUS_SCOPING.md §5). One reference (date, run);
+  the mapping schema is date-independent, reused across forecast dates.
 
-Must be launched by a user with Coiled auth in `cfs/` (`coiled login` done;
-`coiled-data.json` GCS key present). It cannot be launched by the assistant.
-`--dry-run` prints the plan with no Coiled / no cost.
+Two sinks:
+  --sink local-tar (default): workers RETURN the mapping parquets; the client
+      bundles them into a single tar.gz in the GEFS-style layout. Needs NO GCS
+      key — this is the runnable path and produces the artifact the GEFS-model
+      CFS template consumes (a mapping tar beside the deflated skeleton).
+  --sink gcs: upload per-hour parquets to gs://gik-cfs-aws-tf/cfs/time_idx/...
+      (needs `coiled-data.json` shipped to workers).
+
+Launched by a user with Coiled auth in `cfs/` (`coiled login` done). `--sink gcs`
+also needs `coiled-data.json`. `--dry-run` prints the plan (discovers the real
+per-date step counts) with no Coiled / no cost.
 
 Coiled config follows the ECMWF driver: software=gik-coiled-pinned (fallback
 gik-coiled-v6), vm_type=n2-standard-2, region=us-east1, arm=False,
@@ -40,10 +51,14 @@ idle_timeout=30m, cluster.adapt(min=1,max=N), workspace=gcp-sewaa-nka. All
 overridable via flags.
 
 Usage:
-    python cfs_coiled_preprocessing.py --date 20251101 --run 00 --dry-run
-    python cfs_coiled_preprocessing.py --date 20251101 --run 00                 # paid
-    python cfs_coiled_preprocessing.py --date 20251101 --run 00 \
-        --members 01,02,03,04 --max-forecast-hours 2160 --max-workers 20
+    # plan only (discovers per-date step counts), no cost
+    python cfs_coiled_preprocessing.py --date 20260702 --run 00 --dry-run
+    # member 01 flxf, full corpus -> local tar.gz (no GCS key needed)
+    python cfs_coiled_preprocessing.py --date 20260702 --run 00       # paid Coiled
+    # cheap partial (first 48h) to smoke-test the cluster path
+    python cfs_coiled_preprocessing.py --date 20260702 --run 00 --max-forecast-hours 48
+    # production GCS sink
+    python cfs_coiled_preprocessing.py --date 20260702 --run 00 --sink gcs
 """
 import os
 import re
@@ -51,9 +66,14 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 
-# CFS flux files are 6-hourly. Default 5160h ~= 215 days -> 861 files per member.
+# CFS flux files are 6-hourly. The step COUNT is date/member-dependent (fixed
+# calendar horizon), so the task grid is DISCOVERED from the S3 listing rather
+# than a flat range — see cfs_corpus_scoping/CFS_CORPUS_SCOPING.md §5:
+#   member 01    : ~849-857 steps (212-214 d), varies by init month
+#   member 02-04 : ~481-493 steps (~4 months)
+#   cfs.20181031 : short first-day anomaly (729 steps / 182 d)
+# A flat 0..5160h range would 404 the last few hours on most dates.
 FORECAST_INTERVAL = 6
-DEFAULT_MAX_FORECAST_HOURS = 5160
 
 S3_BUCKET = "noaa-cfs-pds"
 GCS_BUCKET = "gik-cfs-aws-tf"
@@ -71,26 +91,60 @@ def cfs_grib_url(date_str, run, forecast_hour, member):
     )
 
 
-def build_task_plan(date, run, members, max_forecast_hours):
-    """Build the (member × forecast-hour) task plan for one reference date/run."""
-    hours = list(range(0, max_forecast_hours + 1, FORECAST_INTERVAL))
+def discover_forecast_hours(date, run, member, max_forecast_hours=None):
+    """List the actual flxf files in S3 -> the exact forecast hours present.
+
+    This is the per-date step count from §5: every task points at a file that
+    exists (no 404 tail). `max_forecast_hours` optionally caps the range (cheap
+    partial run); None = all discovered.
+    """
+    import s3fs
+    fs = s3fs.S3FileSystem(anon=True)
+    d = f"{S3_BUCKET}/cfs.{date}/{run}/6hrly_grib_{member}"
+    init = datetime.strptime(f"{date}{run}", "%Y%m%d%H")
+    hours = set()
+    for f in fs.ls(d, detail=False):
+        name = f.split("/")[-1]
+        if not (name.startswith("flxf") and name.endswith(".grb2")):
+            continue
+        m = re.match(r"flxf(\d{10})\.", name)
+        if not m:
+            continue
+        fh = int((datetime.strptime(m.group(1), "%Y%m%d%H") - init).total_seconds() // 3600)
+        if max_forecast_hours is None or fh <= max_forecast_hours:
+            hours.add(fh)
+    return sorted(hours)
+
+
+def build_task_plan(date, run, members, max_forecast_hours=None):
+    """Per-(member, forecast-hour) task plan; hours discovered from S3 per member."""
     tasks = []
+    per_member = {}
     for member in members:
+        hours = discover_forecast_hours(date, run, member, max_forecast_hours)
+        per_member[member] = hours
         for hour in hours:
             tasks.append({
                 "member": member,
                 "hour": hour,
                 "url": cfs_grib_url(date, run, hour, member),
             })
-    return tasks
+    return tasks, per_member
 
 
-def print_plan(tasks, date, run, members):
-    n_hours = len({t["hour"] for t in tasks})
+def print_plan(tasks, per_member, date, run, members, sink, out):
     print(f"CFS preprocessing plan: date={date} run={run}z  {len(tasks)} tasks "
-          f"({len(members)} member(s) {','.join(members)} × {n_hours} hours)")
-    print(f"GCS dest: gs://{GCS_BUCKET}/cfs/time_idx/{date[:4]}/{date}/{run}/"
-          f"<member>/cfs-time-{date}-{run}-rt<hhhh>.parquet")
+          f"({len(members)} member(s) {','.join(members)}) — steps discovered from S3")
+    for m in members:
+        hrs = per_member.get(m, [])
+        span = f"{hrs[0]}..{hrs[-1]}h ({hrs[-1]//24}d)" if hrs else "none"
+        print(f"    m{m}: {len(hrs)} steps  {span}")
+    if sink == "gcs":
+        print(f"sink=gcs: gs://{GCS_BUCKET}/cfs/time_idx/{date[:4]}/{date}/{run}/"
+              f"<member>/cfs-time-{date}-{run}-rt<hhhh>.parquet")
+    else:
+        print(f"sink=local-tar: {out}/gik-fmrc-v2cfs_fmrc-mappings-{date}-{run}.tar.gz "
+              f"(members at cfs/time_idx/{date[:4]}/{date}/{run}/<member>/...)")
     for t in tasks[:2]:
         print(f"  [m{t['member']}]  {t['hour']:04d}h  {t['url']}")
     if len(tasks) > 2:
@@ -105,8 +159,15 @@ def main():
     ap.add_argument("--members", default="01",
                     help="comma-separated 6hrly_grib members, or 'all' (01,02,03,04). "
                          "Default 01 (matches the current CFS pipeline).")
-    ap.add_argument("--max-forecast-hours", type=int, default=DEFAULT_MAX_FORECAST_HOURS,
-                    help=f"max forecast hour, 6-hourly (default {DEFAULT_MAX_FORECAST_HOURS})")
+    ap.add_argument("--max-forecast-hours", type=int, default=None,
+                    help="optional cap on forecast hour (6-hourly); default = all "
+                         "hours discovered in S3 for the date/member")
+    ap.add_argument("--sink", choices=["local-tar", "gcs"], default="local-tar",
+                    help="local-tar (default): workers return mapping parquets, client "
+                         "bundles a tar.gz (no GCS key needed). gcs: upload per-hour "
+                         "parquets to gs://gik-cfs-aws-tf (needs --gcs-key).")
+    ap.add_argument("--out", default="./cfs_template",
+                    help="output dir for the local-tar sink")
     ap.add_argument("--max-workers", type=int, default=20)
     # Coiled config — defaults follow the ECMWF driver.
     ap.add_argument("--software", default="gik-coiled-pinned",
@@ -117,7 +178,7 @@ def main():
     ap.add_argument("--vm-type", default="n2-standard-2")
     ap.add_argument("--region", default="us-east1")
     ap.add_argument("--gcs-key", default="coiled-data.json",
-                    help="GCS service-account key shipped to workers (default coiled-data.json)")
+                    help="GCS service-account key shipped to workers (sink=gcs only)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the task plan; no Coiled, no cost")
     args = ap.parse_args()
@@ -133,13 +194,16 @@ def main():
         if bad:
             sys.exit(f"--members entries must be 01..04; got {bad}")
 
-    tasks = build_task_plan(args.date, args.run, members, args.max_forecast_hours)
-    print_plan(tasks, args.date, args.run, members)
+    tasks, per_member = build_task_plan(args.date, args.run, members,
+                                        args.max_forecast_hours)
+    print_plan(tasks, per_member, args.date, args.run, members, args.sink, args.out)
+    if not tasks:
+        sys.exit("no flxf files discovered — check date/run/member")
 
     if args.dry_run:
         return 0
 
-    if not os.path.exists(args.gcs_key):
+    if args.sink == "gcs" and not os.path.exists(args.gcs_key):
         sys.exit(f"GCS key not found: {args.gcs_key} (run from cfs/ with coiled-data.json present)")
 
     import coiled
@@ -147,6 +211,7 @@ def main():
 
     date = args.date
     run = args.run
+    sink = args.sink
     gcs_key_name = os.path.basename(args.gcs_key)
 
     @coiled.function(
@@ -204,7 +269,14 @@ def main():
         out = f'cfs-time-{date}-{run}-rt{task["hour"]:04d}.parquet'
         deduped.to_parquet(out, engine="pyarrow")
 
-        # locate the GCS key (uploaded to workers via client.upload_file)
+        # sink=local-tar: return the parquet bytes to the client (no GCS write)
+        if sink == "local-tar":
+            with open(out, "rb") as fh:
+                data = fh.read()
+            return {"member": task["member"], "hour": task["hour"],
+                    "n": int(len(deduped)), "bytes": data}
+
+        # sink=gcs: locate the GCS key (uploaded to workers via client.upload_file)
         creds = None
         cands = []
         try:
@@ -230,10 +302,31 @@ def main():
 
     cluster = scan_one.cluster
     cluster.adapt(min=1, max=args.max_workers)
-    # ship the GCS service-account key to every worker (image doesn't bake it in)
-    Client(cluster).upload_file(args.gcs_key)
+    if sink == "gcs":
+        # ship the GCS service-account key to every worker (image doesn't bake it in)
+        Client(cluster).upload_file(args.gcs_key)
+    else:
+        Client(cluster)
 
     results = list(scan_one.map(tasks))
+
+    if sink == "local-tar":
+        import io
+        import tarfile
+        from pathlib import Path
+        rows = [r for r in results if isinstance(r, dict)]
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        tar_path = Path(args.out) / f"gik-fmrc-v2cfs_fmrc-mappings-{date}-{run}.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            for r in rows:
+                arc = (f'cfs/time_idx/{date[:4]}/{date}/{run}/{r["member"]}/'
+                       f'cfs-time-{date}-{run}-rt{r["hour"]:04d}.parquet')
+                info = tarfile.TarInfo(name=arc)
+                info.size = len(r["bytes"])
+                tar.addfile(info, io.BytesIO(r["bytes"]))
+        print(f"completed {len(rows)}/{len(tasks)} -> {tar_path}")
+        return 0 if len(rows) == len(tasks) else 1
+
     ok = [r for r in results if isinstance(r, str) and "ok" in r]
     print(f"completed {len(ok)}/{len(tasks)}")
     for r in results:
