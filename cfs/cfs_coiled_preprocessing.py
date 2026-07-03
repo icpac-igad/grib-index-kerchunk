@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "pandas<2.2", "pyarrow", "fsspec", "s3fs", "cfgrib", "eccodes",
+#     "kerchunk==0.2.7", "zarr>=2.18,<3", "xarray==2024.10.0",
+#     "numcodecs<0.13", "h5py",
+# ]
+# ///
+# NOTE: the PEP723 deps above are for `--backend local` via `uv run` (they
+# provide cfgrib/kerchunk locally). `--backend coiled` is run with `python`
+# from a native Coiled-auth env (coiled/distributed are imported lazily there).
 """
 CFS Coiled preprocessing driver — adapted from
 `ecmwf/dev-test/ecmwf_50r1_coiled_preprocessing.py`.
@@ -64,6 +75,7 @@ import os
 import re
 import argparse
 import sys
+import time
 from datetime import datetime, timedelta
 
 # CFS flux files are 6-hourly. The step COUNT is date/member-dependent (fixed
@@ -151,6 +163,80 @@ def print_plan(tasks, per_member, date, run, members, sink, out):
         print(f"  ... ({len(tasks) - 2} more)")
 
 
+def scan_one_local(task):
+    """Sequential/threaded local equivalent of the Coiled scan_one — returns the
+    deduped mapping parquet bytes (same schema/output as the remote path)."""
+    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/nonexistent"
+    import io
+    import fsspec
+    import s3fs
+    import pandas as pd
+    fsspec.config.conf["s3"] = {"anon": True}
+    s3fs.S3FileSystem.clear_instance_cache()
+
+    _orig_astype = pd.Series.astype
+    if not getattr(pd.Series.astype, "_cfs_patched", False):
+        def _safe_astype(self, dtype, **kwargs):
+            if dtype is int or dtype == int:
+                try:
+                    return _orig_astype(self, dtype, **kwargs)
+                except (ValueError, TypeError):
+                    return pd.to_numeric(self, errors="coerce").fillna(0).astype(int)
+            return _orig_astype(self, dtype, **kwargs)
+        _safe_astype._cfs_patched = True
+        pd.Series.astype = _safe_astype
+
+    from kerchunk._grib_idx import build_idx_grib_mapping
+    mapping = build_idx_grib_mapping(
+        basename=task["url"], storage_options={"anon": True}, validate=False)
+    deduped = mapping.loc[~mapping["attrs"].duplicated(keep="first"), :]
+    buf = io.BytesIO()
+    deduped.to_parquet(buf, engine="pyarrow")
+    return {"member": task["member"], "hour": task["hour"],
+            "n": int(len(deduped)), "bytes": buf.getvalue()}
+
+
+def write_mapping_tar(rows, out, date, run):
+    """Bundle returned mapping parquets into the GEFS-style tar.gz layout."""
+    import io
+    import tarfile
+    from pathlib import Path
+    Path(out).mkdir(parents=True, exist_ok=True)
+    tar_path = Path(out) / f"gik-fmrc-v2cfs_fmrc-mappings-{date}-{run}.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for r in rows:
+            arc = (f'cfs/time_idx/{date[:4]}/{date}/{run}/{r["member"]}/'
+                   f'cfs-time-{date}-{run}-rt{r["hour"]:04d}.parquet')
+            info = tarfile.TarInfo(name=arc)
+            info.size = len(r["bytes"])
+            tar.addfile(info, io.BytesIO(r["bytes"]))
+    return tar_path
+
+
+def run_local(tasks, args):
+    """Backend: scan sequentially (or with a small thread pool) on this machine."""
+    rows = []
+    t0 = time.time()
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            it = ex.map(scan_one_local, tasks)
+            for i, r in enumerate(it, 1):
+                rows.append(r)
+                if i % 25 == 0 or i == len(tasks):
+                    print(f"  [{i}/{len(tasks)}] {time.time()-t0:.0f}s", flush=True)
+    else:
+        for i, task in enumerate(tasks, 1):
+            rows.append(scan_one_local(task))
+            if i % 25 == 0 or i == len(tasks):
+                print(f"  [{i}/{len(tasks)}] {time.time()-t0:.0f}s", flush=True)
+    tar_path = write_mapping_tar(rows, args.out, args.date, args.run)
+    print(f"completed {len(rows)}/{len(tasks)} -> {tar_path} "
+          f"in {(time.time()-t0)/60:.1f} min", flush=True)
+    return 0 if len(rows) == len(tasks) else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -162,13 +248,20 @@ def main():
     ap.add_argument("--max-forecast-hours", type=int, default=None,
                     help="optional cap on forecast hour (6-hourly); default = all "
                          "hours discovered in S3 for the date/member")
+    ap.add_argument("--backend", choices=["coiled", "local"], default="coiled",
+                    help="coiled (default): parallel scan on a Coiled cluster. "
+                         "local: scan sequentially/threaded on THIS machine via uv "
+                         "(no Coiled/GCS; ~5.9 s/file -> ~85 min for m01's 857 files).")
     ap.add_argument("--sink", choices=["local-tar", "gcs"], default="local-tar",
-                    help="local-tar (default): workers return mapping parquets, client "
-                         "bundles a tar.gz (no GCS key needed). gcs: upload per-hour "
-                         "parquets to gs://gik-cfs-aws-tf (needs --gcs-key).")
+                    help="local-tar (default): return mapping parquets and bundle a "
+                         "tar.gz (no GCS key needed). gcs: upload per-hour parquets to "
+                         "gs://gik-cfs-aws-tf (needs --gcs-key; coiled backend only).")
     ap.add_argument("--out", default="./cfs_template",
-                    help="output dir for the local-tar sink")
-    ap.add_argument("--max-workers", type=int, default=20)
+                    help="output dir for the local-tar sink / local backend")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="local backend: thread-pool size (default 1 = sequential)")
+    ap.add_argument("--max-workers", type=int, default=20,
+                    help="coiled backend: max cluster workers")
     # Coiled config — defaults follow the ECMWF driver.
     ap.add_argument("--software", default="gik-coiled-pinned",
                     help="Coiled software env. Default gik-coiled-pinned (reproducible "
@@ -202,6 +295,11 @@ def main():
 
     if args.dry_run:
         return 0
+
+    if args.backend == "local":
+        if args.sink == "gcs":
+            sys.exit("--sink gcs is not supported with --backend local (writes a tar)")
+        return run_local(tasks, args)
 
     if args.sink == "gcs" and not os.path.exists(args.gcs_key):
         sys.exit(f"GCS key not found: {args.gcs_key} (run from cfs/ with coiled-data.json present)")
@@ -311,19 +409,8 @@ def main():
     results = list(scan_one.map(tasks))
 
     if sink == "local-tar":
-        import io
-        import tarfile
-        from pathlib import Path
         rows = [r for r in results if isinstance(r, dict)]
-        Path(args.out).mkdir(parents=True, exist_ok=True)
-        tar_path = Path(args.out) / f"gik-fmrc-v2cfs_fmrc-mappings-{date}-{run}.tar.gz"
-        with tarfile.open(tar_path, "w:gz") as tar:
-            for r in rows:
-                arc = (f'cfs/time_idx/{date[:4]}/{date}/{run}/{r["member"]}/'
-                       f'cfs-time-{date}-{run}-rt{r["hour"]:04d}.parquet')
-                info = tarfile.TarInfo(name=arc)
-                info.size = len(r["bytes"])
-                tar.addfile(info, io.BytesIO(r["bytes"]))
+        tar_path = write_mapping_tar(rows, args.out, date, run)
         print(f"completed {len(rows)}/{len(tasks)} -> {tar_path}")
         return 0 if len(rows) == len(tasks) else 1
 
