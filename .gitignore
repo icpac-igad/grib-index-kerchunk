@@ -28,3 +28,4 @@ coiled-data.json
 /cfs/2026-06-28-cfs-plan-steps.txt
 cfs/cfs_template/
 cfs/cfs_validation/*.parquet
+cfs/cfs_ensemble_202602/
