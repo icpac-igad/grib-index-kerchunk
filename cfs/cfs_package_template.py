@@ -140,8 +140,16 @@ def build_member_set(args) -> list:
     return uniq
 
 
-def write_tar(out_path: str, skeleton: bytes, members: list, member_id: str):
-    """Write the skeleton bytes under one arcname per (date, run)."""
+def count_mapping_members(mappings_tar: str) -> int:
+    with tarfile.open(mappings_tar, "r:gz") as mtar:
+        return sum(1 for m in mtar.getmembers() if m.isfile())
+
+
+def write_tar(out_path: str, skeleton: bytes, members: list, member_id: str,
+              mappings_tar: str = None):
+    """Write the skeleton bytes under one arcname per (date, run), and (optionally)
+    fold in every mapping parquet from `mappings_tar` at its own arcname."""
+    n_map = 0
     with tarfile.open(out_path, "w:gz") as tar:
         for date, run in members:
             arc = tar_member_path(date, run, member_id)
@@ -149,8 +157,20 @@ def write_tar(out_path: str, skeleton: bytes, members: list, member_id: str):
             info.size = len(skeleton)
             info.mtime = 0  # reproducible tar
             tar.addfile(info, io.BytesIO(skeleton))
+        if mappings_tar:
+            with tarfile.open(mappings_tar, "r:gz") as mtar:
+                for m in mtar.getmembers():
+                    if not m.isfile():
+                        continue
+                    data = mtar.extractfile(m).read()
+                    info = tarfile.TarInfo(name=m.name)
+                    info.size = len(data)
+                    info.mtime = 0
+                    tar.addfile(info, io.BytesIO(data))
+                    n_map += 1
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"wrote {out_path}  ({len(members)} members, {size_mb:.2f} MB)")
+    print(f"wrote {out_path}  ({len(members)} skeleton member(s)"
+          f"{f' + {n_map} mapping parquet(s)' if mappings_tar else ''}, {size_mb:.2f} MB)")
 
 
 def upload_hf(out_path: str, repo: str):
@@ -194,6 +214,10 @@ def main():
                     help="also write the skeleton under every (date,run) of this init month")
     ap.add_argument("--replicate-dates", metavar="LIST",
                     help="also write under 'YYYYMMDD:HH,YYYYMMDD,...' (HH optional -> all runs)")
+    ap.add_argument("--mappings-tar", metavar="TAR",
+                    help="fold the mapping parquets from this tar.gz "
+                         "(cfs_coiled_preprocessing.py output) into the same tar -> the "
+                         "full GEFS-model template (deflated skeleton + idx->grib mappings)")
     ap.add_argument("--upload", action="store_true", help="upload the tar.gz to HuggingFace")
     ap.add_argument("--repo", default=DEFAULT_REPO,
                     help=f"HF dataset repo for --upload (default {DEFAULT_REPO})")
@@ -203,20 +227,25 @@ def main():
 
     if not os.path.exists(args.skeleton):
         sys.exit(f"skeleton not found: {args.skeleton}")
+    if args.mappings_tar and not os.path.exists(args.mappings_tar):
+        sys.exit(f"mappings tar not found: {args.mappings_tar}")
 
     members = build_member_set(args)
-    print(f"plan: {len(members)} tar member(s), member id {args.member}")
+    print(f"plan: {len(members)} skeleton member(s), member id {args.member}")
     print(f"  e.g. {tar_member_path(*members[0], args.member)}")
     if len(members) > 1:
         print(f"       ... and {len(members) - 1} more "
               f"({members[1][0]}_{members[1][1]} .. {members[-1][0]}_{members[-1][1]})")
+    if args.mappings_tar:
+        print(f"  + mappings: {count_mapping_members(args.mappings_tar)} parquet(s) "
+              f"from {args.mappings_tar}")
     print(f"  out: {args.out}" + ("  (+ upload to " + args.repo + ")" if args.upload else ""))
 
     if args.dry_run:
         return 0
 
     skeleton = load_skeleton_bytes(args.skeleton)
-    write_tar(args.out, skeleton, members, args.member)
+    write_tar(args.out, skeleton, members, args.member, args.mappings_tar)
 
     # quick self-check: re-open and confirm the reference member resolves
     with tarfile.open(args.out, "r:gz") as tar:
