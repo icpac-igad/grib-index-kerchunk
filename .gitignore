@@ -27,3 +27,4 @@ coiled-data.json
 /ecmwf/dev-test/2026-06-02-gik-three-era-scan-grib-template-creation-ready.txt
 /cfs/2026-06-28-cfs-plan-steps.txt
 cfs/cfs_template/
+cfs/cfs_validation/*.parquet
