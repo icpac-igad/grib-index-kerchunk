@@ -15,6 +15,10 @@
 #     "s3fs",
 #     "gcsfs",
 #     "requests",
+#     "kerchunk==0.2.7",
+#     "zarr>=2.18,<3",
+#     "numcodecs<0.13",
+#     "xarray==2024.10.0",
 # ]
 # ///
 """
@@ -104,7 +108,7 @@ PARALLEL_WORKERS = int(os.environ.get('PARALLEL_WORKERS', '8'))
 
 TEMPLATE_URL = os.environ.get(
     'TEMPLATE_URL',
-    'https://huggingface.co/datasets/Nishadhka/gfs_s3_gik_refs/resolve/main/gik-fmrc-v2cfs_fmrc.tar.gz'
+    'https://huggingface.co/datasets/E4DRR/grib-index-kerchunk-templates/resolve/main/gik-fmrc-v2cfs_fmrc.tar.gz'
 )
 
 # CFS uses 6-hourly intervals
@@ -114,8 +118,12 @@ FORECAST_INTERVAL = 6  # hours
 S3_BUCKET = "noaa-cfs-pds"
 CFS_MEMBER = "01"  # 6hrly_grib_01
 
-# Reference init date used when building the template
-REFERENCE_INIT_DATE = '20251101'
+# Reference init date the shipped template (skeleton + mappings) was built from.
+# The skeleton + idx->grib mappings are date-independent, so this one reference
+# serves all processing dates (skeleton lookup falls back to it; map_from_index
+# overlays each processing date's fresh .idx byte positions).
+REFERENCE_INIT_DATE = os.environ.get('CFS_REFERENCE_INIT_DATE', '20260702')
+REFERENCE_RUN = os.environ.get('CFS_REFERENCE_RUN', '00')
 
 # Use baked-in template from Docker image if available, fallback to /tmp download
 TEMPLATE_CACHE_PATH = os.environ.get(
@@ -226,17 +234,32 @@ def build_deflated_store_from_template(
             logger.info(f"Stage 1 complete: {len(zstore)} keys from local parquet in {elapsed:.1f}s")
             return zstore
 
-        # tar.gz archive (HuggingFace template)
-        tar_member_path = (
-            f"gik-fmrc/v2cfs_fmrc/{init_date}_{run}/"
-            f"cfs-{init_date}{run}-member{CFS_MEMBER}-rt000.par"
-        )
+        # tar.gz archive (HuggingFace template). The skeleton is date-independent,
+        # so if the processing (init_date, run) has no entry, fall back to the
+        # reference date/run, then to any skeleton member in the tar.
+        def _skel_path(d, r):
+            return (f"gik-fmrc/v2cfs_fmrc/{d}_{r}/"
+                    f"cfs-{d}{r}-member{CFS_MEMBER}-rt000.par")
 
         with tarfile.open(template_path, 'r:gz') as tar:
-            try:
-                member_info = tar.getmember(tar_member_path)
-            except KeyError:
-                logger.warning(f"Template not found for {init_date} {run}z: {tar_member_path}")
+            names = set(tar.getnames())
+            member_info = None
+            candidates = [
+                _skel_path(init_date, run),
+                _skel_path(REFERENCE_INIT_DATE, run),
+                _skel_path(REFERENCE_INIT_DATE, REFERENCE_RUN),
+            ]
+            for cand in candidates:
+                if cand in names:
+                    member_info = tar.getmember(cand)
+                    break
+            if member_info is None:  # any skeleton member (rt000.par under gik-fmrc/)
+                for n in tar.getnames():
+                    if n.startswith("gik-fmrc/") and n.endswith("-rt000.par"):
+                        member_info = tar.getmember(n)
+                        break
+            if member_info is None:
+                logger.warning(f"No skeleton member found in template for {init_date} {run}z")
                 return None
 
             f = tar.extractfile(member_info)
@@ -730,6 +753,246 @@ def validate_cfs_availability(init_date: str, run: str) -> Tuple[bool, int, int]
 
 
 # ==============================================================================
+# STAGE 2/3 (GEFS-STYLE) — map_from_index + real multi-timestep time axis
+# ==============================================================================
+# Ported from gefs/lithops-cr-gik-gefs/run_lithops_gefs.py, adapted for CFS
+# (6-hourly, member 01, flxf). Consumes the per-hour idx->grib mapping parquets
+# bundled in the template tar (cfs/time_idx/{year}/{date}/{run}/{member}/...) via
+# kerchunk.map_from_index, then builds the zarr store with store_coord_var /
+# store_data_var over ALL forecast hours — a real time axis, not a step_XXXX/
+# overlay. This is the two-part GEFS-model runtime.
+
+def _patch_cfs_astype():
+    """CFS .idx fractional record ids (36.1/36.2) break parse_grib_idx's
+    `.astype(int)`; coerce them (same patch as the template builders)."""
+    if getattr(pd.Series.astype, "_cfs_patched", False):
+        return
+    _orig = pd.Series.astype
+
+    def _safe(self, dtype, **kw):
+        if dtype is int or dtype == int:
+            try:
+                return _orig(self, dtype, **kw)
+            except (ValueError, TypeError):
+                return pd.to_numeric(self, errors="coerce").fillna(0).astype(int)
+        return _orig(self, dtype, **kw)
+    _safe._cfs_patched = True
+    pd.Series.astype = _safe
+
+
+class CFSMappingManager:
+    """Read per-hour idx->grib mapping parquets from the template tar.gz.
+
+    Tar layout: cfs/time_idx/{year}/{date}/{run}/{member}/cfs-time-{date}-{run}-rt{hhhh}.parquet
+    Keyed by (member, forecast_hour). The mapping is date-independent, so the
+    reference-date parquets serve every processing date via map_from_index.
+    """
+
+    def __init__(self, tar_gz_path: str):
+        self.tar_gz_path = tar_gz_path
+        self._index: Dict[Tuple[str, int], str] = {}
+        with tarfile.open(tar_gz_path, "r:gz") as tar:
+            for m in tar.getmembers():
+                if not (m.isfile() and m.name.endswith(".parquet")
+                        and "/time_idx/" in m.name):
+                    continue
+                member = m.name.split("/")[-2]
+                tok = os.path.basename(m.name).replace(".parquet", "").split("-")[-1]
+                if tok.startswith("rt"):
+                    self._index[(member, int(tok[2:]))] = m.name
+        logger.info(f"Mapping manager: indexed {len(self._index)} mapping parquet(s)")
+
+    def read_mapping(self, member: str, forecast_hour: int) -> Optional[pd.DataFrame]:
+        name = self._index.get((member, forecast_hour))
+        if name is None:
+            return None
+        with tarfile.open(self.tar_gz_path, "r:gz") as tar:
+            f = tar.extractfile(tar.getmember(name))
+            if f is not None:
+                return pd.read_parquet(io.BytesIO(f.read()))
+        return None
+
+    def available_hours(self, member: str) -> List[int]:
+        return sorted(h for (mm, h) in self._index if mm == member)
+
+
+def generate_axes_cfs(init_date: str, run: str, forecast_hours: List[int]) -> List[pd.Index]:
+    """valid_time index (one entry per 6-hourly forecast hour) + single 'time'."""
+    init = pd.Timestamp(f"{init_date}") + pd.Timedelta(hours=int(run))
+    valid_time = pd.DatetimeIndex(
+        [init + pd.Timedelta(hours=int(h)) for h in forecast_hours], name="valid_time")
+    time_index = pd.Index([init], name="time")
+    return [valid_time, time_index]
+
+
+def calculate_time_dimensions(axes: List[pd.Index]):
+    """Time dims/coords/times/valid_times/steps (BEST_AVAILABLE, as in GEFS)."""
+    axes_by_name = {pdi.name: pdi for pdi in axes}
+    time_dims: Dict[str, int] = {}
+    time_coords: Dict[str, tuple] = {}
+    time_dims["valid_time"] = len(axes_by_name["valid_time"])
+    assert len(axes_by_name["time"]) == 1
+    reference_time = axes_by_name["time"].to_numpy()[0]
+    time_coords["step"] = ("valid_time",)
+    time_coords["valid_time"] = ("valid_time",)
+    time_coords["time"] = ("valid_time",)
+    time_coords["datavar"] = ("valid_time",)
+    valid_times = axes_by_name["valid_time"].to_numpy()
+    times = np.where(valid_times <= reference_time, valid_times, reference_time)
+    steps = valid_times - times
+    times = valid_times
+    return time_dims, time_coords, times, valid_times, steps
+
+
+def _cfs_flux_grib_url(init_date: str, run: str, forecast_hour: int, member: str) -> str:
+    init = pd.Timestamp(f"{init_date}") + pd.Timedelta(hours=int(run))
+    fdt = init + pd.Timedelta(hours=int(forecast_hour))
+    return (f"s3://{S3_BUCKET}/cfs.{init_date}/{run}/6hrly_grib_{member}/"
+            f"flxf{fdt:%Y%m%d%H}.{member}.{init:%Y%m%d%H}.grb2")
+
+
+def _map_one_cfs_timestep(init_date, run, forecast_hour, datestr, member, mgr):
+    """parse this date's fresh flxf .idx + map_from_index against the template."""
+    from kerchunk._grib_idx import parse_grib_idx, map_from_index
+    grib_url = _cfs_flux_grib_url(init_date, run, forecast_hour, member)
+    try:
+        idxdf = parse_grib_idx(basename=grib_url, storage_options={"anon": True})
+    except Exception as e:
+        logger.warning(f"  idx parse failed f{forecast_hour:04d}: {e}")
+        return None
+    mapping = mgr.read_mapping(member, forecast_hour)
+    if mapping is None:
+        return None
+    idxdf = idxdf.loc[~idxdf["attrs"].duplicated(keep="first"), :]
+    try:
+        return map_from_index(datestr, mapping, idxdf)
+    except Exception as e:
+        logger.warning(f"  map_from_index failed f{forecast_hour:04d}: {e}")
+        return None
+
+
+def build_cfs_mapped_index(axes, init_date, run, forecast_hours, member, mgr,
+                           parallel_workers: int = PARALLEL_WORKERS) -> pd.DataFrame:
+    """Map every timestep (parallel I/O), concat, and light-dedup."""
+    valid_time = axes[0]
+    tasks = list(zip(range(len(valid_time)), valid_time, forecast_hours))
+    results = []
+    with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+        futs = {ex.submit(_map_one_cfs_timestep, init_date, run, fh, ts, member, mgr): fh
+                for (_, ts, fh) in tasks}
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            r = fut.result()
+            if r is not None and len(r):
+                results.append(r)
+            if done % 100 == 0 or done == len(futs):
+                logger.info(f"  Stage 2: mapped {done}/{len(futs)} timesteps")
+    if not results:
+        raise ValueError("No CFS mapped indices created")
+    kind = pd.concat(results, ignore_index=True)
+    if "length" in kind.columns:
+        kind = kind.sort_values("length", ascending=False)
+    dedup_cols = [c for c in ["varname", "typeOfLevel", "level", "valid_time"]
+                  if c in kind.columns]
+    if dedup_cols:
+        kind = kind.drop_duplicates(subset=dedup_cols, keep="first")
+    sort_cols = [c for c in ["time", "varname"] if c in kind.columns]
+    return kind.sort_values(by=sort_cols) if sort_cols else kind
+
+
+def process_unique_groups(zstore, chunk_index, time_dims, time_coords,
+                          times, valid_times, steps):
+    """Build the zarr store: drop groups not present, then write coord+data vars
+    with a real time axis. Ported from GEFS (store_coord_var / store_data_var)."""
+    from kerchunk._grib_idx import store_coord_var, store_data_var
+    unique_groups = chunk_index.set_index(
+        ["varname", "stepType", "typeOfLevel"]).index.unique()
+
+    keys_to_delete = []
+    for key in list(zstore.keys()):
+        lookup = tuple([v for v in os.path.dirname(key).split("/")[:3] if v != ""])
+        if lookup not in unique_groups:
+            keys_to_delete.append(key)
+    for key in keys_to_delete:
+        del zstore[key]
+
+    stored = 0
+    for key, group in chunk_index.groupby(["varname", "stepType", "typeOfLevel"]):
+        try:
+            base_path = "/".join(key)
+            lvals = group.level.unique()
+            dims = time_dims.copy()
+            coords = time_coords.copy()
+
+            required = [f"{base_path}/time/.zattrs",
+                        f"{base_path}/valid_time/.zattrs",
+                        f"{base_path}/step/.zattrs"]
+            if key[2]:
+                required.append(f"{base_path}/{key[2]}/.zattrs")
+            if any(k not in zstore for k in required):
+                continue
+
+            if len(lvals) == 1:
+                lvals = lvals.squeeze()
+                dims[key[2]] = 0
+            elif len(lvals) > 1:
+                lvals = np.sort(lvals)
+                dims[key[2]] = len(lvals)
+                coords["datavar"] += (key[2],)
+            else:
+                continue
+
+            store_coord_var(key=f"{base_path}/time", zstore=zstore,
+                            coords=time_coords["time"], data=times.astype("datetime64[s]"))
+            store_coord_var(key=f"{base_path}/valid_time", zstore=zstore,
+                            coords=time_coords["valid_time"], data=valid_times.astype("datetime64[s]"))
+            store_coord_var(key=f"{base_path}/step", zstore=zstore,
+                            coords=time_coords["step"],
+                            data=steps.astype("timedelta64[s]").astype("float64") / 3600.0)
+            store_coord_var(key=f"{base_path}/{key[2]}", zstore=zstore,
+                            coords=(key[2],) if lvals.shape else (), data=lvals)
+            store_data_var(key=f"{base_path}/{key[0]}", zstore=zstore, dims=dims,
+                           coords=coords, data=group, steps=steps, times=times,
+                           lvals=lvals if lvals.shape else None)
+            stored += 1
+        except Exception as e:
+            logger.warning(f"  skip group {key}: {e}")
+    logger.info(f"Stage 3: stored {stored} variable group(s), {len(zstore)} zarr keys")
+    return zstore
+
+
+def build_final_store_mapped(deflated_store, template_path, init_date, run,
+                             max_forecast_hours, member=CFS_MEMBER):
+    """GEFS-style Stage 2/3: mapped index -> real-axis zarr store dict."""
+    import copy
+    _patch_cfs_astype()
+    mgr = CFSMappingManager(template_path)
+    hours = [h for h in mgr.available_hours(member) if h <= max_forecast_hours]
+    if not hours:
+        raise ValueError(f"No mappings for member {member} (<= {max_forecast_hours}h) in template")
+    logger.info(f"Stage 2: {len(hours)} timesteps (member {member}, 0..{hours[-1]}h)")
+    axes = generate_axes_cfs(init_date, run, hours)
+    time_dims, time_coords, times, valid_times, steps = calculate_time_dimensions(axes)
+    chunk_index = build_cfs_mapped_index(axes, init_date, run, hours, member, mgr)
+    zstore = copy.deepcopy(
+        deflated_store["refs"] if "refs" in deflated_store else deflated_store)
+    # store_coord_var/store_data_var expect JSON *strings* in .zarray/.zattrs,
+    # not parsed dicts (our loader may have json.loads-ed them) — normalize back.
+    for k, v in list(zstore.items()):
+        if isinstance(v, (dict, list)):
+            zstore[k] = json.dumps(v)
+        elif isinstance(v, bytes):
+            try:
+                zstore[k] = v.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+    zstore = process_unique_groups(zstore, chunk_index, time_dims, time_coords,
+                                   times, valid_times, steps)
+    return zstore
+
+
+# ==============================================================================
 # MAIN PROCESSING FUNCTION (runs on Cloud Run workers via Lithops)
 # ==============================================================================
 
@@ -793,16 +1056,14 @@ def process_cfs_member(
             result["message"] = "Stage 1 failed: template loading error"
             return result
 
-        # Stage 2: Parse .idx files + build references
-        stage2_refs = build_refs_from_indices(
-            init_date, run, max_forecast_hours
+        # Stage 2/3 (GEFS-style): map_from_index against the template mappings
+        # and build a real multi-timestep zarr store (store_data_var).
+        final_store = build_final_store_mapped(
+            deflated_store, template_path, init_date, run, max_forecast_hours
         )
-        if not stage2_refs:
-            result["message"] = "Stage 2 failed: no references built"
+        if not final_store:
+            result["message"] = "Stage 2/3 failed: empty store"
             return result
-
-        # Merge with template
-        final_store = merge_with_template(stage2_refs, deflated_store)
 
         # Stage 3: Create final parquet
         if output_dir_override:
@@ -825,11 +1086,10 @@ def process_cfs_member(
         result.update({
             "success": True,
             "message": (f"Processed {init_date} {run}z in {total_time:.1f}s "
-                        f"({len(stage2_refs)} refs)"),
+                        f"({len(final_store)} zarr keys)"),
             "gcs_path": gcs_path,
             "output_path": str(parquet_file) if output_dir_override else None,
             "total_time_seconds": round(total_time, 1),
-            "stage2_refs": len(stage2_refs),
             "final_keys": len(final_store),
         })
 
