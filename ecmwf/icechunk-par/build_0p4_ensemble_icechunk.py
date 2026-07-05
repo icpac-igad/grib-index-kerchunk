@@ -44,6 +44,20 @@ SFC_RENAME = {"2t": "t2m", "10u": "u10", "10v": "v10"}
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def resolve_storage(store: str):
+    """Local path, or s3://bucket/prefix (credentials + AWS_ENDPOINT_URL from env,
+    e.g. source.coop: source .env with AWS_* keys and endpoint https://data.source.coop)."""
+    if store.startswith("s3://"):
+        import os
+        bucket, _, prefix = store[5:].partition("/")
+        return icechunk.s3_storage(
+            bucket=bucket, prefix=prefix.rstrip("/"),
+            region=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+            from_env=True, force_path_style=True)
+    return icechunk.local_filesystem_storage(store)
+
+
 def member_number(par_path: Path) -> int:
     m = re.search(r"-(control|ens_(\d+))\.parquet$", par_path.name)
     if not m:
@@ -81,10 +95,10 @@ def load_date_refs(pars_dir: Path) -> pd.DataFrame:
 
 
 def open_or_create(store_path, steps, levels):
-    storage = icechunk.local_filesystem_storage(str(store_path))
+    storage = resolve_storage(str(store_path))
     auth = icechunk.containers_credentials(
         {CONTAINER_PREFIX: icechunk.s3_anonymous_credentials()})
-    if Path(store_path).exists():
+    if icechunk.Repository.exists(storage):
         return icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth), False
 
     config = icechunk.RepositoryConfig.default()

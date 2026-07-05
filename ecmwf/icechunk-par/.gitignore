@@ -3,3 +3,6 @@ pars/
 stores/
 note.txt
 .ipynb_checkpoints/
+note*.txt
+untitled*.txt
+*.log

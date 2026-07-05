@@ -76,7 +76,17 @@ def main():
     args = ap.parse_args()
 
     print(f"== T1 structure: {args.store} ==")
-    storage = icechunk.local_filesystem_storage(args.store)
+    if args.store.startswith("s3://"):
+        import os
+        bucket, _, prefix = args.store[5:].partition("/")
+        anon = "AWS_ACCESS_KEY_ID" not in os.environ  # no creds -> public read
+        storage = icechunk.s3_storage(
+            bucket=bucket, prefix=prefix.rstrip("/"),
+            region=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+            anonymous=anon, from_env=not anon, force_path_style=True)
+    else:
+        storage = icechunk.local_filesystem_storage(args.store)
     auth = icechunk.containers_credentials(
         {CONTAINER_PREFIX: icechunk.s3_anonymous_credentials()})
     repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)

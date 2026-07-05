@@ -66,8 +66,9 @@ Per the three-era plan: separate stores for 0p4 / 49r1 (13-level superset) /
 |---|---|
 | `audit_par.py` | step 0: dump a par's schema, key trees, ref categories |
 | `pilot_0p4_to_icechunk.py` | single member → store, inline bit-exact proof |
-| `build_0p4_ensemble_icechunk.py` | 51 members; creates store or **appends** a date along `time` |
-| `test_icechunk_read.py` | test routine T1 structure / T2 decode / T3 bit-exact |
+| `build_0p4_ensemble_icechunk.py` | 51 members; creates store or **appends** a date along `time`; `--store` accepts a local path or `s3://bucket/prefix` |
+| `test_icechunk_read.py` | test routine T1 structure / T2 decode / T3 bit-exact (local or S3 store; anonymous read when no AWS creds in env) |
+| `test_dask_read.py` | dask-cluster read test: multi-process workers, ensemble mean/std, per-worker peak RSS |
 
 ## Commands
 
@@ -112,6 +113,77 @@ auth = icechunk.containers_credentials(
 repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
 ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
 ds.t2m.sel(time="2023-06-28", number=7).isel(step=0).plot()
+```
+
+## Dask-cluster evaluation (the #884 OOM question)
+
+The historical CMORPH OOM (VirtualiZarr
+[#884](https://github.com/zarr-developers/VirtualiZarr/discussions/884)) was on
+the **write** side: the coordinator accumulated ~85 KB kerchunk JSON × 236K
+files, and `append_dim` re-read O(n) metadata at ~87K timesteps. This pipeline
+avoids both by construction — refs stream straight into icechunk manifests via
+`set_virtual_refs` (no JSON accumulation; builder RSS is flat per date), one
+commit per date, and the time axis grows by 1/day (401 dates for the whole 0p4
+era, not 473K timesteps).
+
+`test_dask_read.py` evaluates the complementary **read** side on a
+multi-process cluster (same pickling path as Coiled workers):
+
+```bash
+uv run test_dask_read.py --store stores/ecmwf-0p4-ens --steps 3
+# or against the published source.coop store, no credentials needed:
+AWS_DEFAULT_REGION=us-west-2 uv run test_dask_read.py \
+    --store s3://us-west-2.opendata.source.coop/e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test
+```
+
+Result (4 worker processes × 2 GB): ensemble mean+std of `t2m` over 51 members
+× 2 dates × 3 steps = 306 virtual chunks (497 MB of GRIB decoded from
+`ecmwf-forecasts`) in ~37 s, per-worker **peak RSS 355–394 MB**, no worker
+restarts — identical numbers for the local and source.coop-hosted store. The
+icechunk readonly session and the gribberish codec pickle to workers cleanly.
+For Coiled, swap `LocalCluster` for `coiled.Cluster(...)` and follow the DAG
+pattern of `../dev-test/ecmwf_ea_tp_source_coop_zarr.py` (one task per
+(date, member), `as_completed`, batching + STS credential-timeout guard);
+workers need `icechunk zarr xarray gribberish` installed.
+
+## Publishing to source.coop
+
+Published test store (public, anonymous read):
+`s3://us-west-2.opendata.source.coop/e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test`
+(region `us-west-2`, no endpoint override).
+
+Empirical findings with source.coop credentials (`.env` with
+`AWS_ENDPOINT_URL=https://data.source.coop`):
+
+- The `data.source.coop` proxy supports plain PUT/GET/LIST/DELETE and even
+  conditional PUT (`If-None-Match: *`), but **not** the full S3 API icechunk
+  commits need — `Repository.create()`'s commit fails in `update_repo_info`
+  (service error) and batch `DeleteObjects` returns `NoSuchBucket`.
+- The proxy credentials are **not** AWS STS tokens: direct writes to
+  `us-west-2.opendata.source.coop` fail with `InvalidAccessKeyId` (the older
+  `ecmwf_ea_tp_source_coop_zarr.py` used real STS creds and wrote directly).
+- **Working pattern: build + commit locally, publish as a plain file sync**
+  through the proxy — icechunk's local layout is identical to its S3 layout
+  (59 objects, 19 MB, ~5 s to upload), and *reading* an icechunk repo needs
+  only GET/LIST, which works anonymously on the public opendata bucket. This
+  mirrors the reference script's own conclusion: keep transactions off the
+  source.coop write path.
+
+```python
+# publish: sync the local store tree via the proxy (see git history for the
+# exact snippet) -- boto3 upload_file of every file under stores/ecmwf-0p4-ens
+# to e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test/
+
+# consume from anywhere, no credentials:
+import icechunk, xarray as xr
+storage = icechunk.s3_storage(
+    bucket="us-west-2.opendata.source.coop",
+    prefix="e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test",
+    region="us-west-2", anonymous=True, force_path_style=True)
+auth = icechunk.containers_credentials(
+    {"s3://ecmwf-forecasts/": icechunk.s3_anonymous_credentials()})
+repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
 ```
 
 ## Measured results (2026-07-05, icechunk 2.1.0 / zarr 3.2.1 / gribberish 1.4.0)
