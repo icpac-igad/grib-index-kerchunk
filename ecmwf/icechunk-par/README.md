@@ -70,6 +70,13 @@ Per the three-era plan: separate stores for 0p4 / 49r1 (13-level superset) /
 | `test_icechunk_read.py` | test routine T1 structure / T2 decode / T3 bit-exact (local or S3 store; anonymous read when no AWS creds in env) |
 | `test_dask_read.py` | dask-cluster read test: multi-process workers, ensemble mean/std, per-worker peak RSS |
 | `materialize_ea_from_icechunk.py` | dask-cluster **realize** test: virtual store → East Africa subset → plain zarr on another source.coop path |
+| `publish_to_source_coop.py` | resumable file-sync of a local store to source.coop (survives 1-hour STS expiry) |
+
+See `CONVERSION_ESTIMATE.md` for the full four-era time/size estimate (~5 h
+build for all 1,256 dates, ~13 GB published) and how the credential-free
+build + resumable publish keep the 1-hour STS window a non-issue. The build now
+uses **manifest splitting** along `time` (mandatory: without it store size is
+O(n²) in dates).
 
 ## Commands
 

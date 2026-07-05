@@ -42,6 +42,14 @@ NY, NX = 451, 900  # 0.4-deg beta grid
 N_MEMBERS = 51     # number 0 = control, 1..50 = ens_01..ens_50
 SFC_RENAME = {"2t": "t2m", "10u": "u10", "10v": "v10"}
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# manifest shard size along `time`. Splitting is ESSENTIAL at era scale: without
+# it every append rewrites one ever-growing manifest, so store size is O(n^2) in
+# dates (measured: +12,+18,+24 MB for dates 2,3,4) and appends slow down. With
+# splitting each commit touches only the active shard -> store grows LINEARLY
+# (~7 MB/date for 0p4) and appends stay flat (~8.5 s). 1 = each date sealed in
+# its own shard, which also makes the source.coop publish incremental (only the
+# new shard uploads per date).
+MANIFEST_SPLIT_TIME = 1
 
 
 def resolve_storage(store: str):
@@ -104,6 +112,11 @@ def open_or_create(store_path, steps, levels):
     config = icechunk.RepositoryConfig.default()
     config.set_virtual_chunk_container(icechunk.VirtualChunkContainer(
         CONTAINER_PREFIX, icechunk.s3_store(region="eu-central-1", anonymous=True)))
+    config.manifest = icechunk.ManifestConfig(
+        splitting=icechunk.ManifestSplittingConfig.from_dict({
+            icechunk.ManifestSplitCondition.AnyArray(): {
+                icechunk.ManifestSplitDimCondition.DimensionName("time"):
+                    MANIFEST_SPLIT_TIME}}))
     repo = icechunk.Repository.create(storage, config, authorize_virtual_chunk_access=auth)
 
     session = repo.writable_session("main")
