@@ -78,6 +78,31 @@ build + resumable publish keep the 1-hour STS window a non-issue. The build now
 uses **manifest splitting** along `time` (mandatory: without it store size is
 O(n²) in dates).
 
+## One store, era/run groups (current direction)
+
+`build_ecmwf_icechunk.py` supersedes the per-era script: a **single Icechunk
+repo** holding zarr groups `{era}/{run}z` — `0p4/00z`, `49r1/00z` (13-level
+superset), `50r1/00z`, with room for `06z/12z/18z` groups (each run keeps its
+own time and step axes, since 06z/18z forecasts are shorter). Verified: two
+different-grid eras coexist in one store, each opens with
+`xr.open_zarr(store, group="49r1/00z")`, the whole archive opens with
+`xr.open_datatree(...)`, and reads decode bit-exact. 49r1+ pars carry two soil
+fields (`sot`, `vsw`, levtype `sol`, no level segment) — treated as surface
+vars; the builder now refuses to drop unknown levtypes silently.
+
+It also writes **natively to GCS** (`--store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens`,
+service-account json via `GOOGLE_APPLICATION_CREDENTIALS` or `--sa-key`):
+Icechunk commits work directly against GCS — no local staging, no disk ceiling,
+no 1-hour STS. Measured per date on GCS: 0p4 ~26 s, 49r1-13L ~48 s (vs 13/24 s
+local). source.coop then gets a plain GCS→S3 object copy of the finished store
+(same mirror pattern as the pars).
+
+Single-store trade-offs (evaluated): one URL + one publish pipeline + datatree
+view, at the cost of a single commit stream — era backfills serialize (or need
+commit-retry/rebase if run concurrently), and repo history/GC spans all eras.
+For a sequential backfill and 4 appends/day in operations, the serialization
+cost is irrelevant.
+
 ## Commands
 
 Fetch pars for a date (51 files, ~10 MB):
