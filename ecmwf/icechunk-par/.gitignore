@@ -1,0 +1,5 @@
+# local-only working data
+pars/
+stores/
+note.txt
+.ipynb_checkpoints/
