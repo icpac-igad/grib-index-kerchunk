@@ -69,6 +69,7 @@ Per the three-era plan: separate stores for 0p4 / 49r1 (13-level superset) /
 | `build_0p4_ensemble_icechunk.py` | 51 members; creates store or **appends** a date along `time`; `--store` accepts a local path or `s3://bucket/prefix` |
 | `test_icechunk_read.py` | test routine T1 structure / T2 decode / T3 bit-exact (local or S3 store; anonymous read when no AWS creds in env) |
 | `test_dask_read.py` | dask-cluster read test: multi-process workers, ensemble mean/std, per-worker peak RSS |
+| `materialize_ea_from_icechunk.py` | dask-cluster **realize** test: virtual store → East Africa subset → plain zarr on another source.coop path |
 
 ## Commands
 
@@ -145,6 +146,48 @@ For Coiled, swap `LocalCluster` for `coiled.Cluster(...)` and follow the DAG
 pattern of `../dev-test/ecmwf_ea_tp_source_coop_zarr.py` (one task per
 (date, member), `as_completed`, batching + STS credential-timeout guard);
 workers need `icechunk zarr xarray gribberish` installed.
+
+## Materializing East Africa from the virtual store (the #884 answer, both planes)
+
+Where does the #884 OOM actually live? It is a **virtual-reference write**
+(metadata plane) problem — the CMORPH coordinator accumulated kerchunk JSON
+for 236K files and `append_dim` re-read O(n) metadata. It is *not* a problem
+of writing realized data. Measured on both planes here:
+
+| plane | operation | peak RSS | notes |
+|---|---|---|---|
+| metadata (where #884 OOM'd) | builder: 359,805 virtual refs, one date | **468 MB**, flat | streamed `set_virtual_refs`, commit per date — nothing accumulates |
+| data (this test) | dask cluster: read virtual store → EA subset → write realized zarr | coordinator **308 MB**, workers **~280 MB** | workers stream chunk → decode → subset → PUT |
+
+The full run (`materialize_ea_from_icechunk.py`): 2 worker processes read the
+**source.coop icechunk virtual store**, decode all 8,670 GRIB messages of `tp`
+(2 dates × 51 members × 85 steps, ~5.2 GB streamed from `ecmwf-forecasts`),
+subset to the ICPAC box (lat 25…-14, lon 19…55 → 98×90), and write a 306 MB
+realized zarr (chunks `(1,1,85,98,90)`, one object per date+member — the
+layout of `../dev-test/ecmwf_ea_tp_source_coop_zarr.py`) to a second
+source.coop path in **470 s (18.4 msgs/s)**. Verified: anonymous public read,
+bit-exact against the virtual store, zero NaNs.
+
+```bash
+source .env && uv run materialize_ea_from_icechunk.py \
+    --source s3://us-west-2.opendata.source.coop/e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test \
+    --dest   s3://e4drr-project/forecasts/ecmwf_ea_tp_0p4_zarr_test
+```
+
+Realized output (public):
+`s3://us-west-2.opendata.source.coop/e4drr-project/forecasts/ecmwf_ea_tp_0p4_zarr_test`
+
+Three gotchas encountered, relevant for the Coiled scale-up:
+
+- **S3 `SlowDown` throttling** from `ecmwf-forecasts` under burst range-GETs.
+  Fix: `StorageRetriesSettings(max_tries=10, ...)` +
+  `config.max_concurrent_requests = 8` on the icechunk repo, `ZARR_ASYNC__CONCURRENCY=6`,
+  2 threads/worker. On Coiled, bound per-worker fan-out before adding workers.
+- **Strip inherited encodings** before `to_zarr`: the source arrays carry the
+  read-only gribberish serializer, which cannot encode.
+- **`AWS_ENDPOINT_URL` env leakage**: icechunk's Rust client auto-reads it, so
+  proxy creds in the env silently reroute the (anonymous, direct-AWS) source
+  reads — capture the endpoint for the dest writer and pop it from the env.
 
 ## Publishing to source.coop
 
