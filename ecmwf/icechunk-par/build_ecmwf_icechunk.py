@@ -214,7 +214,11 @@ def main():
     if time_val in existing:
         raise SystemExit(f"{args.date} {args.run}z already in group {grp}")
     if existing.size and time_val < existing[-1]:
-        raise SystemExit("appends must be chronological within a group")
+        # gap fill (e.g. retrying a date that failed on a transient error):
+        # appended at the END, so the time axis becomes unsorted -- readers
+        # should ds.sortby("time"); the health check reports it as a WARN
+        print(f"NOTE: {args.date} is earlier than the group tip -> out-of-order "
+              f"gap fill; time axis unsorted until consumers sortby('time')")
     if not created:
         gsteps = g["step"][:]
         assert np.array_equal(gsteps, steps), \
@@ -222,6 +226,17 @@ def main():
     ti = int(tarr.shape[0])
     tarr.resize((ti + 1,))
     tarr[ti] = time_val
+
+    # resize EVERY existing data array, not just those with refs in this date:
+    # a var that disappears mid-era (e.g. 49r1 cape -> mucape) must keep growing
+    # (NaN for absent dates) or the group's time dims diverge and xarray
+    # refuses to open it (found live by check_store_health.py)
+    coord_names = {"time", "number", "step", "isobaricInhPa", "latitude", "longitude"}
+    for name in list(g.array_keys()):
+        if name not in coord_names:
+            arr = g[name]
+            if arr.shape[0] != ti + 1:
+                arr.resize((ti + 1,) + arr.shape[1:])
 
     n_set = 0
     for var, is_pl in [(v, False) for v in sfc_vars] + [(v, True) for v in pl_vars]:
@@ -241,7 +256,7 @@ def main():
         if zname in g:
             arr = g[zname]
             assert arr.shape[1:] == full[1:], f"{path}: shape drift"
-            arr.resize(full)
+            assert arr.shape[0] == ti + 1  # resized above
         else:
             # first appearance (group creation, or schema drift mid-era):
             # full time length, earlier dates read as NaN

@@ -213,6 +213,15 @@ def main():
     tarr.resize((ti + 1,))
     tarr[ti] = time_val
 
+    # resize EVERY existing data array (vars can drift across the corpus);
+    # otherwise time dims diverge and the group won't open in xarray
+    coord_names = {"time", "number", "step", "latitude", "longitude"}
+    for name in list(g.array_keys()):
+        if name not in coord_names:
+            arr = g[name]
+            if arr.shape[0] != ti + 1:
+                arr.resize((ti + 1,) + arr.shape[1:])
+
     n_set = 0
     for zname, sub in refs.groupby("zname"):
         path = f"{GROUP}/{zname}"
@@ -220,7 +229,7 @@ def main():
         if zname in g:
             arr = g[zname]
             assert arr.shape[1:] == full[1:], f"{path}: shape drift"
-            arr.resize(full)
+            assert arr.shape[0] == ti + 1  # resized above
         else:
             zarr.create_array(store, name=path, shape=full,
                               chunks=(1, 1, 1, NY, NX), dtype="float32",
