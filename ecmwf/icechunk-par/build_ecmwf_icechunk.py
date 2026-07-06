@@ -224,9 +224,15 @@ def main():
     tarr[ti] = time_val
 
     n_set = 0
-    for var in sfc_vars + pl_vars:
-        is_pl = var in pl_vars
-        zname = var if is_pl else SFC_RENAME.get(var, var)
+    for var, is_pl in [(v, False) for v in sfc_vars] + [(v, True) for v in pl_vars]:
+        # a var can exist at BOTH sfc and pl (50r1 control: z = orography at sfc,
+        # geopotential on levels) -- the surface instance gets a _sfc suffix
+        if is_pl:
+            zname = var
+        else:
+            zname = SFC_RENAME.get(var, var)
+            if var in pl_vars:
+                zname = f"{zname}_sfc"
         path = f"{grp}/{zname}"
         full = ((ti + 1, N_MEMBERS, len(steps), n_levels, ny, nx) if is_pl
                 else (ti + 1, N_MEMBERS, len(steps), ny, nx))
@@ -245,7 +251,9 @@ def main():
                               serializer=GribberishCodec(var=zname),
                               compressors=None, filters=None, dimension_names=dims,
                               attributes={"grib_shortName": var}, overwrite=True)
-        sub = refs[refs["var"] == var]
+        sub = refs[(refs["var"] == var)
+                   & (refs.levtype == "pl" if is_pl
+                      else refs.levtype.isin(["sfc", "sol"]))]
         if is_pl:
             specs = [icechunk.VirtualChunkSpec(
                 index=[ti, int(r.number), step_idx[r.step_h], lev_idx[r.level], 0, 0],
