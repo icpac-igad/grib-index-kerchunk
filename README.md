@@ -167,6 +167,114 @@ date as a lazy xarray Dataset" or [`gefs/hf_README.md`](gefs/hf_README.md).
 
 ---
 
+## Icechunk Virtual Stores (v1.0+)
+
+Production GIK parquets are now converted to **Icechunk virtual stores** — a
+performant, API-compatible replacement that eliminates parquet parsing overhead
+and integrates natively with xarray's `zarr_format=3` backend. Both ECMWF and
+GEFS have live stores in GCS.
+
+### Store locations
+
+| Product | Store | Coverage | Type |
+|---------|-------|----------|------|
+| **ECMWF** | `gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens` | 4 eras (0.4°, 49r1 9L, 49r1 13L, 50r1 14L) | Multi-group repo |
+| **GEFS** | `gs://gik-gefs-aws-tf/icechunk/gefs-ens` | 2020–present, 30 members | Single group (`0p25/00z`) |
+
+### Opening a store (with service account)
+
+Stores are hosted on GCS and require a service account for write access; reads
+are anonymous. To open for reading or to append new dates:
+
+```python
+import icechunk
+import xarray as xr
+import os
+
+# 1. Set up storage backend with service account (for write/append)
+#    For read-only, pass service_account_file=None
+storage = icechunk.gcs_storage(
+    bucket="gik-ecmwf-aws-tf",
+    prefix="icechunk/ecmwf-ens",
+    service_account_file=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+)
+
+# 2. Configure virtual chunk access to S3 (ECMWF forecast data source)
+auth = icechunk.containers_credentials({
+    "s3://ecmwf-forecasts/": icechunk.s3_anonymous_credentials()
+})
+
+# 3. Open repo and access via xarray
+repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+ds = xr.open_zarr(
+    repo.readonly_session("main").store,
+    consolidated=False,
+    zarr_format=3
+)
+
+print(ds)  # displays virtual size (unrealized): e.g. "170.0 TB"
+print(ds["t2m"].isel(time=0, number=0, step=0).values)  # streams ~20 KB from S3
+```
+
+### For GEFS (S3 backend)
+
+```python
+storage = icechunk.gcs_storage(
+    bucket="gik-gefs-aws-tf",
+    prefix="icechunk/gefs-ens",
+    service_account_file=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+)
+
+auth = icechunk.containers_credentials({
+    "s3://noaa-gefs-pds/": icechunk.s3_anonymous_credentials()
+})
+
+repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+```
+
+### Environment setup
+
+```bash
+# Set service account credentials for GCS access (write/append)
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
+
+# Optional: AWS credentials for S3 (anonymous read works by default)
+# export AWS_ACCESS_KEY_ID=...
+# export AWS_SECRET_ACCESS_KEY=...
+```
+
+### Key features
+
+- **Lazy loading**: Opens instantly; size shows unrealized (virtual) footprint
+- **Append-safe**: Time dimension is the append axis; multiple dates → O(1) manifest update
+- **Unified schema**: All eras in one repo (ECMWF); seamless cross-era queries
+- **Gribberish codec**: GRIB chunks decode directly from S3 byte ranges (~80× faster than cfgrib)
+- **Bit-exact to source**: Every value matches the original GRIB, verified independently
+
+### Building your own
+
+To convert GIK parquets to an Icechunk store:
+
+```bash
+# ECMWF (all members, one date, era 49r1)
+uv run ecmwf/icechunk-par/build_ecmwf_icechunk.py \
+    --era 49r1 --run 00 --date 20250515 \
+    --pars-dir /tmp/pars/20250515 \
+    --store gs://your-bucket/icechunk/ecmwf-ens
+
+# GEFS (all members, one date)
+uv run gefs/build_gefs_icechunk.py \
+    --date 20240301 \
+    --pars-dir /tmp/pars/20240301 \
+    --store gs://your-bucket/icechunk/gefs-ens
+```
+
+See [`ecmwf/icechunk-par/README.md`](ecmwf/icechunk-par/README.md) and
+[`gefs/README.md`](gefs/README.md) for detailed workflows.
+
+---
+
 ## Validation
 
 GIK references produce **bit-identical** APCP / TP fields to
