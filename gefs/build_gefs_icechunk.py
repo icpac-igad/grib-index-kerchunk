@@ -208,7 +208,10 @@ def main():
     if time_val in existing:
         raise SystemExit(f"{args.date} already in store")
     if existing.size and time_val < existing[-1]:
-        raise SystemExit("appends must be chronological")
+        # gap fill (retrying a transiently-failed date): appended at the END,
+        # so the time axis becomes unsorted -- readers should sortby("time")
+        print(f"NOTE: {args.date} is earlier than the group tip -> out-of-order "
+              f"gap fill; time axis unsorted until consumers sortby('time')")
     ti = int(tarr.shape[0])
     tarr.resize((ti + 1,))
     tarr[ti] = time_val

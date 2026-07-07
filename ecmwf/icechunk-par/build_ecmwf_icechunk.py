@@ -100,6 +100,15 @@ def parse_par(path: Path) -> pd.DataFrame:
     refs["step_h"] = parts.map(lambda p: int(p[0].split("_")[1]))
     refs["var"] = parts.map(lambda p: p[1])
     refs["levtype"] = parts.map(lambda p: p[2])
+    # defective pars exist (e.g. 2026-03-19..31): pl keys missing the level
+    # segment entirely, 13 levels collapsed onto one arbitrary message --
+    # unrecoverable here, the date's pars must be regenerated upstream
+    n_bad = int(((parts.map(len) == 5) & (refs.levtype == "pl")).sum())
+    if n_bad:
+        raise SystemExit(
+            f"DEFECTIVE PAR {path.name}: {n_bad} pl chunk keys lack the level "
+            f"segment (upstream par-generation bug) -- regenerate this date's "
+            f"pars with run_lithops_ecmwf before retrying")
     refs["level"] = parts.map(lambda p: float(p[3]) if p[2] == "pl" else np.nan)
     loc = refs.v.map(json.loads)
     refs["url"] = loc.map(lambda x: x[0] if x[0].endswith(".grib2") else x[0] + ".grib2")
