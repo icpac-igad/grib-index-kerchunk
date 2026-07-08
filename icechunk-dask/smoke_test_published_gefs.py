@@ -60,6 +60,8 @@ def main():
     print("  data vars :", list(ds.data_vars))
     print("  dims      :", dict(ds.sizes))
     print("  coords    :", list(ds.coords))
+    print(f"  virtual (unrealized) size: {ds.nbytes/1e12:.1f} TB "
+          f"({ds.nbytes:,} bytes)")
 
     # newest forecast date; decode an instant var (t2m has an f000 message)
     ti = int(np.argmax(ds["time"].values))

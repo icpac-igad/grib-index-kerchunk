@@ -70,6 +70,8 @@ def main():
               f"{len(ds.data_vars)} vars, time={ds.sizes['time']}, "
               f"number={ds.sizes['number']}, step={ds.sizes['step']}, "
               f"levels={ds.sizes.get('isobaricInhPa')}, grid={ny}x{nx}")
+        print(f"         virtual (unrealized) size: {ds.nbytes/1e12:.1f} TB "
+              f"({ds.nbytes:,} bytes)")
 
         var = next((v for v in T2M_CANDIDATES if v in ds), None)
         if var is None:
