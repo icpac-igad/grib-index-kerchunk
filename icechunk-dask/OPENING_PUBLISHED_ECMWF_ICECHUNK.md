@@ -59,13 +59,19 @@ storage = icechunk.s3_storage(
 auth = icechunk.containers_credentials(
     {"s3://ecmwf-forecasts/": icechunk.s3_anonymous_credentials()})
 
-repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+# Disable eager manifest preload -- see "source.coop sporadic 500s" below.
+cfg = icechunk.RepositoryConfig.default()
+cfg.manifest = icechunk.ManifestConfig(
+    preload=icechunk.ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0))
+
+repo = icechunk.Repository.open(
+    storage, config=cfg, authorize_virtual_chunk_access=auth)
 sess = repo.readonly_session("main")
 
 # pick the era you want -- e.g. the current 50r1 stream
 ds = xr.open_zarr(sess.store, group="50r1/00z",
                   consolidated=False, zarr_format=3)
-print(ds)
+print(ds)   # xarray reports the virtual (unrealized) size, e.g. "Size: 168TB"
 
 # read one field -- resolves a virtual chunk from ecmwf-forecasts and decodes it
 t2m = ds["t2m"].isel(time=-1, number=0, step=0).values   # (721, 1440), Kelvin
@@ -84,11 +90,20 @@ t2m = ds["t2m"].isel(time=-1, number=0, step=0).values   # (721, 1440), Kelvin
 - **`force_path_style=True`** is required for source.coop.
 - **`from_env=False`** so stray `AWS_*` env vars don't turn the anonymous read
   into a signed one.
-- **"Failure pre-loading manifest ... service error" on stderr is harmless.**
-  Icechunk eagerly/speculatively pre-loads manifests on open; source.coop
-  occasionally returns a transient 5xx for some of those GETs. They are logged
-  but tolerated -- the actual read path retries and succeeds. Confirmed against
-  a full object-count check (destination holds all 46,154 manifests).
+- **Disable eager manifest preload (source.coop sporadic 500s).** source.coop
+  returns transient `HTTP 500` ("service error") on a small % of GETs under
+  concurrency. This is source.coop, *not* AWS S3 (manifests live on source.coop;
+  the GRIB byte-range reads to `ecmwf-forecasts` are never even reached at open
+  time), and it is *not* a rate limit (128-way concurrent GET bursts succeed).
+  icechunk's default open **prefetches thousands of manifests in parallel**, so
+  at a few-% error rate at least one *critical* fetch tends to draw a 500 and the
+  open raises `IcechunkError: object store error service error` -- with hundreds
+  of "Failure pre-loading manifest ... service error" lines on stderr. Passing
+  the `ManifestPreloadConfig(max_total_refs=0, max_arrays_to_scan=0)` above turns
+  preload off: manifests load lazily on demand (with retry), the stderr noise
+  disappears, and open is robust (slower, but reliable). The store itself is
+  complete -- a full object-count check shows all 46,154 manifests present, so
+  the errors are transport-side, not missing data.
 
 ## Smoke test
 

@@ -56,7 +56,17 @@ def main():
     )
     auth = icechunk.containers_credentials(
         {CONTAINER_PREFIX: icechunk.s3_anonymous_credentials()})
-    repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+    # Disable eager manifest preload. source.coop returns sporadic HTTP 500s
+    # ("service error") on a few % of GETs; icechunk's default open prefetches
+    # thousands of manifests in parallel, so at least one critical fetch tends
+    # to draw a 500 and the open raises. With preload off, manifests load
+    # lazily on demand (with retry) -- slower open, but robust and quiet.
+    cfg = icechunk.RepositoryConfig.default()
+    cfg.manifest = icechunk.ManifestConfig(
+        preload=icechunk.ManifestPreloadConfig(max_total_refs=0,
+                                               max_arrays_to_scan=0))
+    repo = icechunk.Repository.open(storage, config=cfg,
+                                    authorize_virtual_chunk_access=auth)
     sess = repo.readonly_session("main")
     print(f"repo opened in {time.time()-t0:.1f}s")
 
