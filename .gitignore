@@ -8,6 +8,10 @@ gcp-*-key.json
 .env
 **/.env
 
+# --- Mirror / run logs (source.coop publish artifacts) ---
+icechunk-dask/*.log
+**/mirror_*.log
+
 # --- Notebook / tooling noise ---
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
