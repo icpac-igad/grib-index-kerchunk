@@ -26,6 +26,9 @@ Variable/extent spec: `../docs/ecmwf_icechunk_dask_variable_extraction.md`
 | What dominates the cost? | Read, by ~400×. 2.43 M *global* GRIB messages are decoded to write 5.5 GB of East Africa. Cropping saves storage, not time. §4 |
 | Can MAM 2024 / MAM 2025 be done? | **No, not on this cluster.** A single `49r1` pressure-level manifest needs **89.5 GB of worker RAM**. Measured, not inferred. §2 |
 | What is the fix for that? | Upstream: rebuild the source store with `icechunk.ManifestSplittingConfig` split along `time`. §6 |
+| **Full corpus, all 51 members stored?** | 1,246 dates over three eras → **7.37 TB written (~4.4 TB compressed), 91.5 M messages / ~115 TB read, ~182 h ≈ 7.6 days.** §7 |
+| Does keeping members cost more runtime? | **No.** All 51 are read either way; the reduction only changes what lands on disk. It is a storage decision, not a runtime one. §7 |
+| How much of the corpus is reachable today? | **4 % — 51 of 1,246 dates.** The rest is blocked on manifest RAM, not storage or time. §7.2 |
 | Biggest surprise | Manifest RAM is **~2000 B/ref in memory**, not the ~200 B/ref quoted in the extraction doc. 10× the budget. §2 |
 
 ---
@@ -319,9 +322,9 @@ lead is wanted for a *forecast* product but the cGAN only trains on 24–54 h,
 those are two different extractions and it is worth being explicit about which
 one this store is for.
 
-**If individual members were stored instead of mean+sd**, 30 dates would be
-**233 GB** rather than 9.14 GB (×25.5). The mean+sd reduction is what keeps
-this tractable; it is also exactly what `load_fcst()` consumes.
+**If individual members are stored instead of mean+sd**, 30 dates is **233 GB**
+rather than 9.14 GB (×25.5). See §7 for the full corpus at that setting, and
+for the write-path change it forces.
 
 ---
 
@@ -435,3 +438,86 @@ Three ways forward, in order of leverage:
 Until (1) lands, the honest scope is: **the pipeline is proven, the sizing is
 measured, and the data it can actually produce today is the 51 dates of
 `50r1`.**
+
+---
+
+## 7. The full corpus, storing individual members
+
+All three eras, every published 00z date, 7-day lead (53 steps), **all 51
+members kept** rather than reduced to mean + sd. Reproduce with
+`materialize_ea_icechunk_ewc.py corpus --store-members`.
+
+Grid sizes and date counts are read from the store's own coordinate arrays,
+not assumed. The 0p4 era is a **0.4° grid**, so the same lat/lon window is a
+much smaller array — 102 × 91 = 9,282 cells against 163 × 147 = 23,961.
+
+| group | dates | channels | EA cells | GB/date | **write TB** | msgs M | read TB | hours |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `0p4` | 401 | 22 | 9,282 | 2.21 | 0.885 | 23.85 | 13.95 | 34.8 |
+| `49r1`-pre | 320 | 29 | 23,961 | 7.51 | 2.404 | 25.08 | 37.63 | 55.6 |
+| `49r1`-post | 474 | 30 | 23,961 | 7.77 | 3.684 | 38.44 | 57.65 | 82.4 |
+| `50r1` | 51 | 30 | 23,961 | 7.77 | 0.396 | 4.14 | 6.20 | 8.9 |
+| **total** | **1,246** | | | | **7.37 TB** | **91.5 M** | **115 TB** | **182 h** |
+
+- **Storage: 7.37 TB uncompressed, ~4.4 TB after zstd.** Against 289 GB
+  (~173 GB compressed) for mean+sd — a **25.5×** difference.
+- **Read: 91.5 M GRIB messages, ~115 TB — identical in both modes.** All 51
+  members must be *read* either way; the reduction only changes what lands on
+  disk. So the ensemble decision is a storage decision, not a runtime one.
+- **Time: 182 h ≈ 7.6 days** of continuous cluster at the measured 21.6 msg/s,
+  again the same in both modes.
+
+### 7.1 Why the channel counts differ per group
+
+| group | surface | pressure | total |
+|---|---:|---:|---:|
+| `0p4` | 6 — no `ssr`, `ttr`, `tcw`, `cape`, `mucape` (none published) | 16 — **no `w` at all** | **22** |
+| `49r1`-pre | 9 — has `cape`, no `tcw`/`mucape` yet | 20 | **29** |
+| `49r1`-post | 10 — `mucape` + `tcw`, `cape` now all-NaN | 20 | **30** |
+| `50r1` | 10 | 20 | **30** |
+
+Verified against each group's variable list. `0p4` has `d gh lsm msl q r ro
+skt sp st t t2m tcwv tp u u10 v v10 vo` — no `w`, no radiation, no CAPE
+family, which is what makes it a different channel set rather than a shorter
+one.
+
+### 7.2 What actually blocks this today
+
+| era | surface manifest | pressure manifest | on a 9.7 GB budget |
+|---|---:|---:|---|
+| `0p4` | 3.48 GB | **31.3 GB** | pressure INFEASIBLE |
+| `49r1` | 6.88 GB | **89.5 GB** | pressure INFEASIBLE |
+| `50r1` | 0.44 GB | 6.19 GB | ✅ fits |
+
+**51 of 1,246 dates — 4 % of the corpus — are extractable on this cluster.**
+The other 96 % are blocked on manifest RAM, not on storage or time. Nothing in
+the extraction code can change that; the fix is `ManifestSplittingConfig` on
+the source store (§6).
+
+### 7.3 Two consequences of keeping members that are easy to miss
+
+**1. The write path has to change.** At 51 members a single date is ~7.8 GB —
+far too much to gather into the driver and append as one Dataset, which is how
+the mean+sd path works. `--store-members` therefore switches to
+**preallocate + region writes**: the full `(time, step, number, lat, lon)`
+schema is created NaN-filled up front (zarr does not write all-fill chunks, so
+this is nearly free), then each variable is streamed into its own region as it
+lands and released. Peak driver memory becomes one variable (~1.3 GB for a
+5-level one) instead of a whole date.
+
+**2. The output store inherits the manifest problem.** Chunked one per
+`(date, step)` with all members together, the full corpus is **1.79 M refs →
+~3.6 GB** of manifest for the *materialised* store — the very cost
+materialising was meant to escape. Chunking one per `(date, all steps, all
+members)` keeps it at 0.03 M refs / 0.07 GB, but makes each chunk ~259 MB,
+which is too coarse to read efficiently.
+
+Neither extreme is right. **Split the output store per era (or per year) and
+write it with `icechunk.ManifestSplittingConfig`** — the same fix the source
+store needs, applied on the way out.
+
+> **Untested:** neither write path has been executed. My shell has no EWC
+> credentials and writing would create objects in `must-icechunk`. The read
+> side, the manifest measurements, and the channel availability are all
+> measured on the live cluster; the append and region-write paths are
+> designed and syntax-checked only. Step 3 in §5 is what proves them.

@@ -222,6 +222,32 @@ ERA_SHAPE = {                      # (dates, members, steps, levels) per era
     "50r1": (51,  51, 85, 14),     # still growing; `probe` reports the truth
 }
 
+# EA box size per era -- READ from the store's coordinate arrays, not assumed.
+# 0p4 is a 0.4 deg grid, so the same lat/lon window is a much smaller array.
+EA_CELLS = {
+    "0p4":  102 * 91,              # 9,282   @ 0.40 deg
+    "49r1": 163 * 147,             # 23,961  @ 0.25 deg
+    "50r1": 163 * 147,             # 23,961  @ 0.25 deg
+}
+
+# The 49r1 group is a union of two schema sub-eras, split at 2025-01-14.
+# Counted from the store's own time axis: 320 dates before, 474 after.
+SUBERA_DATES = {"49r1-pre": 320, "49r1-post": 474}
+
+# Corpus rows: (label, era, dates, channel-count). Channel counts come from the
+# per-era availability in SURFACE_SPEC/PRESSURE_SPEC plus the sub-era rules:
+#   0p4       22 = 6 sfc (no ssr/ttr/tcw/cape/mucape, none published) + 16 pl
+#             (no `w` at all in 0p4)
+#   49r1-pre  29 = 9 sfc (cape, but no tcw/mucape yet)               + 20 pl
+#   49r1-post 30 = 10 sfc (mucape + tcw, cape now all-NaN)           + 20 pl
+#   50r1      30 = 10 sfc                                            + 20 pl
+CORPUS = [
+    ("0p4",       "0p4",  401, 22),
+    ("49r1-pre",  "49r1", 320, 29),
+    ("49r1-post", "49r1", 474, 30),
+    ("50r1",      "50r1",  51, 30),
+]
+
 
 def manifest_gb(era: str, pressure: bool, dates: int | None = None) -> float:
     d, m, s, lv = ERA_SHAPE[era]
@@ -308,7 +334,23 @@ def open_source_era(era: str):
     return _ERA_CACHE[era]
 
 
-def extract_var_day(era, store_var, levels, date, steps_h, members, retries=3):
+def fetch_coords(era, steps_h):
+    """The driver holds AWS_* (it writes the sink) and therefore cannot read
+    the source itself -- so even the coordinate arrays for the output template
+    have to come off a worker."""
+    import numpy as np
+    _, ds = open_source_era(era)
+    lat = np.asarray(ds.latitude.values)
+    lon = np.asarray(ds.longitude.values)
+    return {
+        "latitude": lat[(lat <= LAT_MAX) & (lat >= LAT_MIN)],
+        "longitude": lon[(lon >= LON_MIN) & (lon <= LON_MAX)],
+        "number": np.asarray(ds.number.values),
+    }
+
+
+def extract_var_day(era, store_var, levels, date, steps_h, members,
+                    reduce_members=True, retries=3):
     """Read one store variable for one forecast date, crop to the EA box and
     reduce over `number` to mean + sd.
 
@@ -355,13 +397,22 @@ def extract_var_day(era, store_var, levels, date, steps_h, members, retries=3):
     out, finite = {}, {}
     for level, name in levels:
         c = cube.sel(isobaricInhPa=level) if level is not None else cube
-        stacked = (xr.concat([c.mean("number"), c.std("number")], dim=stat)
-                   .transpose("step", "stat", "latitude", "longitude")
-                   .astype("float32"))
-        for coord in ("isobaricInhPa", "number", "time", "valid_time"):
+        if reduce_members:
+            # (step, stat, y, x) -- the 2 channels per field load_fcst() reads
+            stacked = (xr.concat([c.mean("number"), c.std("number")], dim=stat)
+                       .transpose("step", "stat", "latitude", "longitude"))
+        else:
+            # (step, number, y, x) -- every member kept, 25.5x the bytes
+            stacked = c.transpose("step", "number", "latitude", "longitude")
+        stacked = stacked.astype("float32")
+        drop = ("isobaricInhPa", "time", "valid_time")
+        if reduce_members:
+            drop += ("number",)
+        for coord in drop:
             if coord in stacked.coords:
                 stacked = stacked.drop_vars(coord)
-        f = float(np.isfinite(stacked.sel(stat="mean").values).mean())
+        probe = stacked.sel(stat="mean") if reduce_members else stacked.isel(number=0)
+        f = float(np.isfinite(probe.values).mean())
         # The all-NaN trap: the array exists for this era but was never
         # populated in this sub-era window. Report it; the driver decides.
         out[name] = stacked.rename(name)
@@ -473,6 +524,52 @@ def prepare_cluster(client, restart: bool):
     log.info("cluster: %d workers, %d threads, %.1f GB/worker", len(winfo),
              sum(w["nthreads"] for w in winfo.values()), gb)
     return sorted(winfo), gb
+
+
+def preallocate(repo, chans, dates, steps_td, coords, store_members, log_=log):
+    """Create the full (time, step, depth, lat, lon) schema up front, filled
+    with NaN, so each (date, variable) can be written straight into its own
+    region afterwards.
+
+    Needed for --store-members: at 51 members a single date is ~7.8 GB, far
+    too much to gather into the driver and append as one Dataset the way the
+    mean+sd path does. Region writes let each variable land independently.
+
+    The NaN fill costs almost nothing on disk -- zarr does not write a chunk
+    that is entirely fill_value -- but it does create every array's metadata,
+    which is what makes the region writes legal.
+    """
+    import dask.array as dsa
+    from icechunk.xarray import to_icechunk
+
+    ny, nx = len(coords["latitude"]), len(coords["longitude"])
+    depth_name = "number" if store_members else "stat"
+    depth_vals = (coords["number"] if store_members
+                  else np.array(["mean", "sd"], dtype="<U4"))
+    shape = (len(dates), len(steps_td), len(depth_vals), ny, nx)
+    chunks = (1, len(steps_td), len(depth_vals), ny, nx)
+
+    names = [n for lv in chans.values() for _, n in lv]
+    template = xr.Dataset(
+        {n: ((("time", "step", depth_name, "latitude", "longitude")),
+             dsa.full(shape, np.nan, dtype="float32", chunks=chunks))
+         for n in names},
+        coords={"time": [np.datetime64(d) for d in dates],
+                "step": steps_td, depth_name: depth_vals,
+                "latitude": coords["latitude"],
+                "longitude": coords["longitude"]},
+    )
+    logical = sum(v.nbytes for v in template.data_vars.values())
+    log_.info("preallocating %d channels x %d dates = %.2f GB logical "
+              "(NaN chunks are not written)", len(names), len(dates),
+              logical / 1e9)
+    session = repo.writable_session("main")
+    to_icechunk(template, session, mode="w",
+                encoding={n: {"chunks": chunks} for n in names})
+    snap = session.commit(f"preallocate {len(names)} channels x {len(dates)} "
+                          f"dates ({depth_name}={len(depth_vals)})")
+    log_.info("schema committed %s", snap[:12])
+    return depth_name
 
 
 def warm_manifests(client, era, chans, pin, date, batch, timeout):
@@ -632,6 +729,91 @@ def cmd_plan(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# corpus -- the whole published record, all three eras, both storage modes
+# ─────────────────────────────────────────────────────────────────────────────
+def cmd_corpus(args):
+    n_step = len(steps_for_lead(args.lead_days))
+    n_mem = 51
+    # What multiplies the cell count on the write side: 51 individual members,
+    # or the 2-channel mean+sd reduction the cGAN actually consumes.
+    depth = n_mem if args.store_members else 2
+    mode = f"{n_mem} individual members" if args.store_members else "mean+sd"
+
+    print(f"\nFULL CORPUS  --  {mode}, lead {args.lead_days:g} d "
+          f"({n_step} steps), all 51 members READ either way")
+    print(f"box {LAT_MAX}..{LAT_MIN} N, {LON_MIN}..{LON_MAX} E\n")
+
+    hdr = (f"{'group':11s} {'dates':>5s} {'ch':>3s} {'cells':>7s} "
+           f"{'GB/date':>8s} {'WRITE TB':>9s} {'msgs M':>8s} {'READ TB':>8s} "
+           f"{'hours':>7s}")
+    print(hdr); print("-" * len(hdr))
+
+    tot_w = tot_msg = tot_read = tot_h = tot_d = 0.0
+    for label, era, dates, n_chan in CORPUS:
+        cells = EA_CELLS[era]
+        per_date_b = n_chan * n_step * depth * cells * 4
+        write_tb = per_date_b * dates / 1e12
+        msgs = dates * n_chan * n_mem * n_step
+        # 0p4 messages are a 451x900 global field, 0.25 deg eras are 721x1440
+        mb_per_msg = 1.5 * (cells / EA_CELLS["49r1"]) ** 0 * (
+            0.39 if era == "0p4" else 1.0)
+        read_tb = msgs * mb_per_msg / 1e6
+        # Critical path per date is the heaviest single task: `u`, 5 levels.
+        rate = args.msg_rate * (2.0 if era == "0p4" else 1.0)   # smaller fields
+        hours = dates * (5 * n_mem * n_step / rate) / 3600
+        print(f"{label:11s} {dates:5d} {n_chan:3d} {cells:7,d} "
+              f"{per_date_b/1e9:8.2f} {write_tb:9.3f} {msgs/1e6:8.2f} "
+              f"{read_tb:8.2f} {hours:7.1f}")
+        tot_w += write_tb; tot_msg += msgs; tot_read += read_tb
+        tot_h += hours; tot_d += dates
+    print("-" * len(hdr))
+    print(f"{'TOTAL':11s} {int(tot_d):5d} {'':3s} {'':7s} {'':8s} "
+          f"{tot_w:9.3f} {tot_msg/1e6:8.2f} {tot_read:8.2f} {tot_h:7.1f}")
+
+    print(f"\nWRITE   {tot_w*1000:.0f} GB uncompressed "
+          f"(~{tot_w*1000*0.6:.0f} GB after zstd -- measure, do not trust)")
+    if args.store_members:
+        print(f"        storing mean+sd instead would be "
+              f"{tot_w*1000*2/n_mem:.0f} GB, i.e. {n_mem/2:.1f}x smaller")
+    else:
+        print(f"        storing all {n_mem} members instead would be "
+              f"{tot_w*1000*n_mem/2/1000:.1f} TB, i.e. {n_mem/2:.1f}x bigger")
+    print(f"READ    {tot_msg/1e6:.0f} M GRIB messages, ~{tot_read:.0f} TB "
+          f"-- IDENTICAL in both modes. The read is what costs; the ensemble\n"
+          f"        reduction only changes what lands on disk.")
+    print(f"TIME    {tot_h:.0f} h = {tot_h/24:.1f} days of continuous cluster "
+          f"at the measured {args.msg_rate} msg/s")
+
+    print(f"\nOUTPUT-STORE MANIFEST (the materialised store's own cost)")
+    for chunk_desc, per_date_chunks in (
+            ("chunk=(1 date, all steps, all members)", 1),
+            ("chunk=(1 date, 1 step, all members)", n_step)):
+        refs = sum(d * c * per_date_chunks for _, _, d, c in CORPUS)
+        print(f"    {chunk_desc:42s} {refs/1e6:6.2f} M refs -> "
+              f"{refs*BYTES_PER_REF/1e9:5.2f} GB")
+    print(f"    -> past ~1 M refs the OUTPUT store starts to have the same\n"
+          f"       manifest problem as the input. Split it per era (or per\n"
+          f"       year) and write it with icechunk.ManifestSplittingConfig.")
+
+    print(f"\nFEASIBILITY ON THIS CLUSTER ({args.workers} x {args.worker_gb} GB)")
+    budget = args.worker_gb * 0.7
+    done = set()
+    for _, era, _, _ in CORPUS:
+        if era in done:
+            continue
+        done.add(era)
+        sfc, pl = manifest_gb(era, False), manifest_gb(era, True)
+        ok_s = "fits" if sfc <= budget else "INFEASIBLE"
+        ok_p = "fits" if pl <= budget else "INFEASIBLE"
+        print(f"    {era:6s} surface {sfc:6.2f} GB {ok_s:10s} "
+              f"pressure {pl:6.2f} GB {ok_p}")
+    reachable = sum(d for _, e, d, _ in CORPUS
+                    if manifest_gb(e, True) <= budget)
+    print(f"    budget {budget:.2f} GB/worker -> {reachable} of {int(tot_d)} "
+          f"dates ({reachable/tot_d*100:.0f}%) are extractable today.\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # probe -- what is actually in the store, and is it finite?
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_probe(args):
@@ -779,6 +961,17 @@ def cmd_run(args):
     log.info("sink: s3://%s/%s", DST_BUCKET, args.prefix)
 
     steps_td = pd.to_timedelta([f"{h}h" for h in args.steps])
+    depth_name = "number" if args.store_members else "stat"
+    if args.store_members:
+        # 51 members is ~7.8 GB per date -- far too much to funnel through the
+        # driver as one appended Dataset. Preallocate and region-write instead.
+        coords = client.submit(fetch_coords, era, args.steps, pure=False
+                               ).result(timeout=args.timeout)
+        preallocate(repo, chans, dates, steps_td, coords, True)
+        per_date_gb = (sum(len(v) for v in chans.values()) * len(args.steps)
+                       * len(args.members) * NLAT * NLON * 4 / 1e9)
+        log.info("store-members mode: ~%.2f GB/date, written per variable "
+                 "into preallocated regions", per_date_gb)
     schema = None            # fixed by the first date, enforced on the rest
     written_mb = tot_msgs = 0
     per_date_secs = []
@@ -816,7 +1009,7 @@ def cmd_run(args):
         # an OOM.
         inflight[d] = [(v, client.submit(
             extract_var_day, era, v, lvs, str(d.date()), args.steps,
-            args.members,
+            args.members, not args.store_members,
             key=f"x-{'-'.join(n for _, n in lvs)}-{d.date()}",
             workers=[pin[v]], allow_other_workers=False, pure=False))
             for v, lvs in tasks]
@@ -826,6 +1019,62 @@ def cmd_run(args):
 
     for i, d in enumerate(dates):
         t0 = time.time()
+
+        if args.store_members:
+            # Stream: take each variable as it lands, write it into its region,
+            # release it. Never holds more than one variable (~1.3 GB for a
+            # 5-level one) instead of the whole 7.8 GB date.
+            session = repo.writable_session("main")
+            names, dropped, failed = [], [], []
+            mb = 0.0
+            write_s = 0.0
+            peak = 0.0
+            cold = []
+            for v, f in inflight.pop(d):
+                r = f.result(timeout=args.timeout)
+                if r["status"] != "ok":
+                    failed.append(f"{v}({r['status']})")
+                    continue
+                tot_msgs += r["n_messages"]
+                peak = max(peak, r.get("rss_gb") or 0)
+                if r.get("cold"):
+                    cold.append(v)
+                for name, da in r["data"].items():
+                    if r["finite"][name] == 0.0:
+                        dropped.append(name)
+                        continue
+                    one = da.expand_dims(time=[np.datetime64(d)]).rename(name)
+                    one = one.to_dataset()
+                    one = one.drop_vars([c for c in one.coords])
+                    t1 = time.time()
+                    to_icechunk(one, session, region={"time": slice(i, i + 1)})
+                    write_s += time.time() - t1
+                    mb += da.nbytes / 1e6
+                    names.append(name)
+                del r
+            if failed:
+                log.error("date %s: tasks failed: %s", d.date(), failed)
+                return 3
+            got = tuple(sorted(names))
+            if schema is None:
+                schema = got
+                if dropped:
+                    log.warning("all-NaN, not written: %s",
+                                ", ".join(sorted(set(dropped))))
+                log.info("schema %d channels: %s", len(schema), " ".join(schema))
+            snap = session.commit(f"{era} {d.date()} ({len(names)} channels, "
+                                  f"{len(args.members)} members)")
+            written_mb += mb
+            per_date_secs.append(time.time() - t0)
+            log.info("[%3d/%d] %s  total %6.1fs  write %5.1fs  %7.1f MB  "
+                     "peak worker %4.1f GB  snapshot %s%s", i + 1, len(dates),
+                     d.date(), time.time() - t0, write_s, mb, peak, snap[:12],
+                     f"  (cold: {' '.join(cold)})" if cold else "")
+            nxt = i + args.lookahead
+            if nxt < len(dates):
+                submit(dates[nxt])
+            continue
+
         results = [(v, f.result(timeout=args.timeout))
                    for v, f in inflight.pop(d)]
         read_s = time.time() - t0
@@ -1003,6 +1252,15 @@ def main(argv=None):
     sp.add_argument("--msg-rate", type=float, default=21.6,
                     help="messages/s per task, measured warm (see the plan doc)")
 
+    sp = sub.add_parser("corpus",
+                        help="whole published record, all eras, both modes")
+    sp.add_argument("--lead-days", type=float, default=7)
+    sp.add_argument("--store-members", action="store_true",
+                    help="store all 51 members instead of mean+sd")
+    sp.add_argument("--workers", type=int, default=6)
+    sp.add_argument("--worker-gb", type=float, default=13.9)
+    sp.add_argument("--msg-rate", type=float, default=21.6)
+
     sp = sub.add_parser("probe", help="live store: dates, levels, finiteness")
     common(sp)
     sp.add_argument("--eras", nargs="*", default=None)
@@ -1027,6 +1285,11 @@ def main(argv=None):
     sp.add_argument("--members", type=int, nargs="+", default=MEMBERS_FULL)
     sp.add_argument("--cheap-members", action="store_true",
                     help="control + every 5th perturbed (11) instead of 51")
+    sp.add_argument("--store-members", action="store_true",
+                    help="store all 51 members (dim `number`) instead of "
+                         "reducing to mean+sd. 25.5x the bytes, identical "
+                         "read cost, and switches the write path from "
+                         "append-per-date to preallocate + region writes")
     sp.add_argument("--levels-per-task", type=int, default=0,
                     help="levels per read task. 0 (default) = one task per "
                          "variable, all its levels together -- MEASURED at "
@@ -1049,7 +1312,7 @@ def main(argv=None):
         args.steps = STEPS_CGAN_H
     elif getattr(args, "steps", None) is None:
         args.steps = steps_for_lead(args.lead_days)
-    return {"plan": cmd_plan, "probe": cmd_probe,
+    return {"plan": cmd_plan, "corpus": cmd_corpus, "probe": cmd_probe,
             "run": cmd_run, "size": cmd_size}[args.command](args)
 
 
