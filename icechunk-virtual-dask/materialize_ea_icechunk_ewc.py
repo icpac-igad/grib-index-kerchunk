@@ -500,7 +500,12 @@ def prepare_cluster(client, restart: bool):
         client.restart(timeout=300)
         client.wait_for_workers(n_expected, timeout=300)
 
-    client.register_plugin(scrub_plugin())      # covers workers joining later
+    # Covers workers that join mid-run. NOTE: this registration is STICKY --
+    # the scheduler re-applies it to every worker that starts afterwards,
+    # including workers for unrelated jobs, which would silently strip their
+    # EWC credentials. release_cluster() must undo it; every entry point that
+    # calls prepare_cluster() wraps its work in a try/finally to guarantee it.
+    client.register_plugin(scrub_plugin())
 
     # Belt and braces for workers that were already up when the plugin landed.
     # Workers can still be settling right after a restart, so a dropped comm
@@ -602,6 +607,41 @@ def warm_manifests(client, era, chans, pin, date, batch, timeout):
                             type(exc).__name__, str(exc)[:120])
         log.info("  batch %d/%d done in %.0fs", i // batch + 1,
                  (len(order) + batch - 1) // batch, time.time() - t0)
+
+
+def release_cluster(client, restore=True):
+    """Undo prepare_cluster()'s sticky state.
+
+    The scrub plugin stays registered on the SCHEDULER until removed, so every
+    worker that starts later -- including workers belonging to somebody else's
+    job -- would come up with its EWC credentials stripped and be unable to
+    reach must-icechunk. Always call this, even on failure.
+    """
+    try:
+        client.unregister_worker_plugin("scrub-aws-env")
+        log.info("unregistered the AWS_* scrub plugin")
+    except Exception as exc:                                    # noqa: BLE001
+        log.warning("could NOT unregister the scrub plugin (%s). Workers "
+                    "starting from now on will have AWS_* stripped -- clear "
+                    "it by hand with "
+                    "client.unregister_worker_plugin('scrub-aws-env')",
+                    type(exc).__name__)
+        return
+    if restore:
+        # The running workers are still scrubbed; only a restart brings the
+        # service environment back.
+        try:
+            n = len(client.scheduler_info()["workers"])
+            client.restart(timeout=300)
+            client.wait_for_workers(n, timeout=300)
+            got = sum(1 for v in client.run(
+                lambda: bool(os.environ.get("AWS_ACCESS_KEY_ID"))).values() if v)
+            log.info("workers restarted with credentials restored: %d/%d",
+                     got, n)
+        except Exception as exc:                                # noqa: BLE001
+            log.warning("restart to restore worker credentials failed (%s); "
+                        "restart the cluster before running anything that "
+                        "writes to must-icechunk", type(exc).__name__)
 
 
 def check_manifest_budget(era: str, chans: dict, n_workers: int, worker_gb: float):
@@ -819,6 +859,14 @@ def cmd_corpus(args):
 def cmd_probe(args):
     from dask.distributed import Client
     client = Client(args.scheduler, timeout=60)
+    try:
+        return _probe(args, client)
+    finally:
+        release_cluster(client, restore=not args.leave_scrubbed)
+        client.close()
+
+
+def _probe(args, client):
     waddrs, _ = prepare_cluster(client, args.restart)
 
     def axis(era):
@@ -869,7 +917,6 @@ def cmd_probe(args):
                       f"ok: {' '.join(good) or '-'}"
                       + (f"   ALL-NaN: {', '.join(bad)}" if bad else ""),
                       flush=True)
-    client.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -885,6 +932,17 @@ def cmd_run(args):
         return 2
 
     client = Client(args.scheduler, timeout=60)
+    try:
+        return _run(args, client, to_icechunk)
+    finally:
+        # Sticky scheduler state: leaving the scrub plugin registered would
+        # strip AWS_* from every worker that starts later, including other
+        # people's jobs. Undo it whatever happened above.
+        release_cluster(client, restore=not args.leave_scrubbed)
+        client.close()
+
+
+def _run(args, client, to_icechunk):
     waddrs, worker_gb = prepare_cluster(client, args.restart)
     user = os.environ.get("JUPYTERHUB_USER", "<user>")
     log.info("dashboard: https://jupyter-ewc-must.e4drr-cloud.work"
@@ -1176,7 +1234,6 @@ def cmd_run(args):
     print(f"sink           s3://{DST_BUCKET}/{args.prefix}")
     print(f"{'='*72}\n")
     log.info("measure the on-disk size with:  size --prefix %s", args.prefix)
-    client.close()
     return 0
 
 
@@ -1232,6 +1289,10 @@ def main(argv=None):
                         help="skip the worker restart. Only safe if the "
                              "workers have never touched icechunk in this "
                              "process -- see the AWS_* note in the docstring")
+        sp.add_argument("--leave-scrubbed", action="store_true",
+                        help="skip the closing restart that restores AWS_* on "
+                             "the workers (the scrub plugin is unregistered "
+                             "either way)")
         sp.add_argument("--batch", type=int, default=3,
                         help="how many manifests to load at once. Firing all "
                              "16 has dropped the scheduler connection")
@@ -1308,9 +1369,11 @@ def main(argv=None):
     args = p.parse_args(argv)
     if getattr(args, "cheap_members", False):
         args.members = MEMBERS_CHEAP
+    # Only the subcommands that actually read a step axis carry --lead-days;
+    # `probe` and `size` have neither and must not be given one.
     if getattr(args, "cgan_steps", False):
         args.steps = STEPS_CGAN_H
-    elif getattr(args, "steps", None) is None:
+    elif getattr(args, "steps", None) is None and hasattr(args, "lead_days"):
         args.steps = steps_for_lead(args.lead_days)
     return {"plan": cmd_plan, "corpus": cmd_corpus, "probe": cmd_probe,
             "run": cmd_run, "size": cmd_size}[args.command](args)

@@ -441,6 +441,80 @@ measured, and the data it can actually produce today is the 51 dates of
 
 ---
 
+## 6a. Credentials: where they are, and the trap in this script
+
+**Verified 2026-07-31.** `test-icechunk-write.py` was re-run end to end and
+**all 8 checks pass**, so the write path this plan depends on is proven, not
+assumed:
+
+```
+[PASS] all workers have S3 credentials -- 6/6
+[PASS] repository open_or_create on Ceph RGW
+[PASS] commit succeeded (conditional writes supported) -- snapshot G3T8TMS7CXHMMEP2
+[PASS] readback has expected variables / shape / t2m mean 288.01 K
+[PASS] work ran on worker VMs, not locally -- 6 workers
+[PASS] stale session rejected (commits serialised) -- ConflictError
+```
+
+The bucket currently holds **1,329 objects / 3.38 GB** under `_probe`,
+`long-test` and `realized-test` — leftovers from those tests, worth clearing
+before a real run so `size` reports only the new store.
+
+### Where the credentials actually are
+
+| location | has `AWS_*` |
+|---|---|
+| the dask **workers** (service environment) | ✅ all 4 vars |
+| your **login shell** | ❌ none |
+| `~/.aws/credentials`, `~/.env`, `/etc/dask/*` | ❌ do not exist |
+
+So the credentials are only ever in the worker service environment. `run` and
+`test-icechunk-write.py` both need them **on the client**, because the client
+is what creates the repo and commits. To get them into a shell:
+
+```bash
+python - <<'PY' > ~/.ewc-creds.env
+import os; from dask.distributed import Client
+c = Client(os.environ["DASK_SCHEDULER_ADDRESS"])
+for k, v in sorted(list(c.run(
+        lambda: {k: v for k, v in os.environ.items()
+                 if k.startswith("AWS_")}).values())[0].items()):
+    print(f"export {k}={v}")
+PY
+chmod 600 ~/.ewc-creds.env && source ~/.ewc-creds.env
+```
+
+### The trap — a defect this script had and now guards against
+
+`prepare_cluster()` registers a `WorkerPlugin` that strips `AWS_*` before the
+worker touches icechunk (§1). **That registration is sticky on the
+scheduler.** It is re-applied to every worker that starts afterwards —
+including workers belonging to unrelated jobs — so after an early version of
+this script ran, `client.restart()` brought the workers back up with **no
+credentials at all**, and nothing could write to `must-icechunk`.
+
+That is exactly what happened here and it took a `client.unregister_worker_plugin`
+to clear. The script now wraps `run` and `probe` in `try/finally` around
+`release_cluster()`, which unregisters the plugin and restarts the workers so
+the service environment comes back. Confirmed:
+
+```
+INFO unregistered the AWS_* scrub plugin
+INFO workers restarted with credentials restored: 6/6
+```
+
+If a run is killed hard enough to skip the `finally` (SIGKILL), clear it by
+hand before anything else uses the cluster:
+
+```python
+client.unregister_worker_plugin("scrub-aws-env"); client.restart()
+```
+
+`--leave-scrubbed` skips only the closing restart; the plugin is unregistered
+either way.
+
+---
+
 ## 7. The full corpus, storing individual members
 
 All three eras, every published 00z date, 7-day lead (53 steps), **all 51
