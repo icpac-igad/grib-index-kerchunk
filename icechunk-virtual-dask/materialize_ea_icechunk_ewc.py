@@ -1309,7 +1309,10 @@ def main(argv=None):
     sp.add_argument("--vars", nargs="*", default=None)
     sp.add_argument("--workers", type=int, default=6)
     sp.add_argument("--threads", type=int, default=4)
-    sp.add_argument("--worker-gb", type=float, default=13.9)
+    sp.add_argument("--worker-gb", type=float, default=13.94,
+                    help="Dask memory_limit per worker, NOT the VM size. The "
+                         "EWC workers are 16.77 GB VMs but dask enforces "
+                         "13.94 GB, spilling at 70%% and killing at 95%%")
     sp.add_argument("--msg-rate", type=float, default=21.6,
                     help="messages/s per task, measured warm (see the plan doc)")
 
@@ -1319,7 +1322,10 @@ def main(argv=None):
     sp.add_argument("--store-members", action="store_true",
                     help="store all 51 members instead of mean+sd")
     sp.add_argument("--workers", type=int, default=6)
-    sp.add_argument("--worker-gb", type=float, default=13.9)
+    sp.add_argument("--worker-gb", type=float, default=13.94,
+                    help="Dask memory_limit per worker, NOT the VM size. The "
+                         "EWC workers are 16.77 GB VMs but dask enforces "
+                         "13.94 GB, spilling at 70%% and killing at 95%%")
     sp.add_argument("--msg-rate", type=float, default=21.6)
 
     sp = sub.add_parser("probe", help="live store: dates, levels, finiteness")

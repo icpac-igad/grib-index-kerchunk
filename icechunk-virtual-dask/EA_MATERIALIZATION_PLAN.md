@@ -7,8 +7,9 @@ Yes. Two things had to be fixed first, and one of them rules out most of the
 intended training window on this cluster.**
 
 _Written 2026-07-31. Every number below was measured on the live EWC cluster
-(6 workers × 4 threads × 13.9 GB) against the live source.coop store, not
-estimated._
+— 6 worker VMs, each 4 vCPU / 16.77 GB RAM with a Dask `memory_limit` of
+13.94 GB — against the live source.coop store, not estimated. Budgets below
+are against `memory_limit`, which is what Dask actually enforces._
 
 Companion script: `materialize_ea_icechunk_ewc.py`
 Variable/extent spec: `../docs/ecmwf_icechunk_dask_variable_extraction.md`
