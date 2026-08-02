@@ -42,20 +42,27 @@ Design constraints, all of which come from the *source* store, not the sink:
     icechunk, which is what scrub_aws_env() + --restart do here. The client
     keeps its AWS_* -- the client is what writes the sink.
 
-  * Resolving ANY chunk of a source array loads that array's ENTIRE icechunk
-    manifest into RAM. refs = dates x members x steps x levels for the WHOLE
-    era, regardless of what you select, and the in-memory cost is ~2000 B/ref
-    (measured -- the ~200 B/ref in the docs is the packed on-disk size). On
-    this cluster's 13.9 GB workers that means AT MOST ONE pressure-level
-    manifest per worker. So one store variable is pinned to one worker for the
-    whole run and the opened era is cached there: the manifest is paid for once
-    (11-215 s) instead of once per date. Use --vars to run in tiers.
+  * MANIFEST RAM IS NOT THE CONSTRAINT -- an earlier version of this file said
+    it was, and was wrong. Listing the store shows 46,154 manifest objects
+    totalling 11.11 GB, largest 1.1 MB, and the repo's own persisted config
+    declares splitting one shard per `time` index. A read pulls a ~0.1-1 MB
+    object, never a per-array index. No era is blocked by memory, and no
+    ManifestSplittingConfig rebuild is needed -- it is already done upstream.
+
+    Variables are still pinned one-per-worker, for a better reason: it keeps
+    the opened era cached and each read task large, which is the shape the
+    21.6 msg/s throughput was measured on.
+
+  * THE CONSTRAINT IS THE NETWORK to s3://ecmwf-forecasts. Measured
+    single-stream throughput from these workers ranged 0.74-14.5 MB/s and
+    later failed outright with connect timeouts. Against ~61 TB of reads that
+    band alone spans 3.5 to 60 days.
 
   * Reads want to be BIG, not many. One task holding all 5 `u` levels measured
     3060 messages in 176 s (21.6 msg/s). The same work split into 5 concurrent
     single-level tasks on the same worker took the cluster down -- 5 decode
-    pipelines on top of a 6.2 GB resident manifest. Hence one task per
-    variable (--levels-per-task 0) and a staggered manifest warm-up.
+    pipelines against a link that was already marginal. Hence one task per
+    variable (--levels-per-task 0) and a staggered warm-up.
 
   * Cropping to East Africa does NOT reduce bytes read: a virtual chunk is one
     whole *global* GRIB message. Only the write side shrinks (~500x). The read
@@ -207,20 +214,29 @@ SPEC = SURFACE_SPEC + PRESSURE_SPEC
 # round-robin to workers the big pressure-level manifests land one per worker.
 PL_VARS = ["u", "v", "w", "r", "t", "gh"]
 
-# Measured in-memory cost of one manifest chunk-ref on this cluster (RSS delta
-# across the first read of an array, divided by that array's ref count), from
-# three arrays spanning 0.22 M to 3.44 M refs:
-#     50r1/t2m  0.22 M refs -> 0.52 GB, 2195 B/ref, manifest load  11 s
-#     50r1/u    3.10 M refs -> 6.25 GB, 2008 B/ref, manifest load 179 s
-#     49r1/t2m  3.44 M refs -> 6.95 GB, 2006 B/ref, manifest load 155 s
-# The ~200 B/ref quoted in the docs is the packed on-disk figure and is ~10x
-# too optimistic for sizing workers.
-BYTES_PER_REF = 2000
-ERA_SHAPE = {                      # (dates, members, steps, levels) per era
-    "0p4":  (401, 51, 85, 9),
-    "49r1": (794, 51, 85, 13),
-    "50r1": (51,  51, 85, 14),     # still growing; `probe` reports the truth
-}
+# ── manifest reality, MEASURED 2026-07-31 by LISTING the store ─────────────
+# An earlier version modelled manifest RAM as
+# `dates x members x steps x levels x 2000 B`, concluded a 49r1 pressure-level
+# manifest needs 89.5 GB, and refused to run on that basis. THAT WAS WRONG.
+# Listing the store's manifest objects:
+#
+#     46,154 objects, 11.11 GB total, largest 1.1 MB, median 0.071 MB
+#
+# and the repo's own PERSISTED config (icechunk.Repository.fetch_config)
+# declares  splitting: [(any_array, [(dimension_name("time"), 1)])]
+#
+# i.e. the store is ALREADY split one manifest shard per date. No per-array
+# manifest is ever loaded, and no ManifestSplittingConfig rebuild is needed.
+MANIFEST_OBJECTS = 46_154
+MANIFEST_TOTAL_GB = 11.11
+MANIFEST_MAX_MB = 1.1
+
+# Mean bytes pulled per GRIB message, from ECMWF's own .index sidecars
+# (`_length` per record) over the 1,500 messages making up our channels.
+# An earlier draft guessed 1.5 MB and overstated ingress ~2x.
+MSG_MB = 0.788                     # 0.25 deg eras
+MSG_MB_0P4 = 0.307                 # 0.4 deg grid, same channels
+MSG_PER_S = 21.6                   # measured warm, per task (~12.5 MB/s)
 
 # EA box size per era -- READ from the store's coordinate arrays, not assumed.
 # 0p4 is a 0.4 deg grid, so the same lat/lon window is a much smaller array.
@@ -250,9 +266,10 @@ CORPUS = [
 
 
 def manifest_gb(era: str, pressure: bool, dates: int | None = None) -> float:
-    d, m, s, lv = ERA_SHAPE[era]
-    d = dates or d
-    return d * m * s * (lv if pressure else 1) * BYTES_PER_REF / 1e9
+    """Per-read manifest cost: one ~1 MB shard, not the old whole-array
+    formula. The store is split one manifest per date."""
+    return MANIFEST_MAX_MB / 1000.0
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ea-ewc")
@@ -645,20 +662,14 @@ def release_cluster(client, restore=True):
 
 
 def check_manifest_budget(era: str, chans: dict, n_workers: int, worker_gb: float):
-    """Refuse a run whose manifests cannot physically fit.
+    """Kept for call-site compatibility; NO LONGER A GATE.
 
-    A worker can hold roughly `worker_gb * 0.7` of manifest before dask starts
-    spilling and then killing it. Each store variable pinned to a worker costs
-    one whole manifest for the era.
+    This used to model manifest RAM from the whole array's chunk-reference
+    count and refuse runs. Listing the store disproved the model: manifests
+    are split one shard per date, largest 1.1 MB. Nothing here blocks a run.
     """
-    cost = {v: manifest_gb(era, pressure=(v in PL_VARS)) for v in chans}
-    budget = worker_gb * 0.7
-    too_big = {v: g for v, g in cost.items() if g > budget}
-    per_worker = defaultdict(float)
-    for i, v in enumerate(sorted(cost, key=lambda k: -cost[k])):
-        per_worker[i % n_workers] += cost[v]
-    worst = max(per_worker.values()) if per_worker else 0.0
-    return cost, too_big, worst, budget
+    cost = {v: MANIFEST_MAX_MB / 1000.0 for v in chans}
+    return cost, {}, max(cost.values(), default=0.0), worker_gb * 0.7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,34 +749,12 @@ def cmd_plan(args):
     print(f"    If the link caps below that, BANDWIDTH sets the time, not the "
           f"task model.")
 
-    print(f"\nSOURCE MANIFEST RAM ({BYTES_PER_REF} B/ref measured -- the "
-          f"constraint that shapes the whole task graph)")
-    d, m, s, lv = ERA_SHAPE[era]
-    for kind, nlev in (("surface (2-D)", 1), (f"pressure ({lv} levels)", lv)):
-        refs = d * m * s * nlev
-        print(f"    {kind:24s} {refs/1e6:7.2f} M refs -> "
-              f"{refs*BYTES_PER_REF/1e9:6.2f} GB in the worker that holds it")
-
-    cost, too_big, worst, budget = check_manifest_budget(
-        era, chans, args.workers, args.worker_gb)
-    print(f"    per-worker budget        {budget:6.2f} GB "
-          f"(70% of {args.worker_gb} GB)")
-    print(f"    {len(chans)} store vars over {args.workers} workers -> worst "
-          f"worker holds {worst:.2f} GB")
-    if too_big:
-        print(f"\n    *** INFEASIBLE on this cluster: "
-              f"{', '.join(f'{v} needs {g:.1f} GB' for v, g in too_big.items())}")
-        print(f"    A single manifest exceeds one worker. No amount of task "
-              f"splitting helps -- \n    the fix is upstream: rebuild the "
-              f"source store with icechunk.ManifestSplittingConfig\n    split "
-              f"along `time`, so a read loads one shard, not the whole array.")
-    elif worst > budget:
-        print(f"\n    *** OVER BUDGET: run in tiers with --vars, e.g.\n"
-              f"        --vars {' '.join(list(chans)[:args.workers])}\n"
-              f"        --vars {' '.join(list(chans)[args.workers:])}")
-    else:
-        print(f"    -> fits: one pass, {len(chans)} vars pinned one-per-worker")
-    print()
+    print(f"\nSOURCE MANIFEST (measured by listing the store, not modelled)")
+    print(f"    {MANIFEST_OBJECTS:,} objects, {MANIFEST_TOTAL_GB:.2f} GB total, "
+          f"largest {MANIFEST_MAX_MB} MB")
+    print(f"    split one shard per `time` index, so a read pulls ~1 MB --")
+    print(f"    never a per-array index. RAM is not the constraint;")
+    print(f"    the network to s3://ecmwf-forecasts is.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -794,13 +783,9 @@ def cmd_corpus(args):
         per_date_b = n_chan * n_step * depth * cells * 4
         write_tb = per_date_b * dates / 1e12
         msgs = dates * n_chan * n_mem * n_step
-        # 0p4 messages are a 451x900 global field, 0.25 deg eras are 721x1440
-        mb_per_msg = 1.5 * (cells / EA_CELLS["49r1"]) ** 0 * (
-            0.39 if era == "0p4" else 1.0)
+        mb_per_msg = MSG_MB_0P4 if era == "0p4" else MSG_MB
         read_tb = msgs * mb_per_msg / 1e6
-        # Critical path per date is the heaviest single task: `u`, 5 levels.
-        rate = args.msg_rate * (2.0 if era == "0p4" else 1.0)   # smaller fields
-        hours = dates * (5 * n_mem * n_step / rate) / 3600
+        hours = read_tb * 1e12 / (args.agg_mb_s * 1e6) / 3600
         print(f"{label:11s} {dates:5d} {n_chan:3d} {cells:7,d} "
               f"{per_date_b/1e9:8.2f} {write_tb:9.3f} {msgs/1e6:8.2f} "
               f"{read_tb:8.2f} {hours:7.1f}")
@@ -821,36 +806,29 @@ def cmd_corpus(args):
     print(f"READ    {tot_msg/1e6:.0f} M GRIB messages, ~{tot_read:.0f} TB "
           f"-- IDENTICAL in both modes. The read is what costs; the ensemble\n"
           f"        reduction only changes what lands on disk.")
-    print(f"TIME    {tot_h:.0f} h = {tot_h/24:.1f} days of continuous cluster "
-          f"at the measured {args.msg_rate} msg/s")
+    print(f"TIME    {tot_h:.0f} h = {tot_h/24:.1f} days at an assumed "
+          f"{args.agg_mb_s:.0f} MB/s aggregate read bandwidth --")
+    print(f"        set by the NETWORK, not by CPU, RAM or dask. See below.")
 
-    print(f"\nOUTPUT-STORE MANIFEST (the materialised store's own cost)")
-    for chunk_desc, per_date_chunks in (
-            ("chunk=(1 date, all steps, all members)", 1),
-            ("chunk=(1 date, 1 step, all members)", n_step)):
-        refs = sum(d * c * per_date_chunks for _, _, d, c in CORPUS)
-        print(f"    {chunk_desc:42s} {refs/1e6:6.2f} M refs -> "
-              f"{refs*BYTES_PER_REF/1e9:5.2f} GB")
-    print(f"    -> past ~1 M refs the OUTPUT store starts to have the same\n"
-          f"       manifest problem as the input. Split it per era (or per\n"
-          f"       year) and write it with icechunk.ManifestSplittingConfig.")
+    print(f"OUTPUT-STORE MANIFEST")
+    refs_flat = sum(d * c * n_step for _, _, d, c in CORPUS)
+    print(f"    one chunk per (date, step) -> {refs_flat/1e6:.2f} M refs total.")
+    print(f"    Create the sink with the SAME splitting the source uses")
+    print(f"    (ManifestSplittingConfig on `time`, size 1) so each shard")
+    print(f"    covers one date. Set it explicitly; do not leave it to chance.\n")
 
-    print(f"\nFEASIBILITY ON THIS CLUSTER ({args.workers} x {args.worker_gb} GB)")
-    budget = args.worker_gb * 0.7
-    done = set()
-    for _, era, _, _ in CORPUS:
-        if era in done:
-            continue
-        done.add(era)
-        sfc, pl = manifest_gb(era, False), manifest_gb(era, True)
-        ok_s = "fits" if sfc <= budget else "INFEASIBLE"
-        ok_p = "fits" if pl <= budget else "INFEASIBLE"
-        print(f"    {era:6s} surface {sfc:6.2f} GB {ok_s:10s} "
-              f"pressure {pl:6.2f} GB {ok_p}")
-    reachable = sum(d for _, e, d, _ in CORPUS
-                    if manifest_gb(e, True) <= budget)
-    print(f"    budget {budget:.2f} GB/worker -> {reachable} of {int(tot_d)} "
-          f"dates ({reachable/tot_d*100:.0f}%) are extractable today.\n")
+    print(f"WHAT ACTUALLY LIMITS THIS")
+    print(f"    NOT worker RAM. Manifests are split one per date "
+          f"({MANIFEST_OBJECTS:,} objects,")
+    print(f"    largest {MANIFEST_MAX_MB} MB). Every era is reachable as far as "
+          f"memory goes.")
+    print(f"\n    The constraint is the EWC<-AWS link. Measured single-stream")
+    print(f"    throughput ranged 0.74-14.5 MB/s across workers and later")
+    print(f"    failed outright:")
+    for agg in (11.8, 75.0, 200.0):
+        d = tot_read * 1e12 / (agg * 1e6) / 86400
+        print(f"      {agg:6.1f} MB/s aggregate -> {d:7.1f} days")
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1315,6 +1293,9 @@ def main(argv=None):
                          "13.94 GB, spilling at 70%% and killing at 95%%")
     sp.add_argument("--msg-rate", type=float, default=21.6,
                     help="messages/s per task, measured warm (see the plan doc)")
+    sp.add_argument("--agg-mb-s", type=float, default=75.0,
+                    help="assumed AGGREGATE EWC<-AWS read bandwidth (MB/s). "
+                         "This now sets the schedule")
 
     sp = sub.add_parser("corpus",
                         help="whole published record, all eras, both modes")
@@ -1327,6 +1308,8 @@ def main(argv=None):
                          "EWC workers are 16.77 GB VMs but dask enforces "
                          "13.94 GB, spilling at 70%% and killing at 95%%")
     sp.add_argument("--msg-rate", type=float, default=21.6)
+    sp.add_argument("--agg-mb-s", type=float, default=75.0,
+                    help="assumed AGGREGATE EWC<-AWS read bandwidth (MB/s)")
 
     sp = sub.add_parser("probe", help="live store: dates, levels, finiteness")
     common(sp)

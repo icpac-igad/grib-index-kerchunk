@@ -3,8 +3,9 @@
 **Can the `test-icechunk-long.py` pattern — Dask cluster, `to_icechunk`, one
 commit per day, appending along `time` — be pointed at a new path and used to
 write the *real* East Africa predictor subset instead of synthetic arrays?
-Yes. Two things had to be fixed first, and one of them rules out most of the
-intended training window on this cluster.**
+Yes. One real blocker had to be cleared (an `AWS_*` environment clash), and
+one blocker I reported earlier turned out not to exist — see §2 for that
+correction. What actually limits the job is the AWS→EWC network.**
 
 _Written 2026-07-31. Every number below was measured on the live EWC cluster
 — 6 worker VMs, each 4 vCPU / 16.77 GB RAM with a Dask `memory_limit` of
@@ -22,15 +23,15 @@ Variable/extent spec: `../docs/ecmwf_icechunk_dask_variable_extraction.md`
 |---|---|
 | Can `test-icechunk-long.py`'s write pattern be reused verbatim? | **Yes.** Per-date `writable_session` → `to_icechunk(append_dim="time")` → `commit` works unchanged. Only the *source* of the arrays changes. §3 |
 | Does it work as-is? | **No — it failed on the first read.** The workers' `AWS_*` environment hijacks the virtual-chunk fetch. §1 |
-| **What does a month cost?** | 30 dates × 7-day lead (53 steps) × 51 members × 30 channels → **9.1 GB written (~5.5 GB compressed), 2.43 M GRIB messages / 1.9–4.9 TB read, 4.6–9.2 h.** §4 |
+| **What does a month cost?** | 30 dates × 7-day lead (53 steps) × 51 members × 30 channels → **9.1 GB written (~5.5 GB compressed), 2.43 M GRIB messages / 1.92 TB read, 2.7–45 h depending entirely on the link.** §4 |
 | Can a month be done? | **Yes on `50r1` — but the store only holds 51 dates (2026-05-13 … 2026-07-02),** so "a month" means a month inside that window. §2.2 |
-| What dominates the cost? | Read, by ~400×. 2.43 M *global* GRIB messages are decoded to write 5.5 GB of East Africa. Cropping saves storage, not time. §4 |
-| Can MAM 2024 / MAM 2025 be done? | **No, not on this cluster.** A single `49r1` pressure-level manifest needs **89.5 GB of worker RAM**. Measured, not inferred. §2 |
-| What is the fix for that? | Upstream: rebuild the source store with `icechunk.ManifestSplittingConfig` split along `time`. §6 |
-| **Full corpus, all 51 members stored?** | 1,246 dates over three eras → **7.37 TB written (~4.4 TB compressed), 91.5 M messages / ~115 TB read, ~182 h ≈ 7.6 days.** §7 |
+| What dominates the cost? | Read, by ~210×. 2.43 M *global* GRIB messages are decoded to write 9.1 GB of East Africa. Cropping saves storage, not time. §4 |
+| Can MAM 2024 / MAM 2025 be done? | **No known memory obstacle.** An earlier version of this doc said a `49r1` pressure-level manifest needs 89.5 GB — **that was wrong**. §2 |
+| What is the real constraint? | **The AWS→EWC network.** 0.74–14.5 MB/s measured, later failing outright. §2.3 |
+| **Full corpus, all 51 members stored?** | 1,246 dates over three eras → **7.37 TB written (~4.4 TB compressed), 91.5 M messages / ~61 TB read, 3.5–60 days depending on the link.** §7 |
 | Does keeping members cost more runtime? | **No.** All 51 are read either way; the reduction only changes what lands on disk. It is a storage decision, not a runtime one. §7 |
-| How much of the corpus is reachable today? | **4 % — 51 of 1,246 dates.** The rest is blocked on manifest RAM, not storage or time. §7.2 |
-| Biggest surprise | Manifest RAM is **~2000 B/ref in memory**, not the ~200 B/ref quoted in the extraction doc. 10× the budget. §2 |
+| How much of the corpus is reachable today? | **All of it, as far as memory goes.** The earlier "4 %" verdict rested on the disproven manifest model. §2 |
+| Biggest surprise | **My own manifest-RAM diagnosis was wrong.** The store is already split one shard per date — 46,154 objects, largest 1.1 MB. §2 |
 
 ---
 
@@ -86,38 +87,75 @@ around.
 
 ---
 
-## 2. The constraint that shapes everything: manifest RAM
+## 2. Manifest RAM — a wrong diagnosis, corrected
 
-Resolving any chunk loads that array's **entire** manifest — refs =
-`era_dates × members × steps × levels`, regardless of how little you select.
-The extraction doc put this at ~200 B/ref. **Measured on a worker, by RSS
-delta across the first read, it is ~2000 B/ref** (that ~200 B is the packed
-on-disk figure):
+**An earlier version of this document claimed the source store's manifests
+were the binding constraint, that a `49r1` pressure-level manifest needed
+89.5 GB of worker RAM, and that 96 % of the archive was therefore
+unreachable. That was wrong.** It is corrected here rather than quietly
+deleted, because the reasoning failure is instructive.
 
-| array | refs | RSS delta | B/ref | manifest load |
-|---|---:|---:|---:|---:|
-| `50r1/t2m` (2-D) | 0.22 M | 0.52 GB | 2195 | 11 s |
-| `0p4/t2m` (2-D) | 1.74 M | 3.61 GB | 2055 | 164 s |
-| `49r1/t2m` (2-D) | 3.44 M | 6.95 GB | 2006 | 155 s |
-| `50r1/u` (14 levels) | 3.10 M | 6.25 GB | 2008 | 179 s |
-| `49r1/u` (13 levels) | 44.75 M | **~89.5 GB** | — | **killed after 40 min** |
+### 2.1 What was measured, and what was wrongly inferred
 
-### 2.1 What fits on this cluster
+The measurement was real: RSS on a worker grew by 0.52–6.95 GB across the
+first read of an array. Dividing by that array's **total** chunk-reference
+count gave a consistent ~2000 B/ref, and I extrapolated that product across
+whole arrays to get 89.5 GB for `49r1/u`.
 
-Worker budget is ~9.7 GB (70 % of 13.9 GB before dask spills, then kills).
+**The extrapolation assumed manifests scale with the whole array. They do
+not.** Listing the store's manifest objects directly:
 
-| era | surface var | pressure var | verdict |
-|---|---:|---:|---|
-| `50r1` | 0.44 GB | **6.19 GB** | ✅ 16 store vars over 6 workers, worst worker 7.07 GB — **one pass** |
-| `0p4` | 3.47 GB | 31.2 GB | ❌ pressure infeasible (and `0p4` has no `w`/`ttr`/`cape` anyway) |
-| `49r1` | 6.88 GB | **89.49 GB** | ❌ **pressure infeasible** — one manifest is 9× a whole worker |
+```
+46,154 manifest objects
+11.11 GB total
+largest  1.1 MB      median 0.071 MB      none above 1.1 MB
+```
 
-`49r1` is not a scheduling problem. No task decomposition helps, because the
-manifest is loaded whole before the first byte of data. Even the *surface*
-vars at 6.88 GB allow only one per worker, so `49r1` surface-only would need
-two passes.
+and the repository's own **persisted** configuration — read with
+`icechunk.Repository.fetch_config()`, not a client default — declares:
 
-### 2.2 What the store actually contains right now
+```
+splitting: [(any_array, [(dimension_name("time"), 1)])]
+```
+
+**The store is already split, one manifest shard per forecast date.** A read
+pulls a ~0.1–1 MB object. There is no per-array manifest anywhere in the
+store to exhaust memory on.
+
+### 2.2 What that changes
+
+| earlier claim | status |
+|---|---|
+| `49r1/u` manifest needs 89.5 GB | ❌ **withdrawn** — largest manifest object in the entire store is 1.1 MB |
+| 96 % of the archive is unreachable | ❌ **withdrawn** — no memory obstacle is known |
+| Workers need 128 GB RAM | ❌ **withdrawn** — 16 GB is not known to be insufficient |
+| Fix: rebuild with `ManifestSplittingConfig` | ❌ **withdrawn** — already done upstream; there is nothing to fix |
+| `49r1/u` read died after 40 min | ⚠️ **re-attributed** — almost certainly the network failure that was already underway, not OOM |
+
+What the 6.25 GB RSS on a first read actually was, I no longer know. It is
+worth re-measuring, but it is not a per-array manifest.
+
+### 2.3 The real constraint: the AWS→EWC link
+
+Plain HTTP range GETs from the six workers to the public bucket — no Dask, no
+Icechunk, no decoding in the path:
+
+| worker | single-stream MB/s |
+|---|---:|
+| 192.168.1.155 | **14.46** |
+| 192.168.1.120 | 10.80 |
+| 192.168.1.105 | 9.42 |
+| 192.168.1.74 | 9.28 |
+| 192.168.1.196 | **0.74** |
+| 192.168.1.20 | **0.74** |
+
+A 20× spread at the same instant. Shortly afterwards every read failed with
+`error fetching virtual reference … HTTP connect timeout after 3.1s`, on all
+three eras and on surface and pressure alike, with worker RSS never exceeding
+0.06 GB — i.e. nothing was loaded. **These are network failures, not memory
+failures.**
+
+### 2.4 What the store actually contains
 
 Read live, not assumed:
 
@@ -127,14 +165,8 @@ Read live, not assumed:
 | `49r1/00z` | 794 | 2024-02-29 … **2026-05-06** | 13 |
 | `50r1/00z` | **51** | 2026-05-13 … **2026-07-02** | 14 |
 
-Two things to note: `50r1` holds **51 dates**, so "at least a month" fits but
-"three months" does not yet; and the store is **~4 weeks behind** today
-(2026-07-31) — it is not being appended daily.
-
-**Consequence for the plan:** the benchmark runs on `50r1`, and the
-`50r1` manifests stay cheap *only while the era is short*. At ~250 dates the
-pressure-level manifest reaches ~30 GB and `50r1` joins `49r1` on the
-infeasible list. This window is temporary.
+`50r1` holds 51 dates, so a month fits but a season does not; and the store is
+~4 weeks behind today, so it is not being appended daily.
 
 ---
 
@@ -155,15 +187,16 @@ The read side is what is new, and it is driven entirely by §2:
   against ~10 msg/s for small reads. Splitting them was tried and is worse —
   §4.2.
 - **Each store variable is pinned to one worker for the whole run** and the
-  opened era is cached there. The manifest is paid once (11–215 s) rather than
-  once per date. Over 30 dates that is the difference between ~5 minutes and
-  ~14 hours of pure manifest loading.
+  opened era is cached there. Originally this was a memory workaround; with
+  the manifest diagnosis withdrawn (§2) it survives for a better reason —
+  it keeps each read task large, which is the shape the 21.6 msg/s throughput
+  was measured on, and avoids re-opening the era per date.
 - **The driver assembles and writes.** Per date the gathered payload is
   ~305 MB, so funnelling it through the client is cheap next to the ~122 GB
   read that produced it, and it keeps the sink credentials off the workers.
-- **A pre-flight budget check refuses to start** a run whose manifests cannot
-  fit, with the `--vars` tiering to use instead. Better than watching workers
-  get killed 20 minutes in.
+- **The pre-flight manifest budget check is no longer a gate.** It was based
+  on the model §2 withdraws, and would have refused runs that are in fact
+  fine. `--vars` remains available for tiering by choice.
 - **Manifests are warmed in batches of 3, not all at once.** Firing all 16
   variables simultaneously means 16 concurrent multi-GB manifest loads; that
   was observed to starve the workers until the scheduler dropped the client
@@ -256,12 +289,15 @@ GRIB messages**.
 | written, after zstd (est.) | ~0.18 GB | ~1.28 GB | **~5.5 GB** | ~9.3 GB |
 | sink chunk-refs | 30 | 210 | 900 | 1,530 |
 | GRIB messages decoded | 81,090 | 567,630 | **2.43 M** | 4.14 M |
-| bytes read @ 0.8–2 MB/msg | 65–162 GB | 0.45–1.1 TB | **1.9–4.9 TB** | 3.3–8.3 TB |
-| **wall clock** | 9–18 min | 1.1–2.1 h | **4.6–9.2 h** | 7.8–15.6 h |
+| bytes read @ 0.788 MB/msg (measured) | 63.9 GB | 0.45 TB | **1.92 TB** | 3.26 TB |
+| **wall clock @ 75 MB/s** | 14 min | 1.7 h | **7.1 h** | 12.1 h |
 
 Note the asymmetry: **~2.4 million global GRIB messages are decoded to write
-5.5 GB.** The read is ~400× the write, because a virtual chunk is one whole
-global field and the EA box is 0.2 % of it. Cropping saves storage, not time.
+9.1 GB.** The read is ~210× the write, because a virtual chunk is one whole
+global field and the EA box is 2.3 % of it. Cropping saves storage, not time.
+
+Wall clock scales inversely with the link: at 200 MB/s a month is 2.7 h, at
+the worst observed 11.8 MB/s it is 45 h. See §6.
 
 ### 4.1 Where the wall clock comes from
 
@@ -415,32 +451,36 @@ store:
 
 ---
 
-## 6. The thing this plan cannot deliver, and what would fix it
+## 6. What actually limits this — corrected
 
-**MAM 2024 and MAM 2025 — the actual training window — are in `49r1`, whose
-pressure-level manifests need 89.5 GB per worker.** This is not a tuning
-problem; nothing in this script or this cluster can work around it.
+**This section previously said `49r1` and `0p4` pressure-level extraction were
+impossible on this cluster because a single manifest needed 89.5 GB and
+31.3 GB respectively, and that the fix was to rebuild the source store with
+`ManifestSplittingConfig`. All of that is withdrawn — see §2.** The store is
+already split one manifest per date, the largest manifest object in it is
+1.1 MB, and there is no memory obstacle to any era.
 
-Three ways forward, in order of leverage:
+What limits the job is the **AWS→EWC network**, and it is not a fixed number:
 
-1. **Rebuild the source store with manifest splitting** (the real fix, already
-   flagged as out-of-scope in the extraction doc §2.6). With
-   `icechunk.ManifestSplittingConfig` split along `time`, a read loads one
-   shard instead of the whole array, and the RAM constraint disappears for
-   every era at once. This also protects `50r1`, which will cross the same
-   threshold at ~250 dates.
-2. **Bigger workers.** `49r1` pressure needs ≥128 GB per worker for one
-   variable — 6 of those to run one pass. Expensive, and it only postpones the
-   problem as the era grows.
-3. **Surface-only from `49r1`,** two passes at 6.88 GB per variable. Gets
-   `tp/pw/sp/msl/t2m/skt/ssr/ttr/tcw/mucape` for MAM 2024–25, but no winds, no
-   `w`, no `r` — i.e. not the set the doc argues for.
+| aggregate read bandwidth | full corpus (61 TB) | one month (1.92 TB) |
+|---|---:|---:|
+| 200 MB/s (16 tasks × best observed) | 3.5 days | 2.7 h |
+| 75 MB/s (6 workers × healthy single stream) | 9.4 days | 7.1 h |
+| 11.8 MB/s (worst observed) | 59.5 days | 45 h |
+| currently | — connect timeouts, nothing completes — | |
 
-Until (1) lands, the honest scope is: **the pipeline is proven, the sizing is
-measured, and the data it can actually produce today is the 51 dates of
-`50r1`.**
+Three things follow, in order of leverage:
 
----
+1. **Establish what the link can actually sustain**, and whether it is stable.
+   Every schedule in this document is a linear function of that one number,
+   and it currently spans 17×. Nothing else is worth deciding first.
+2. **Consider running the extraction in AWS `eu-central-1`** and shipping only
+   the ~4.4 TB result back to EWC, rather than pulling 61 TB across. That
+   inverts the transfer problem — ~14× less data over the constrained link,
+   and the 61 TB read happens in-region where it is fast and free.
+3. **Re-measure the worker RSS behaviour** that produced the 6.25 GB figure
+   in the first place. It is not a per-array manifest, but it is unexplained,
+   and it should be understood before a multi-day run.
 
 ## 6a. Credentials: where they are, and the trap in this script
 
@@ -532,15 +572,15 @@ much smaller array — 102 × 91 = 9,282 cells against 163 × 147 = 23,961.
 | `49r1`-pre | 320 | 29 | 23,961 | 7.51 | 2.404 | 25.08 | 37.63 | 55.6 |
 | `49r1`-post | 474 | 30 | 23,961 | 7.77 | 3.684 | 38.44 | 57.65 | 82.4 |
 | `50r1` | 51 | 30 | 23,961 | 7.77 | 0.396 | 4.14 | 6.20 | 8.9 |
-| **total** | **1,246** | | | | **7.37 TB** | **91.5 M** | **115 TB** | **182 h** |
+| **total** | **1,246** | | | | **7.37 TB** | **91.5 M** | **60.6 TB** | **3.5–60 d** |
 
 - **Storage: 7.37 TB uncompressed, ~4.4 TB after zstd.** Against 289 GB
   (~173 GB compressed) for mean+sd — a **25.5×** difference.
-- **Read: 91.5 M GRIB messages, ~115 TB — identical in both modes.** All 51
+- **Read: 91.5 M GRIB messages, ~60.6 TB — identical in both modes.** All 51
   members must be *read* either way; the reduction only changes what lands on
   disk. So the ensemble decision is a storage decision, not a runtime one.
-- **Time: 182 h ≈ 7.6 days** of continuous cluster at the measured 21.6 msg/s,
-  again the same in both modes.
+- **Time: 3.5–60 days**, set entirely by the AWS→EWC link (§6), and the same
+  in both modes.
 
 ### 7.1 Why the channel counts differ per group
 
@@ -556,18 +596,20 @@ skt sp st t t2m tcwv tp u u10 v v10 vo` — no `w`, no radiation, no CAPE
 family, which is what makes it a different channel set rather than a shorter
 one.
 
-### 7.2 What actually blocks this today
+### 7.2 What blocks this today — corrected
 
-| era | surface manifest | pressure manifest | on a 9.7 GB budget |
-|---|---:|---:|---|
-| `0p4` | 3.48 GB | **31.3 GB** | pressure INFEASIBLE |
-| `49r1` | 6.88 GB | **89.5 GB** | pressure INFEASIBLE |
-| `50r1` | 0.44 GB | 6.19 GB | ✅ fits |
+This subsection previously carried a table showing `0p4` and `49r1`
+pressure-level manifests at 31.3 GB and 89.5 GB against a 9.7 GB budget, and
+concluded **"51 of 1,246 dates — 4 % of the corpus — are extractable"**.
 
-**51 of 1,246 dates — 4 % of the corpus — are extractable on this cluster.**
-The other 96 % are blocked on manifest RAM, not on storage or time. Nothing in
-the extraction code can change that; the fix is `ManifestSplittingConfig` on
-the source store (§6).
+**Withdrawn.** §2 sets out why. The store is split one manifest per date; no
+era is blocked by memory. The corpus is limited by the link (§6), which is a
+schedule question rather than a feasibility one — and, at the time of writing,
+by the link being down altogether.
+
+The one caveat worth keeping: `49r1` and `0p4` pressure-level reads have still
+never been *demonstrated* to work end to end, because every attempt so far
+coincided with the network failing. They should be re-probed once it recovers.
 
 ### 7.3 Two consequences of keeping members that are easy to miss
 

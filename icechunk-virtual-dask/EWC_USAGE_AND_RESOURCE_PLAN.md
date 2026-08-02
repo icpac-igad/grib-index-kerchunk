@@ -22,12 +22,13 @@ Companion material in this directory:
 | Question | Answer |
 |---|---|
 | How much have we processed and stored so far? | **Almost nothing — 3.38 GB stored, all synthetic benchmark data, and ~6 GB read from the real ECMWF source during calibration.** No production data has been materialised. §2 |
-| Why so little? | We were establishing feasibility first. That work turned up a hard blocker (§6) which we would rather report now than after consuming a large allocation. |
+| Why so little? | We were establishing feasibility first, and the link to the data has been unreliable throughout. |
 | What is the production workload? | Read the published virtual ECMWF store (chunks live on AWS), crop to East Africa, keep all 51 ensemble members, write a realized Icechunk store on EWC. §3 |
 | How much will it store? | **~4.4 TB compressed** (7.37 TB uncompressed) for 1,246 forecast dates. §5 |
-| How long will it take? | **~182 h ≈ 7.6 days** of continuous cluster time. §4 |
-| What does it need per worker? | **4 vCPU is enough; RAM is the constraint — 16 GB works only for the newest era, 128 GB is needed for the bulk of the archive.** §6 |
-| What is the unusual cost? | **~115 TB of cross-cloud ingress** from AWS `eu-central-1` into EWC, to write 4.4 TB. A 26× read amplification, and it is unavoidable. §5.3 |
+| How long will it take? | **3.5 to 60 days** — set entirely by the AWS→EWC link, which is the open question. §5.4 |
+| What does it need per worker? | **4 vCPU and 16 GB is not known to be insufficient.** An earlier draft claimed 128 GB was needed for most of the archive; that rested on a manifest model since disproven. §6 |
+| What is the unusual cost? | **~61 TB of cross-cloud ingress** from AWS `eu-central-1` into EWC, to write 4.4 TB — a 14× read amplification, and unavoidable. §5.3 |
+| Biggest risk to the schedule | **The AWS→EWC link.** Measured single-stream throughput varies **0.74 – 14.5 MB/s** and was timing out entirely during testing. That range alone spans **3 days to 5 months**. §5.4 |
 
 ---
 
@@ -61,8 +62,8 @@ benchmark in this investigation:
 | throughput benchmarks (`t2m`, `u`) | ~3,700 | ~5.5 GB |
 | **total** | **~3,800** | **~5.6 GB** |
 
-For scale, the production corpus is **91.5 M messages / ~115 TB** — so we
-have so far read about **0.004 %** of what the full job requires.
+For scale, the production corpus is **91.5 M messages / ~61 TB** — so we have
+so far read about **0.01 %** of what the full job requires.
 
 ### 2.3 What that testing established
 
@@ -75,8 +76,8 @@ viable at all:
 | Anonymous read of the source store from EWC workers | ✅ **measured** — after fixing an `AWS_*` environment clash |
 | All 30 required channels present and finite | ✅ **measured** — finite = 1.00 for every channel in the newest era |
 | Sustained read throughput off AWS | ✅ **measured** — 21.6 messages/s per task |
-| Worker memory required per source array | ✅ **measured** — ~2000 B per chunk reference |
-| Whether the full archive is reachable on the current cluster | ❌ **it is not** — §6 |
+| Worker memory required per source array | ⚠️ **earlier figure withdrawn** — the store is split one manifest per date, largest 1.1 MB — §6 |
+| Whether the full archive is reachable on the current cluster | ⚠️ **no memory obstacle known**; never demonstrated end to end because the link kept failing — §6 |
 
 ---
 
@@ -121,16 +122,16 @@ read-only and public. **Nothing we do writes to it.**
 
 Three properties of this shape matter for resourcing:
 
-1. **One store variable is pinned to one worker for the whole run.** Not a
-   performance choice — a memory one. Resolving any chunk of a source array
-   loads that array's *entire* manifest into RAM (§6), so a worker can hold
-   only a small number of them. Pinning also means each manifest is loaded
-   once per run instead of once per date.
+1. **One store variable is pinned to one worker for the whole run.** It keeps
+   the opened era cached and each read task large — the shape the throughput
+   was measured on. (Originally a memory workaround; §6 explains why that
+   reasoning was withdrawn.)
 
 2. **Cropping to East Africa does not reduce what we read.** A virtual chunk
-   is one whole *global* GRIB message. We download a 721×1440 field and keep
-   163×147 of it — 2.3 % of the bytes. This is inherent to the archive's
-   layout, not a shortcoming of the tool.
+   is one whole *global* GRIB message — 0.788 MB on average, measured from
+   ECMWF's `.index` sidecars. We download a 721×1440 field and keep 163×147 of
+   it, 2.3 % of the bytes. Inherent to the archive's layout, not a shortcoming
+   of the tool.
 
 3. **The write is local.** The sink is in the same data centre as the
    cluster, so the 4.4 TB written costs no egress. All the network cost is on
@@ -161,7 +162,8 @@ Two different "7 days" are involved and they are easy to confuse:
 - **7-day forecast lead** — what we extract *per date*: every published step
   from 0 to 168 h. The store's step axis is 3-hourly to 144 h then 6-hourly,
   so this is **53 steps** (measured off the store's own axis, not assumed).
-- **~7.6 days wall clock** — how long the *job runs*.
+- **~7.6 days wall clock** — how long the *job runs*, **if** the link sustains
+  ~92 MB/s aggregate. It has not been shown to. See §5.4 for the real band.
 
 ### 4.1 The arithmetic chain
 
@@ -214,7 +216,7 @@ path is the single heaviest task — `u`, which carries 5 pressure levels:
 | 49r1-pre | 320 | 55.6 |
 | 49r1-post | 474 | 82.4 |
 | 50r1 | 51 | 8.9 |
-| **total** | **1,246** | **181.7 h = 7.6 days** |
+| **total** | **1,246** | **181.7 h = 7.6 days** *(⇔ ~92 MB/s aggregate)* |
 
 ### 4.2 What could make this wrong
 
@@ -223,15 +225,18 @@ deserves scepticism:
 
 | risk | direction | note |
 |---|---|---|
-| **Network ceiling** | ⬆ could be much slower | 7.6 days for 115 TB implies **~176 MB/s sustained** from AWS into EWC. If the link caps below that, bandwidth sets the time and no tuning helps. **This is the single largest uncertainty.** |
+| **Network ceiling** | ⬆⬆ dominates everything | 60.6 TB at 75 MB/s is 9.4 days; at the worst observed 11.8 MB/s it is 59 days. Measured per-stream throughput was 0.74–14.5 MB/s and later failed outright. **This is not a risk to the estimate, it *is* the estimate.** §5.4 |
 | Cold manifest loads | ⬆ slightly | 11–215 s per (worker, variable), paid once per run. Negligible over 1,246 dates, dominant over 1. |
 | source.coop 5xx responses | ⬆ slightly | sporadic; the tool retries with backoff |
 | Larger workers allow more concurrency | ⬇ faster | the critical path is one task; more RAM per worker would let us split it |
 | Rate measured on a quiet cluster | ⬆ | contention with other tenants not accounted for |
 
-**We would not commit to 7.6 days on this basis alone.** The plan (§7) starts
-with a one-date run that converts the estimate into a measurement before any
-large allocation is requested.
+**We would not commit to 7.6 days on this basis alone — and §5.4 shows why
+not.** The task-rate model above says 7.6 days, but it presumes the per-task
+rate holds under 16-way concurrency. Measured single-stream throughput since
+ranged 0.74–14.5 MB/s and then failed outright, putting the honest band at
+**3.5 to 60 days**. The plan (§7) starts with a one-date run that converts the
+estimate into a measurement before any large allocation is requested.
 
 ---
 
@@ -265,28 +270,21 @@ cost: see §5.3.
 
 ### 5.2 Compute — vCPU and RAM per worker
 
-**vCPU is not the constraint.** The workload is network- and
-decode-bound; 4 vCPU per worker is sufficient and the current cluster's 24
-threads are not saturated. **RAM is the constraint**, and it is set by the
-source store's manifest structure (§6):
+**Neither vCPU nor RAM is the constraint — the network is.** The workload is
+network-bound; 4 vCPU per worker is ample and the current cluster's 24 threads
+are not saturated.
 
-| era | surface array | pressure array | minimum worker RAM |
-|---|---:|---:|---|
-| `50r1` (newest) | 0.44 GB | 6.19 GB | **16 GB** ✅ current cluster works |
-| `0p4` (2023) | 3.48 GB | 31.3 GB | **48 GB** |
-| `49r1` (2024–26) | 6.88 GB | **89.5 GB** | **128 GB** |
-
-Two provisioning scenarios:
+An earlier draft of this section claimed RAM was the binding constraint, with
+a table requiring 128 GB per worker for the `49r1` era. **That is withdrawn**
+— it rested on a manifest model since disproven (§6). The current position:
 
 | | workers | vCPU/worker | RAM/worker | total | vCPU-hours |
 |---|---:|---:|---:|---|---:|
-| **A. As-is (source store unchanged)** | 6 | 4 | **128 GB** | 24 vCPU / 768 GB | ~4,400 |
-| **B. After source-store fix** (§6) | 6–12 | 4 | 16 GB | 24–48 vCPU / 96–192 GB | ~4,400–8,700 |
+| **Current cluster** | 6 | 4 | 16.77 GB | 24 vCPU / ~84 GB usable | ~1,300–21,000 |
 
-Scenario A is expensive in memory for a workload that uses almost none of it
-for actual data — the 128 GB exists solely to hold an index. **Scenario B is
-strongly preferred** and is a change to how the source store was written, not
-to the cluster.
+The vCPU-hour range is wide only because the *duration* is wide (§5.4), not
+because the shape is uncertain. No requirement for larger workers has been
+demonstrated.
 
 ### 5.2.1 The cluster the estimate was actually measured on
 
@@ -319,57 +317,131 @@ This cluster is sufficient for the newest era only — 51 of 1,246 dates.
 
 | | volume |
 |---|---:|
-| **Inbound, AWS `eu-central-1` → EWC** | **~115 TB** |
+| **Inbound, AWS `eu-central-1` → EWC** | **~61 TB** |
 | Outbound from EWC | 0 |
-| Written to EWC object store (same DC) | 4.4 TB |
-| **Read amplification** | **~26×** |
+| Written to EWC object store (same DC) | 4.4 TB compressed (7.37 TB raw) |
+| **Read amplification** | **8× vs raw, 14× vs compressed** |
 
-We download ~115 TB to keep ~4.4 TB. This is not inefficiency in our code — it
+The 61 TB is now **measured, not assumed**. ECMWF publishes a `.index`
+sidecar next to every GRIB file listing `_offset` and `_length` for each
+message; averaged over the 1,500 messages that make up the channels we
+extract, the true size is **0.788 MB per message** (0.307 MB for the coarser
+0p4 grid). An earlier draft of this plan assumed 1.5 MB and therefore
+overstated the ingress as 115 TB.
+
+| group | messages | MB/message | read TB |
+|---|---:|---:|---:|
+| `0p4` | 23.85 M | 0.307 | 7.33 |
+| `49r1`-pre | 25.08 M | 0.788 | 19.77 |
+| `49r1`-post | 38.44 M | 0.788 | 30.29 |
+| `50r1` | 4.14 M | 0.788 | 3.26 |
+| **total** | **91.50 M** | | **60.64** |
+
+We download ~61 TB to keep ~4.4 TB. This is not inefficiency in our code — it
 is that the archive's atom is a whole global GRIB message and our region is
 2.3 % of the globe. There is no server-side subsetting available on the
 public archive.
 
 Two things follow: `ecmwf-forecasts` is in the AWS Open Data programme so
 there is **no egress charge on the AWS side**, but the sustained inbound rate
-(~176 MB/s for 7.6 days) is worth confirming against the EWC link budget
-before we start.
+(**~93 MB/s to finish in 7.6 days**) is the crux of the whole schedule — and
+is well above what we have measured. See §5.4.
 
-**Note this is identical whether we store 51 members or the mean+sd pair.**
+### 5.4 The link is the schedule — and it is not currently healthy
+
+This is the most important measurement in this document, and the least
+comfortable. Plain HTTP range GETs from the six workers to the public bucket
+on AWS `eu-central-1`, no Dask, no Icechunk, no decoding in the path:
+
+| worker | single-stream MB/s |
+|---|---:|
+| 192.168.1.105 | 9.42 |
+| 192.168.1.120 | 10.80 |
+| 192.168.1.155 | **14.46** |
+| 192.168.1.196 | **0.74** |
+| 192.168.1.20 | **0.74** |
+| 192.168.1.74 | 9.28 |
+
+A **20× spread across workers at the same moment**, and during the same
+session the Icechunk read path failed outright with
+`HTTP connect timeout occurred after 3.1s`.
+
+What that does to the schedule, against the measured 60.6 TB:
+
+| per-stream | × 16 concurrent | corpus wall clock |
+|---|---:|---:|
+| 14.5 MB/s (best observed) | 232 MB/s | **3.0 days** |
+| 12.5 MB/s (implied by the Icechunk benchmark) | 200 MB/s | **3.5 days** |
+| 0.74 MB/s (worst observed) | 11.8 MB/s | **59 days** |
+
+**The honest range is 3 days to 2 months, and the network alone decides
+which.** The 7.6-day figure in §4 assumes the healthy end and per-task rates
+that hold under concurrency — an assumption we have not yet been able to test,
+because the link degraded while we were trying to test it.
+
+This is the single thing worth resolving before any allocation is committed,
+and it is a question about the EWC↔AWS path rather than about our code.
+
+**Note the network cost is identical whether we store 51 members or the mean+sd pair.**
 All 51 members must be *read* either way; the reduction only changes what
 lands on disk. The ensemble decision is a storage decision, not a
 network or runtime one.
 
 ---
 
-## 6. The blocker, and why we are reporting it now
+## 6. A blocker we reported, and then disproved
 
-Resolving **any** chunk of a source array loads that array's **entire**
-manifest into RAM — the reference count is
-`era_dates × members × steps × levels` for the whole era, regardless of how
-little is selected. Measured by RSS delta on a worker:
+An earlier version of this document stated that resolving any chunk loads that
+array's entire manifest, that a `49r1` pressure-level manifest therefore needs
+**89.5 GB** of worker RAM, that **96 % of the archive was unreachable**, and
+that the fix was to rebuild the source store with `ManifestSplittingConfig`.
 
-| array | references | RAM | bytes/ref | load time |
-|---|---:|---:|---:|---:|
-| `50r1/t2m` | 0.22 M | 0.52 GB | 2195 | 11 s |
-| `0p4/t2m` | 1.74 M | 3.61 GB | 2055 | 164 s |
-| `49r1/t2m` | 3.44 M | 6.95 GB | 2006 | 155 s |
-| `50r1/u` (14 levels) | 3.10 M | 6.25 GB | 2008 | 179 s |
-| **`49r1/u` (13 levels)** | **44.75 M** | **~89.5 GB** | — | **worker killed** |
+**All of that is withdrawn.** It is recorded rather than deleted because we
+had already raised it, and because the reasoning failure is worth being
+explicit about.
 
-On 13.9 GB workers that makes **51 of 1,246 dates — 4 % of the archive —
-extractable today.** The other 96 % fails before reading a single byte of
-data. No amount of task splitting or scheduling helps, because the manifest
-loads whole.
+### What was measured, and what was wrongly inferred
 
-**The fix is upstream and cheap:** rewrite the source store with
-`icechunk.ManifestSplittingConfig` split along `time`, so a read loads one
-shard rather than the whole array index. That removes the constraint for every
-era at once and drops the worker requirement from 128 GB to ~16 GB.
+The measurement was real — worker RSS grew 0.52–6.95 GB across the first read
+of an array — but the inference was not. Dividing by the array's *total*
+chunk-reference count gave ~2000 B/ref, and that product was extrapolated
+across whole arrays.
 
-It is also *time-sensitive in the other direction*: `50r1` is only cheap
-because it is currently short (51 dates). At ~250 dates its pressure-level
-manifest reaches ~30 GB and it joins the infeasible list. **The window in
-which any of this works on modest workers is closing.**
+**Listing the store's manifest objects disproves the extrapolation:**
+
+```
+46,154 manifest objects
+11.11 GB total
+largest 1.1 MB     median 0.071 MB     none above 1.1 MB
+```
+
+and the repository's own **persisted** configuration, read with
+`icechunk.Repository.fetch_config()`, already declares
+
+```
+splitting: [(any_array, [(dimension_name("time"), 1)])]
+```
+
+**The store is already split one manifest shard per forecast date.** No
+per-array manifest exists to exhaust memory on, no era is blocked by RAM, and
+the `ManifestSplittingConfig` work we were about to ask for **is already done
+upstream**.
+
+The `49r1/u` read that "died after 40 minutes" is now re-attributed to the
+network failure that was already in progress, not to memory.
+
+### What we still do not know
+
+- **What the 6.25 GB RSS on a first read actually was.** Not a per-array
+  manifest, but unexplained, and worth understanding before a multi-day run.
+- **Whether `49r1` and `0p4` pressure-level reads work end to end.** Never
+  demonstrated — every attempt coincided with the link failing.
+
+### What replaces it as the constraint
+
+The AWS→EWC link (§5.4). That is a schedule question rather than a feasibility
+one, but at the time of writing it is also an availability question: reads are
+failing outright.
 
 ---
 
@@ -378,30 +450,36 @@ which any of this works on modest workers is closing.**
 We would rather convert estimates into measurements before requesting a large
 allocation. Each phase is a decision point.
 
-| phase | scope | storage | ingress | wall clock | cluster |
+| phase | scope | storage | ingress | wall clock @75 MB/s | cluster |
 |---|---|---:|---:|---:|---|
-| **0. Calibrate** | 1 date, all channels | 8 GB | 122 GB | ~15 min | current |
-| **1. Prove** | `50r1`, 51 dates | 396 GB | 6.2 TB | ~9 h | current (6 × 4 vCPU × 14 GB) |
-| — *decision* — | fix the source store (§6) before going further | | | | |
-| **2. Recent** | `49r1`-post, 474 dates | 3.68 TB | 57.7 TB | ~82 h | 6 × 4 vCPU × 16 GB *(post-fix)* |
-| **3. Backfill** | `49r1`-pre, 320 dates | 2.40 TB | 37.6 TB | ~56 h | as phase 2 |
-| **4. Archive** | `0p4`, 401 dates | 0.89 TB | 14.0 TB | ~35 h | as phase 2 |
-| | **total** | **7.37 TB** *(≈4.4 TB compressed)* | **115 TB** | **182 h** | |
+| **0. Calibrate** | 1 date, all channels | 7.8 GB | 63.9 GB | ~14 min | current |
+| **1. Prove** | `50r1`, 51 dates | 396 GB | 3.26 TB | ~12 h | current |
+| — *decision* — | is the link stable enough to commit to phases 2–4? | | | | |
+| **2. Recent** | `49r1`-post, 474 dates | 3.68 TB | 30.3 TB | ~112 h | current |
+| **3. Backfill** | `49r1`-pre, 320 dates | 2.40 TB | 19.8 TB | ~73 h | current |
+| **4. Archive** | `0p4`, 401 dates | 0.89 TB | 7.3 TB | ~27 h | current |
+| | **total** | **7.37 TB** *(≈4.4 TB compressed)* | **60.6 TB** | **~225 h** | |
+
+Wall clock scales inversely with the link, so every figure in that column is
+÷2.7 at 200 MB/s and ×6.4 at the worst observed 11.8 MB/s. The cluster column
+now reads "current" throughout — no larger workers are required (§6).
 
 **Phase 0 is the one that matters for planning.** It converts the two soft
-numbers — read throughput and compression ratio — into measured ones, at a
-cost of one date. Everything after it can be re-forecast from real data.
+numbers — sustained read throughput and compression ratio — into measured
+ones, at a cost of one date. Everything after it can be re-forecast from real
+data. It cannot be run until the link recovers.
 
 ### What we would ask for
 
-1. **Confirmation of the sustained inbound rate** EWC can carry from AWS
-   `eu-central-1` — ~176 MB/s for several days. This is the largest
-   uncertainty in the estimate.
+1. **Confirmation of what the EWC↔AWS path can sustain, and why it is
+   currently failing.** We measured 0.74–14.5 MB/s per stream across workers
+   at the same instant, then connect timeouts on every read. This is the whole
+   schedule: the corpus is 3.5 days at 200 MB/s and 60 days at 11.8 MB/s.
 2. **~4.5 TB of object storage** in `must-icechunk` (or a decision to store
    mean+sd instead, at 289 GB).
-3. **Either** 128 GB workers, **or** — much preferably — support for
-   rewriting the source store with manifest splitting, after which 16 GB
-   workers suffice.
+3. **No larger workers are needed** on current evidence — 6 × 4 vCPU × 16 GB
+   stands. (The earlier request for 128 GB workers, and for a source-store
+   manifest rebuild, are both withdrawn — §6.)
 4. Agreement on phasing, so the allocation follows the measurements rather
    than the estimates.
 
@@ -411,13 +489,14 @@ cost of one date. Everything after it can be re-forecast from real data.
 
 - **Used so far: 3.38 GB stored (all synthetic), ~6 GB read.** No production
   data yet. We were proving feasibility.
-- **Planned: ~4.4 TB stored, ~115 TB read, ~7.6 days** for 1,246 forecast
-  dates × 7-day lead × 51 members over East Africa.
-- **Workers: 4 vCPU is plenty; RAM decides everything.** 16 GB after a
-  source-store fix, 128 GB without it.
-- **The 7.6 days rests on one solid measurement** (21.6 messages/s at
-  production task shape) **and one open question** (whether the AWS→EWC link
-  sustains ~176 MB/s). One calibration date settles it.
-- **96 % of the archive is currently unreachable** on this cluster for reasons
-  that have nothing to do with storage or time, and everything to do with how
-  the source store's index is laid out.
+- **Planned: ~4.4 TB stored (7.37 TB raw), ~60.6 TB read, 3.5–60 days** for
+  1,246 forecast dates × 7-day lead × 51 members over East Africa. The
+  duration is a linear function of the link and nothing else.
+- **Workers: 6 × 4 vCPU × 16 GB, unchanged.** Neither CPU nor RAM has been
+  shown to be a limit; an earlier claim that 128 GB was needed is withdrawn.
+- **The schedule is a linear function of one unknown** — what the AWS→EWC
+  link sustains. Measured 0.74–14.5 MB/s per stream, currently failing. That
+  spans 3.5 to 60 days for the corpus.
+- **An earlier "96 % unreachable" finding is withdrawn** (§6). The store is
+  already manifest-split; no era is blocked by memory. What blocks progress
+  today is simply that the link to the data keeps failing.
