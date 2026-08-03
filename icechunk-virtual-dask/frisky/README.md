@@ -54,6 +54,40 @@ one message in, ~0.1 MB out, ~5 MB held per reduction — not the scheduler.
 
 ---
 
+## Against icechunk's own limitation (`81affcd`, `ICECHUNK_DASK_GUIDANCE.md`)
+
+The documented hard limit is a **write** limit:
+
+> "it's not possible to use the existing `Dask.Array.to_zarr` or
+> `Xarray.Dataset.to_zarr` functions with either the Dask multiprocessing or
+> distributed schedulers. (It is fine with the multithreaded scheduler.)"
+
+`81affcd` reads the *shape* of that limitation correctly: **one session per
+process** is the assumption the library is built around, and the untested thing
+in our read path was "open the store client-side and let Dask pickle it into
+six worker processes."
+
+This DAG never does that. `_open_era()` runs **inside the worker process** and
+caches at module level; the session is never an argument to a task and never
+crosses a process boundary. One session per process, which is the supported
+shape — reached by construction rather than by care.
+
+Two related rules, and where this differs from `test_single_date.py`:
+
+| rule | `test_single_date.py` | here |
+|---|---|---|
+| never `chunks={}` before `.sel()` | ✅ opens lazily-indexed, selects, then `.chunk()` | ✅ opens lazily-indexed and **never calls `.chunk()`** — there is no dask array at any point, so `.sel().values` is a direct single-chunk icechunk read |
+| level before `.sel()` | ✅ `.isel(isobaricInhPa=0)` first | ✅ `.sel(isobaricInhPa=level)` first |
+| one session per process | ⚠️ distributed mode pickles a client-side store | ✅ opened on the worker |
+
+**On writes, the limitation still binds and is not yet addressed here.** When
+the sink write is added it must use `icechunk.xarray.to_icechunk` (which
+handles the fork), not `to_zarr` on a `zarr.open_array`, and the sink chunking
+must keep dividing the dask chunks. `--out` currently writes `.npz`, so nothing
+here is on that path yet.
+
+---
+
 ## Environment
 
 Deliberately **not** `/opt/mamba/envs/dask`. That env is version-pinned to all
@@ -103,9 +137,37 @@ frisky observe overview                       # diagnostics
 
 ## Status
 
+Measured 2026-08-03 on the JupyterHub VM (8 GiB cgroup).
+
 | | |
 |---|---|
 | `frisky demo`, 6,295 tasks | ✅ 15.7 s |
 | DAG shape, synthetic, 30 channels / 9,390 tasks | ✅ 33.0 s, 6 workers |
-| Real read through Frisky | ⬜ **not yet run** — the next step |
+| **Real read of `u700`**, 4 members × 2 steps | ✅ 29.0 s — dominated by 4 cold store opens |
+| **Real read of `u700 u850 u500`**, 16 members × 4 steps | ✅ **192 messages, 19.4 s, 6 workers** |
 | Write to `must-icechunk` | ⬜ not implemented; `--out` writes `.npz` only |
+
+The `u` runs are the point: `u` is the array that **never finishes graph
+construction** under `chunks={}`, and still costs 3.76 M tasks select-first.
+Read as futures it is 207 tasks and 19.4 s.
+
+```
+tasks:   31/s   waiting=2 processing=8 finished=197
+cluster: workers=6  memory=878.2 MiB / 8.0 GiB (11%)
+sched:   busy=0.1%
+```
+
+- **9.9 messages/s** aggregate including cold opens; **31 tasks/s** warm on 6
+  single-threaded workers, i.e. ~0.19 s/message — consistent with the
+  0.23–0.25 s single-machine figure in `NEXT_SESSION.md` §2.
+- **878 MiB peak across all six workers** (~146 MB each), against
+  `test_single_date.py`'s 1,329 MB for `u` under the threaded scheduler.
+  Bounded by the task shape, not by a memory manager.
+- Scheduler **0.1% busy**. Submission of the whole graph took 0.01 s.
+- **No 503s** on this run; the backoff was never exercised, so it remains
+  untested against a real `SlowDown`.
+- The first run's 29 s for 8 messages is the store-open cost: ~5 s per worker
+  process, paid once per process, not per task.
+
+Extrapolating 31 tasks/s to the full 82,710-task date gives ~45 min on 6
+workers, ~11 min on 24. Not yet measured at that scale.

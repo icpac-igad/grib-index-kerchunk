@@ -154,15 +154,19 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
     import numpy as _np
 
     ds = _open_era(era)
-    da = ds[var].sel(
+    da = ds[var]
+    # Level FIRST, while this is still lazily-indexed xarray -- DAG_METHOD.md
+    # §5. There is no dask graph here to blow up, but the composed lazy index
+    # is narrower for it and the rule costs nothing to follow.
+    if level is not None:
+        da = da.sel(isobaricInhPa=level)
+    da = da.sel(
         time=_np.datetime64(date),
         number=member,
         step=_np.timedelta64(step_h, "h"),
         latitude=slice(LAT_MAX, LAT_MIN),
         longitude=slice(LON_MIN, LON_MAX),
     )
-    if level is not None:
-        da = da.sel(isobaricInhPa=level)
 
     # §4.4 -- icechunk surfaces AWS throttling as `unhandled error (SlowDown)`
     # and does not retry.  One 503 anywhere otherwise fails the whole read.
@@ -225,6 +229,18 @@ def build_and_submit(client, date, channels, members, steps, era, synthetic):
     return out
 
 
+def select_channels(args):
+    """--vars by name, else the first --channels of the table."""
+    if not getattr(args, "vars", None):
+        return CHANNELS[:args.channels]
+    by_name = {name: c for c in CHANNELS for name in (c[2],)}
+    missing = [v for v in args.vars if v not in by_name]
+    if missing:
+        raise SystemExit(f"unknown channel(s) {missing}.  "
+                         f"known: {', '.join(c[2] for c in CHANNELS)}")
+    return [by_name[v] for v in args.vars]
+
+
 def count_only(args):
     """DAG size, answered by arithmetic, before anything is opened.
 
@@ -257,7 +273,7 @@ def count_only(args):
     expands to 3.76 M tasks, just somewhere else.  So: `graph_size.py` stays
     the right tool for measuring a dask graph.  Frisky lets you not build one.
     """
-    channels = CHANNELS[:args.channels]
+    channels = select_channels(args)
     n_c, n_m, n_s = len(channels), args.members, min(args.steps, len(STEPS_ALL_H))
     leaves = n_c * n_m * n_s
     reductions = n_c * n_s
@@ -306,7 +322,7 @@ def run(args):
     """
     import frisky
 
-    channels = CHANNELS[:args.channels]
+    channels = select_channels(args)
     members = list(range(args.members))
     steps = STEPS_ALL_H[:args.steps]
     n_leaf = len(channels) * len(members) * len(steps)
@@ -381,6 +397,9 @@ def main():
     p.add_argument("--era", default="50r1", choices=["0p4", "49r1", "50r1"])
     p.add_argument("--channels", type=int, default=1,
                    help="how many of the 30 channels (start at 1 -- §4.5)")
+    p.add_argument("--vars", nargs="+", default=None,
+                   help="pick channels by out_name (u925 v850 ...) instead of "
+                        "taking the first --channels")
     p.add_argument("--members", type=int, default=4, help="0..N-1")
     p.add_argument("--steps", type=int, default=2, help="first N step hours")
     p.add_argument("--workers", type=int, default=4)
