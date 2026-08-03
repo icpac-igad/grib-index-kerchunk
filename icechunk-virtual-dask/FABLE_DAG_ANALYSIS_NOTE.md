@@ -82,6 +82,42 @@ rescheduled? Look at `workers=[...]` pinning and `allow_other_workers`.
 
 ## 4. Anti-patterns to flag, highest severity first
 
+### A0. `chunks={}` on a huge array, selection applied afterwards — **hang, in the client**
+
+**This was the actual bug in this codebase. Check for it first.**
+
+```python
+ds = xr.open_zarr(store, chunks={})       # WHOLE array becomes dask
+da = ds["u"].sel(time=..., number=[...], step=[...])   # graph already built
+```
+
+`chunks={}` makes the entire array a dask array, so the graph is constructed
+over **every chunk in the store** before the selection narrows it. Measured
+here, for a read of two chunks:
+
+```
+t2m    221,085 store chunks ->   665,966 graph tasks   1.4 s
+u    3,097,290 store chunks -> ~9,300,000 graph tasks   never finishes
+```
+
+Signature: process appears frozen, **dashboard shows nothing at all** (no tasks
+submitted), no traceback, and a watchdog thread cannot report because graph
+building holds the GIL.
+
+To size it: `prod(array.shape[:-2]) / prod(chunk_shape[:-2])` ≈ number of store
+chunks; graph tasks are a small multiple of that. **Anything over ~10^6 is a
+hang.** Multiply by 14 for a pressure-level variable (`isobaricInhPa`).
+
+Correct form — select while still lazy xarray, chunk afterwards:
+
+```python
+da = ds[name]                            # opened WITHOUT chunks
+if "isobaricInhPa" in da.dims:
+    da = da.isel(isobaricInhPa=0)        # level first
+da = da.sel(**sel)                       # metadata only
+da = da.chunk({"number": 1, "step": 1})  # dask over the SUBSET
+```
+
 ### A. `.compute()` / `.result()` inside a worker task — **hang**
 
 ```python
@@ -205,7 +241,10 @@ client killed) > **FAIL** (task errors, recoverable) > **SLOW** (works, wasteful
 
 ## 6. Calibration — what a correct answer looks like
 
-For `test_single_date.py`:
+For `test_single_date.py` **as committed at `e77f2aa` or later** (it now opens
+without `chunks={}` and chunks after selection, so A0 is *absent* — if you
+report A0 against the current file you have misread it; A0 applies to the
+version before that commit, and to any other script still using `chunks={}`):
 
 - **Lazy path** (`--eager` absent): `build_graph` returns xarray objects built
   from a `chunks={}` dataset; `client.compute([...], sync=True)` submits them
@@ -236,5 +275,9 @@ wrong — re-do Step 1.
   worker depending on how `ds` was built" is a useful finding.
 - Prior wrong turns to avoid re-deriving: manifest RAM is *not* the constraint
   (store is split, largest manifest 1.1 MB); AWS 503 is *intermittent and not
-  our request rate*; the link is fine when healthy (0.23 s per global message).
-  See `NEXT_SESSION.md` §8.
+  our request rate*; the link is fine when healthy (0.23 s per global message);
+  and the worker-OOM/nanny-kill chain is real but was a *consequence* of the
+  eager pattern, not the cause of the hangs. The cause was A0. See
+  `BLOCKERS.md` §0.
+- **A0 outranks everything else.** If a script uses `chunks={}` on one of these
+  arrays, report that and stop — the other findings are downstream of it.

@@ -10,6 +10,58 @@ published ECMWF IFS ensemble Icechunk store on source.coop.
 
 ---
 
+## `e77f2aa` — root cause found: a 9-million-task graph, built client-side
+
+`xr.open_zarr(..., chunks={})` turns the whole array into a dask array, so the
+graph is constructed over every chunk in the store BEFORE any selection.
+Measured, for a read of TWO chunks:
+
+    t2m    221,085 store chunks ->   665,966 graph tasks   built in 1.4 s
+    u    3,097,290 store chunks -> ~9,300,000 graph tasks   never finishes
+
+The hang is in the CLIENT, during graph construction, before anything is
+submitted. Every symptom follows: the dashboard shows nothing because nothing
+was submitted; the process freezes with no traceback because graph building
+holds the GIL; surface variables work and pressure-level ones hang because 14
+levels is 14x the chunks; more variables is worse because each builds its own
+graph; and distributed vs threaded made no difference because the problem is
+upstream of the scheduler.
+
+Isolated by controlled comparison -- one variable, two chunks, identical shape.
+t2m passes in seconds at 637 MB; u produces no output in 420 s. The only
+difference is the isobaricInhPa dimension.
+
+Fix: select while still lazily-indexed xarray, chunk afterwards over the
+subset. u now passes in seconds at 1329 MB.
+
+Revises the reference tests too: test_dask_read{,_ewc}.py use chunks={} and
+pass, but they read t2m -- surface, 665k tasks, slow but survivable. They would
+hit the same wall on any pressure-level variable. "One variable works, thirty
+do not" was the wrong frame throughout; it was always 2-D works, 3-D does not.
+
+### Docs corrected in this pass
+
+  * BLOCKERS.md      -- new section 0 with the root cause; the memory section
+                        demoted from primary blocker to a consequence of the
+                        eager pattern (real, but 1.3 GB not 7 GB once fixed)
+  * NEXT_SESSION.md  -- header rewritten; the OOM/nanny mechanism marked
+                        superseded; 4.1 (restart the scheduler) still stands
+  * FABLE note       -- new anti-pattern A0, ranked above everything else, with
+                        how to size a graph and a calibration warning that A0
+                        is ABSENT from the current test_single_date.py
+  * README.md        -- status line
+
+### Still open
+
+  * the scheduler holds ~236 orphaned tasks from the failed runs; needs
+    `sudo systemctl restart dask-scheduler`, which cannot be done from the
+    client
+  * no realization run attempted since the fix -- 0 bytes materialized
+  * AWS 503 remains an intermittent, separate nuisance; icechunk does not
+    retry it
+
+---
+
 ## Unreleased — the throttle is not our request rate; correction
 
 **Status: in the working tree.**

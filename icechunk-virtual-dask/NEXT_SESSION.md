@@ -1,9 +1,13 @@
 # Next session: getting the virtual store realized, without Dask fighting us
 
-**Read this first. It says what is proven to work, what hangs, and the order to
-attack it in. The short version: single-machine reads work reliably and fast;
-every failure we have is on the Dask path; and the workload does not actually
-need most of what Dask provides.**
+**ROOT CAUSE FOUND AND FIXED (`e77f2aa`).** `xr.open_zarr(..., chunks={})`
+built the task graph over every chunk in the store before any selection —
+665,966 tasks for `t2m`, ~9.3 M for `u`, never finishing. The hang was in the
+**client**, during graph construction, before anything reached the scheduler.
+Fix: select first, `.chunk()` after. `BLOCKERS.md` §0.
+
+Much of the ordering below was written before that was known. §4.1 (restart the
+scheduler) still stands. §4.2–4.5 are now secondary.
 
 _Written 2026-08-03. Companion to `BLOCKERS.md` (evidence) and `CHANGELOG.md`
 (how the diagnosis evolved, including two of my own wrong turns)._
@@ -18,8 +22,8 @@ _Written 2026-08-03. Companion to `BLOCKERS.md` (evidence) and `CHANGELOG.md`
 | Writing a realized Icechunk store to EWC S3 | ✅ works — `test-icechunk-write.py` 8/8 |
 | EWC credentials, client and workers | ✅ 6/6, `.env` verified |
 | AWS 503 SlowDown | ⚠️ **intermittent nuisance** — 0/6 one minute, 4/4 at 0.23 s the next |
-| **Anything through the Dask cluster** | ❌ **hangs** |
-| Realized data actually produced | **0 bytes** |
+| Reading a pressure-level variable through dask | ✅ **fixed** — was ~9.3 M graph tasks, now passes in seconds at 1.3 GB |
+| Realized data actually produced | **0 bytes** — the fix landed after the last write attempt |
 
 **Nothing has been materialized yet.** Every attempt has died on the Dask path.
 
@@ -73,7 +77,12 @@ between checks, meaning they died and were restarted mid-run.
 — it does not park tasks in `processing` with no worker running them. I spent
 a long time attributing this to AWS and was wrong; see `CHANGELOG.md`.
 
-### The mechanism, as best established
+### The mechanism — SUPERSEDED, see `BLOCKERS.md` §0
+
+The chain below is a real description of what the *eager* pattern does to
+workers, and it is why the cluster is full of wreckage. But it is **not** why
+runs hung: they hung in the client before submitting anything. Kept for the
+record.
 
 1. A task allocates several GB that **Dask cannot see** — `managed` reports
    0.00 GB against 33 GB resident (`BLOCKERS.md` §5), because the memory lives

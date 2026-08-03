@@ -4,11 +4,16 @@ Materialising an East Africa subset of the published **ECMWF IFS ensemble
 virtual Icechunk store** into a **realized Icechunk store** on the ECMWF
 European Weather Cloud (EWC) object store, using the EWC Dask cluster.
 
-> **Status: not working end to end yet.** Single-machine reads are reliable and
-> fast; everything routed through the Dask cluster hangs. Start with
-> [`NEXT_SESSION.md`](NEXT_SESSION.md) — it says what is proven, what is
-> broken, and the order to attack it. [`BLOCKERS.md`](BLOCKERS.md) has the
-> evidence.
+> **Status: the hang is fixed; no data materialized yet.**
+> The blocker was `xr.open_zarr(..., chunks={})` building a task graph over
+> every chunk in the store before any selection — 665,966 tasks for `t2m`,
+> ~9.3 M for `u`, never finishing, **in the client**. Fix: select first,
+> `.chunk()` after (`e77f2aa`). See [`BLOCKERS.md`](BLOCKERS.md) §0.
+>
+> Still outstanding: the scheduler holds ~236 orphaned tasks from the failed
+> runs and needs `sudo systemctl restart dask-scheduler`; and no realization
+> run has been attempted since the fix. [`NEXT_SESSION.md`](NEXT_SESSION.md)
+> has the order to work in.
 
 ---
 

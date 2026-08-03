@@ -1,12 +1,80 @@
 # Blockers: why the ECMWF → EWC realization does not scale
 
-**The cross-cloud read works. It just does not work more than one request at a
-time, and the job needs roughly a hundred thousand times that.**
+**RESOLVED 2026-08-03 — the primary blocker was ours, and it was not what most
+of this document originally said. `xr.open_zarr(..., chunks={})` built a task
+graph over every chunk in the store before any selection was applied: 665,966
+tasks for `t2m`, ~9.3 million for `u`. Graph construction never finished, in
+the CLIENT, before anything was submitted. See §0.**
+
+The sections below are kept because the measurements in them are real, but
+read §0 first — several conclusions here were drawn while the actual cause was
+invisible.
 
 _Written 2026-08-03, against the live EWC Dask cluster (Bonn, non-AWS — 6
 worker VMs, 4 vCPU / 16.77 GB each, Dask `memory_limit` 13.94 GB) reading the
 published ECMWF IFS ensemble Icechunk store whose virtual chunks live on AWS
 `s3://ecmwf-forecasts` in `eu-central-1`._
+
+---
+
+## 0. The actual root cause
+
+`xr.open_zarr(..., chunks={})` turns the **whole array** into a dask array. The
+graph is therefore constructed over every chunk in the store **before** `.sel()`
+is applied. Measured, for a read of **two** chunks:
+
+| variable | store chunks | graph tasks | outcome |
+|---|---:|---:|---|
+| `t2m` (surface, 5-D) | 221,085 | **665,966** | built in 1.4 s — slow but survivable |
+| `u` (pressure-level, 6-D) | 3,097,290 | **~9,300,000** | **never finishes** |
+
+**The hang happens in the client, during graph construction, before anything is
+submitted to the scheduler.**
+
+### It explains every symptom in this document
+
+| symptom | explanation |
+|---|---|
+| Dashboard shows no movement | nothing was ever submitted |
+| Whole process freezes, no traceback | graph building is Python holding the GIL — a watchdog thread with `join(timeout)` could not even report |
+| Surface variables work, pressure-level hang | 14 levels = 14× the chunks. `realize_smoke_test.py` died at channel 11, `u925` — the first pressure-level channel |
+| More variables is worse | each builds its own graph |
+| Distributed and threaded schedulers fail identically | the problem is upstream of the scheduler |
+| `processing: 7, waiting: 140, executing: 0` | orphaned wreckage from earlier runs, not the current one |
+
+### Isolated by controlled comparison
+
+One variable, two chunks, identical shape:
+
+```
+t2m  (surface)          PASS  in seconds,  637 MB
+u    (pressure-level)   no output in 420 s
+```
+
+The only difference is the `isobaricInhPa` dimension.
+
+### The fix
+
+Select while it is still lazily-indexed xarray; convert to dask afterwards,
+over the subset only:
+
+```python
+da = ds[name]
+if "isobaricInhPa" in da.dims:
+    da = da.isel(isobaricInhPa=0)        # level FIRST, costs nothing
+da = da.sel(**sel)                       # metadata op, still no dask
+da = da.chunk({"number": 1, "step": 1})  # dask over the SUBSET only
+```
+
+`u` now passes in seconds at 1329 MB. Committed in `e77f2aa`.
+
+### This also revises the reference tests
+
+`grib-index-kerchunk/ecmwf/icechunk-par/test_dask_read{,_ewc}.py` use
+`chunks={}` and pass — but they read `t2m`, a **surface** variable, at 665k
+tasks: slow but survivable. **They would hit the same wall on any
+pressure-level variable.** So "one variable works, thirty do not" was the wrong
+frame throughout. It was always **2-D works, 3-D does not**.
 
 ---
 
@@ -19,7 +87,8 @@ published ECMWF IFS ensemble Icechunk store whose virtual chunks live on AWS
 | Writing a realized Icechunk store to EWC S3 | ✅ works, 8/8 correctness checks |
 | EWC object-store credentials | ✅ work from client and all 6 workers |
 | **Reading anything at all, right now** | ❌ **AWS returns 503 SlowDown to a SINGLE request** — not rate-related |
-| **Reading many fields sequentially on a worker** | ❌ **~7 GB RSS per array, never released** |
+| **Graph construction with `chunks={}`** | ❌ **THE ROOT CAUSE — see §0. Fixed.** |
+| Reading many fields sequentially on a worker | ⚠️ ~7 GB RSS per array — real, but a consequence of the eager pattern, not the hang |
 | **Dask seeing that memory** | ❌ **`managed` reports 0.00 GB of 33.6 GB — it schedules blind** |
 | **Running the whole thing on the notebook instead** | ❌ **8 GiB cgroup cap, SIGKILL** |
 | Net result of the last full attempt | **1 of 30 channels in ~9 minutes** |
@@ -137,9 +206,15 @@ is possible, the schedule estimates are unfounded in both directions.
 
 ---
 
-## 5. Blocker 2 — worker memory accumulates per source array and is never released
+## 5. Secondary — worker memory accumulates per source array
 
-This is the more damaging one, because it caps concurrency *before* AWS does.
+**Demoted.** This was written as the primary blocker. It is a real,
+reproducible measurement, but it is a consequence of the **eager**
+`.compute()`-inside-a-task pattern, not the cause of the hang — see §0. With
+the lazy select-then-chunk fix, the same read peaks at **1.3 GB**, not 7 GB.
+
+It still matters for anything that reuses the eager pattern, so the evidence is
+kept below.
 
 Measured RSS on a worker after reading **one channel**, 2 members × 2 steps
 (4 GRIB messages, ~3 MB of useful data):
