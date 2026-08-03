@@ -28,7 +28,7 @@ Companion material in this directory:
 | How long will it take? | **3.5 to 60 days** — set entirely by the AWS→EWC link, which is the open question. §5.4 |
 | What does it need per worker? | **4 vCPU and 16 GB is not known to be insufficient.** An earlier draft claimed 128 GB was needed for most of the archive; that rested on a manifest model since disproven. §6 |
 | What is the unusual cost? | **~61 TB of cross-cloud ingress** from AWS `eu-central-1` into EWC, to write 4.4 TB — a 14× read amplification, and unavoidable. §5.3 |
-| Biggest risk to the schedule | **The AWS→EWC link.** Measured single-stream throughput varies **0.74 – 14.5 MB/s** and was timing out entirely during testing. That range alone spans **3 days to 5 months**. §5.4 |
+| Biggest risk to the schedule | **AWS is returning 503 SlowDown to a single request from a clean process.** Not our request rate — most likely the tenancy's shared egress address. Every rate figure below was measured while throttled and is unreliable. `BLOCKERS.md` §4 |
 
 ---
 

@@ -10,6 +10,66 @@ published ECMWF IFS ensemble Icechunk store on source.coop.
 
 ---
 
+## Unreleased — the throttle is not our request rate; correction
+
+**Status: in the working tree.**
+
+### Correction
+
+The previous entry, and BLOCKERS.md, said the AWS 503 SlowDown was
+**self-inflicted** by our own hammering and would decay once we backed off.
+**Wrong.**
+
+A fresh Python process on the Jupyter host — no Dask, no icechunk, not a
+worker — issuing ONE 1 MB range GET, three times, 3 s apart:
+
+    jupyter client #1        HTTP 503  SlowDown
+    jupyter client #2        HTTP 503  SlowDown
+    jupyter client #3        HTTP 503  SlowDown
+
+and via the known-good lazy Dask pattern, 8 chunks total, also 503. One
+request cannot be a request-rate problem, and we had already backed off
+substantially.
+
+What fits instead: the throttle is on the **egress IP**, very likely a shared
+NAT address for the EWC tenancy, so our requests compete with everything else
+leaving that address. It is intermittent, not absolute — the notebook read
+fine earlier the same day, and two of six workers got 5.0/5.2 MB/s minutes
+before the single-request test failed.
+
+That makes it an EWC<->AWS infrastructure question, not a tuning exercise. The
+concrete ask: does the tenancy share an egress address, and is AWS S3
+rate-limiting it?
+
+Consequence: every throughput number in these documents was measured while
+throttled and is a floor on a rate-limited requester, not link capacity. The
+schedule estimates are unfounded in both directions until a clean measurement
+is possible.
+
+### Added: test_single_date.py
+
+Built on the read pattern that already passes in
+grib-index-kerchunk/ecmwf/icechunk-par/{test_dask_read,test_dask_read_ewc}.py,
+which our extraction had diverged from:
+
+    working:  xr.open_zarr(..., chunks={}) then client.compute(mean/std)
+              -> one dask task per GRIB message, tree reduction, chunks
+                 released as folded in; those tests assert peak RSS < 2 GB
+
+    ours:     da.sel(all members, all steps).compute() inside one task
+              -> holds members x steps x lat x lon plus decode buffers live,
+                 and issues the whole burst from a single task
+
+Runs a single date on either the EWC or a local cluster, ramps the variable
+count (--ramp), and has --eager to reproduce the bad pattern for A/B. Early
+signal, on a run that failed to 503 so not conclusive: peak worker RSS 205 MB
+with the lazy pattern against ~7 GB with the eager one.
+
+Also fixes a bug the run exposed in that script: it printed ALL CHECKS PASSED
+when every attempt had errored, because no checks ran at all.
+
+---
+
 ## Unreleased — blockers documented; three operational scripts added
 
 **Status: in the working tree.**

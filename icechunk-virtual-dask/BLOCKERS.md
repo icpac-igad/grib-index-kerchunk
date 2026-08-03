@@ -18,7 +18,7 @@ published ECMWF IFS ensemble Icechunk store whose virtual chunks live on AWS
 | Reading a single field cross-cloud | ✅ works, 3.5–6 s per global message |
 | Writing a realized Icechunk store to EWC S3 | ✅ works, 8/8 correctness checks |
 | EWC object-store credentials | ✅ work from client and all 6 workers |
-| **Reading many fields concurrently** | ❌ **AWS returns 503 SlowDown** |
+| **Reading anything at all, right now** | ❌ **AWS returns 503 SlowDown to a SINGLE request** — not rate-related |
 | **Reading many fields sequentially on a worker** | ❌ **~7 GB RSS per array, never released** |
 | **Dask seeing that memory** | ❌ **`managed` reports 0.00 GB of 33.6 GB — it schedules blind** |
 | **Running the whole thing on the notebook instead** | ❌ **8 GiB cgroup cap, SIGKILL** |
@@ -65,9 +65,7 @@ concurrency is exactly what breaks. Everything below is about that.
 
 ---
 
-## 4. Blocker 1 — AWS returns 503 SlowDown, and icechunk does not retry it
-
-Under concurrent access the bucket throttles the requester:
+## 4. Blocker 1 — AWS returns 503 SlowDown, and it is not our request rate
 
 ```
 |-> error fetching virtual reference
@@ -76,33 +74,66 @@ Under concurrent access the bucket throttles the requester:
 `-> Error { code: "SlowDown", message: "Please reduce your request rate." }
 ```
 
-Two separate problems in that one message:
+### The measurement that settles the cause
 
-**(a) We get throttled.** Confirmed directly with a plain HTTP range GET,
-no Dask and no icechunk in the path:
+An earlier version of this document said the throttle was **self-inflicted**,
+caused by our own hammering during investigation, and would decay if we backed
+off. **That attribution was wrong.**
+
+A fresh Python process on the Jupyter host — no Dask, no icechunk, not a
+worker — issuing **one** 1 MB range GET, three times, 3 s apart:
 
 ```
-HTTP 503  SlowDown  "Please reduce your request rate."
-Server: AmazonS3   x-amz-request-id: 17HTG4E1HV5N6A0X
+jupyter client #1        HTTP 503  SlowDown
+jupyter client #2        HTTP 503  SlowDown
+jupyter client #3        HTTP 503  SlowDown
 ```
 
-It is **per-requester, not per-key**: spreading across 48 distinct
-`(date, step)` objects after a 60 s cooloff still produced **151 throttles and
-23 hard failures** across 6 workers.
+And via the working lazy Dask pattern on a LocalCluster, **8 chunks total**:
 
-**(b) icechunk surfaces it as `unhandled`** — no internal backoff, no retry.
-A single 503 anywhere in a read fails the whole read.
+```
+vars  chunks    wall  chunk/s   peakRSS alive  finite  status
+   1       8   31.7s      0.3      205M     3     -    IcechunkError (SlowDown)
+```
 
-**Mitigation, implemented and working.** `realize_smoke_test.py` now retries
-with exponential backoff plus jitter around the fetch. The one channel that
-succeeded in the last run shows `503s 1` — it hit a throttle, backed off, and
-completed. So the retry is correct; there simply was not enough headroom to
-carry 30 channels while this throttled.
+**One request cannot be a request-rate problem.** We had also backed off
+substantially by this point, and it had not decayed.
 
-**Caveat on our own measurements.** We hammered this bucket hard during
-investigation. The earlier "0.74–14.5 MB/s, link is the constraint" figures in
-`EWC_USAGE_AND_RESOURCE_PLAN.md` §5.4 were **measured while throttled** and
-should be treated as a floor on a penalised requester, not as link capacity.
+### What actually fits the evidence
+
+The throttle is applied to the **egress IP**, which on EWC is very likely a
+shared NAT address for the tenancy. Our requests compete with everything else
+leaving that address, and AWS rate-limits the address, not our process.
+
+It is **intermittent, not absolute**, which is exactly what a contended shared
+egress looks like:
+
+- the notebook read global fields fine earlier the same day (§2)
+- two of six workers got 5.0 and 5.2 MB/s minutes before the single-request
+  test failed
+- the other four got 503 at the same instant
+
+**This is an EWC ↔ AWS infrastructure question, not something to engineer
+around.** The concrete thing to ask the EWC team: *does the tenancy share an
+egress IP to the internet, and is that address being rate-limited by AWS S3?*
+
+### icechunk makes it worse than it needs to be
+
+icechunk surfaces 503 as `unhandled error (SlowDown)` — no internal backoff,
+no retry. A single 503 anywhere in a read fails the entire read.
+
+Retry with exponential backoff and jitter (implemented in
+`realize_smoke_test.py`) does help when the throttle is partial — the one
+channel that completed shows `503s 1`. But retrying cannot fix a
+requester-level block, and retrying harder is precisely the wrong response.
+
+### Consequence for every throughput number in these documents
+
+**All of our rate measurements were taken while throttled.** The
+"0.74–14.5 MB/s" figures, and everything derived from them in
+`EWC_USAGE_AND_RESOURCE_PLAN.md` §5.4, are a floor on a rate-limited requester
+and say nothing reliable about what the link can do. Until a clean measurement
+is possible, the schedule estimates are unfounded in both directions.
 
 ---
 
@@ -249,8 +280,11 @@ Stated plainly, because these gate any commitment:
    returning freed pages. A first cheap test: `MALLOC_TRIM_THRESHOLD_`/
    `malloc_trim`, and reading two different arrays in one process to see
    whether the cost is per-array or one-off.
-2. **What request rate AWS will tolerate** from a non-penalised requester in
-   this region. All our rate measurements were taken while throttled.
+2. **Why the egress address is being throttled**, whether it is shared across
+   the EWC tenancy, and what rate it would tolerate if it were not. All our
+   rate measurements were taken while throttled, so none of them are
+   trustworthy. This is a question for the EWC operators, not a tuning
+   exercise.
 3. **Whether `49r1` and `0p4` pressure-level reads work end to end.** Never
    demonstrated — every attempt coincided with throttling or a worker death.
 4. **The compression ratio of the realized store.** Still the assumed 40 %;
@@ -267,6 +301,8 @@ Three scripts, all in this directory:
 | `cluster_status.py` | what state are the workers in *right now* — rss vs managed, headroom, credentials, what is executing | ~2 s, no side effects |
 | `fix_worker_credentials.py` | `check` / `restore` / `restart` — repairs workers left stripped or holding leaked memory | seconds; `restart` kills running work |
 | `realize_smoke_test.py` | end-to-end: published store → EA subset → realized Icechunk store on EWC | minutes; `--dask` to use workers, `--max-workers` to throttle |
+| `test_single_date.py` | single date, ramps the variable count, on the EWC **or** a local cluster. Built on the read pattern that already passes in `grib-index-kerchunk`. `--eager` reproduces the bad pattern for comparison | seconds to minutes |
+| `stop_work.py` | `status` / `cancel` / `restart` — stop work and reclaim worker memory. `client.restart()` is unreliable here | seconds |
 
 `../../test-icechunk-long.py` is a **workload** test, not a status check — it
 writes 2 GB of synthetic data and exercises worker-to-worker shuffle. Useful
@@ -300,6 +336,13 @@ with `nthreads=1`**. Dask cannot see this memory, so the only safe
 over-subscription factor is 1, and 4 threads per worker simply gives it four
 ways to kill itself.
 
-**Immediate, regardless of route:** stop reading from `ecmwf-forecasts` for
-several hours to let the throttle decay, and restart the workers to reclaim
-the 34.8 GB they are holding idle.
+**D. Ask EWC about the egress address.** Since a single request from a clean
+process is refused, backing off does not help and no amount of client-side
+tuning will. If the tenancy shares a NAT address that AWS is rate-limiting,
+the fix is operational — a different egress path, or a request to AWS — and it
+gates options A and B alike.
+
+**Immediate:** restart the workers to reclaim leaked memory
+(`stop_work.py restart` — measured 33.3 GB → 0.52 GB). Do **not** plan around
+"waiting for the throttle to decay"; that was based on the withdrawn
+self-inflicted theory and is not supported by the single-request test.
