@@ -101,9 +101,24 @@ def cmd_cancel(client, args):
     print(f"\ncancelling {st['n_tasks']} task(s) on the scheduler ...")
 
     def _cancel(dask_scheduler=None):
-        keys = list(dask_scheduler.tasks)
-        dask_scheduler.client_releases_keys(keys=keys, client="stop_work")
-        return len(keys)
+        # Keys must be released on behalf of the client that OWNS them.
+        # Releasing as a synthetic client leaves tasks belonging to zombie
+        # clients (processes long gone, still registered) untouched -- which
+        # is exactly how 234 stale tasks survived a worker restart and made
+        # the cluster look hung.
+        s = dask_scheduler
+        n = 0
+        for cid in list(s.clients):
+            keys = [ts.key for ts in s.clients[cid].wants_what]
+            if keys:
+                s.client_releases_keys(keys=keys, client=cid)
+                n += len(keys)
+        # anything still orphaned, release under our own name
+        rest = list(s.tasks)
+        if rest:
+            s.client_releases_keys(keys=rest, client="stop_work")
+            n += len(rest)
+        return n
 
     try:
         n = client.run_on_scheduler(_cancel)
