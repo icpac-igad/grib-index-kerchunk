@@ -10,6 +10,84 @@ published ECMWF IFS ensemble Icechunk store on source.coop.
 
 ---
 
+## Unreleased — blockers documented; three operational scripts added
+
+**Status: in the working tree.**
+
+### The finding that ties the failures together
+
+`managed` memory reads **0.00 GB on every worker against 33.6 GB resident**,
+on an idle cluster. Dask's `managed_bytes` only counts the Python heap; this
+workload allocates inside the Rust icechunk/object-store layer and the
+gribberish decoder, which Dask cannot see.
+
+So Dask looks at a worker holding 7.4 GB, sees "0 bytes, idle", assigns 4
+concurrent tasks (`nthreads=4`), each adds ~7 GB it cannot see, the worker
+passes `memory_limit`, the nanny kills it, and the client gets
+`scheduler-connection-lost`. Spill-at-70%/pause-at-80% never fire.
+
+Not a Dask bug and not misconfiguration — Dask's memory model has no
+visibility into this workload, so it schedules on wrong information.
+Concurrency has to be capped externally; `nthreads=4` is actively harmful
+here.
+
+### Blockers, in the order you hit them
+
+```
+notebook, 1 field at a time        ->  WORKS      3.5-6 s per message
+client, 30 channels sequential     ->  SIGKILL    channel 11, 8 GiB cgroup cap
+6 workers, 30 channels concurrent  ->  OOM        ~7 GB x 4 threads > 13.94 GB
+6 workers, 1 channel each (waves)  ->  503        AWS SlowDown, icechunk
+                                                  reports it as "unhandled"
+2 workers, waves, with backoff     ->  1/30       throttled, and workers were
+                                                  already holding 7 GB
+```
+
+The cross-cloud link is **not** the blocker: the notebook reads global fields
+from AWS in 3.5-6 s with correct values. Everything sequential works;
+everything concurrent fails. But the notebook's 2.33 msg/s means June 2026
+alone would take 12.1 days and the corpus 454 days, so concurrency is not
+optional.
+
+Also: our earlier "0.74-14.5 MB/s, the link is the constraint" figures were
+measured **while throttled by our own hammering** and are a floor on a
+penalised requester, not link capacity.
+
+### Scripts added
+
+| script | answers | cost |
+|---|---|---|
+| `cluster_status.py` | worker state now — rss vs managed, headroom, credentials, what is executing | ~2 s, no side effects |
+| `fix_worker_credentials.py` | `check`/`restore`/`restart` — repairs workers left stripped or holding leaked memory | seconds |
+| `realize_smoke_test.py` | end-to-end published store -> EA subset -> realized store on EWC | minutes |
+
+Written because the same questions were being answered with throwaway inline
+snippets, which caused real misreadings: a credential count taken mid-task,
+and workers that had silently restarted noticed only via changed port numbers.
+
+`test-icechunk-long.py` is a *workload* test, not a status check — 2 GB of
+synthetic data and a worker-to-worker shuffle. Useful for proving the EWC half
+works (it never touches AWS) but it cannot report worker state.
+
+### Two self-inflicted bugs fixed along the way
+
+* `read_channel_on_worker` popped `AWS_*` and never restored it, silently
+  stripping the workers' Ceph credentials for every other job. Now scrubbed
+  for the duration of the task and restored in a `finally`.
+* A first attempt at that fix restored the environment right after
+  `open_source()` — but the virtual-chunk client is not built until
+  `compute()`, so every read then failed with "error fetching virtual
+  reference". The scrub has to span the whole task.
+
+### Recommendation
+
+Run the extraction inside AWS `eu-central-1` and ship ~4.4 TB back, rather
+than pulling 60.6 TB out. It addresses the throttling and the memory ceiling
+at once. Cheapest next experiment either way: diagnose the ~7 GB per-array
+RSS, which does not need the AWS link healthy.
+
+---
+
 ## Unreleased — the manifest diagnosis was wrong, and is withdrawn
 
 **Status: in the working tree, not yet committed.**
