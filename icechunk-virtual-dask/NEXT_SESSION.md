@@ -282,6 +282,20 @@ every time.
 
 ---
 
+## 6a. The method, generalised
+
+[`DAG_METHOD.md`](DAG_METHOD.md) writes up the order to attack this on any
+Icechunk store: measure the graph with `graph_size.py` before running anything,
+then climb the ladder — single machine, threaded scheduler, ramp the variables,
+process per shard, distributed last. Each rung has a pass condition, so a
+failure localises the layer instead of implicating the whole stack.
+
+It also records what is still unsolved: the select-first pattern avoids the
+hang but still builds a 3.76 M-task graph for `u`, because the graph size
+tracks the store rather than the request.
+
+---
+
 ## 7. Tooling in this directory
 
 | script | use |
@@ -291,6 +305,7 @@ every time.
 | `stop_work.py` | `status` / `cancel` / `restart` / `kill` |
 | `fix_worker_credentials.py` | `check` / `restore` / `restart` |
 | `test_single_date.py` | single date, `--ramp` variable count, `--eager` to A/B the bad pattern |
+| `graph_size.py` | how many dask tasks a read builds. Run this FIRST |
 | `where_does_it_fail.py` | client vs worker, egress IPs, raw HTTP vs icechunk |
 | `realize_smoke_test.py` | end-to-end realization. **Uses the eager pattern — fix or replace before reusing** |
 | `materialize_ea_icechunk_ewc.py` | the full extraction tool. `plan` / `corpus` are useful now; `run` inherits the eager pattern |

@@ -162,6 +162,14 @@ $P quick-run.py
 
 Expect the three eras to list, and a `t2m` field to decode in ~0.2–2 s.
 
+**1b. How big a graph does your read build?** Also no cluster. Do this before
+submitting anything — a graph over ~1 M tasks hangs the *client*, which looks
+exactly like a cluster failure and is not one.
+
+```bash
+$P graph_size.py --vars t2m u
+```
+
 **2. What state is the cluster in?**
 
 ```bash
@@ -204,6 +212,7 @@ $P materialize_ea_icechunk_ewc.py corpus --store-members
 | `stop_work.py` | `status` / `cancel` / `restart` / `kill` | yes | no |
 | `fix_worker_credentials.py` | `check` / `restore` / `restart` for stripped workers | yes | no |
 | `test_single_date.py` | one date, `--ramp` variable count, `--eager` to A/B the bad pattern | either | no |
+| `graph_size.py` | **how many dask tasks does this read build?** Measure this BEFORE running anything | no | no |
 | `where_does_it_fail.py` | client vs worker, egress IPs, raw HTTP vs icechunk | yes | no |
 | `realize_smoke_test.py` | end-to-end realization to `must-icechunk` | optional `--dask` | **yes** |
 | `materialize_ea_icechunk_ewc.py` | full extraction tool: `plan` `corpus` `probe` `run` `size` | `run`/`probe` | `run` only |
@@ -219,6 +228,7 @@ $P materialize_ea_icechunk_ewc.py corpus --store-members
 | file | contents |
 |---|---|
 | **`NEXT_SESSION.md`** | **start here.** What works, what hangs, the order to attack it, and two design options |
+| **`DAG_METHOD.md`** | **the method.** Given a store and a cluster, the order to make a read work — measure the graph first, then climb the ladder |
 | `BLOCKERS.md` | evidence: the 503s, the unmanaged memory, the 8 GiB client cap, where it fails in sequence |
 | `EA_MATERIALIZATION_PLAN.md` | extraction design: channels, extent, steps, members, output layout |
 | `EWC_USAGE_AND_RESOURCE_PLAN.md` | what has actually been used on EWC, and the resource ask |
