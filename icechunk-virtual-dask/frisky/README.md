@@ -137,7 +137,55 @@ frisky observe overview                       # diagnostics
 
 ## Status
 
-Measured 2026-08-03 on the JupyterHub VM (8 GiB cgroup).
+### One full date, six EWC VMs — 2026-08-03
+
+```
+30 channels x 51 members x 53 steps, date 2026-07-02, era 50r1
+  81,090 leaves + 1,590 reductions + 30 stacks = 82,710 tasks
+  submitted in 2.02 s
+  682.4 s  (11 min 22 s)   118.8 messages/s   22.7 s per channel
+  30/30 channels, every one finite 1.000
+  erred 0   spilled 0 B
+```
+
+Peak memory, per `frisky observe workers`:
+
+```
+Address              Memory              Managed   Unacct
+192.168.1.74:34511   374.64 MiB / 10 GiB   0 B     374.64 MiB
+...                  ~372 MiB each         0 B     ~372 MiB
+TOTAL                  2.17 GiB / 60 GiB   0 B       2.17 GiB
+```
+
+**`Managed 0 B` against 2.17 GiB resident is the `BLOCKERS.md` §5 blindness,
+reproduced exactly under Frisky.** Frisky cannot see icechunk's Rust
+allocations any better than Dask can. It did not matter: the task shape caps
+each worker at ~372 MiB — of which ~332 MiB is the pinned per-process store
+session — so there was nothing for a memory manager to get wrong. That is the
+argument of this whole directory in one table.
+
+`--nthreads 4` was the right call. 24 concurrent readers, 4% of the memory
+budget, no spilling, no worker deaths.
+
+Output: `out/2026-07-02.npz`, **235.3 MB** against 304.8 MB of raw float32
+(30 channels x 2 arrays x 53 x 163 x 147 x 4 B) — **77.2%**. `NEXT_SESSION.md`
+§6.7 carried an assumed 40%; the measured figure is much worse than that.
+**Caveat: this is `numpy.savez_compressed` (zlib), not the icechunk/zarr codec
+path**, so treat it as indicative of the payload's compressibility, not as the
+store's ratio. The real number needs the sink write.
+
+Two things this run did **not** establish:
+
+- **Whether any 503s occurred.** `erred 0` only means no task failed
+  permanently. The backoff in `read_message` retries silently, so a throttled
+  read that succeeded on retry leaves no trace anywhere. That is an
+  instrumentation gap, not a clean bill of health — the retry should count and
+  report.
+- **AWS ingress volume.** The ~64 GB figure is derived from `MSG_MB = 0.788`
+  in `materialize_ea_icechunk_ewc.py`, not measured here. Frisky's byte
+  counters cover task output and worker-to-worker transfer, not the S3 fetch.
+
+### Earlier, local, on the JupyterHub VM (8 GiB cgroup)
 
 | | |
 |---|---|
