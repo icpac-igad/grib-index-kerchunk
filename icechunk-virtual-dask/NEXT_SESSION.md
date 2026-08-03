@@ -154,6 +154,27 @@ problem precisely.
 
 ---
 
+## 4.6 Read `ICECHUNK_DASK_GUIDANCE.md` — the library documents this
+
+Icechunk's own Dask guide states, verbatim:
+
+> "it's not possible to use the existing `Dask.Array.to_zarr` or
+> `Xarray.Dataset.to_zarr` functions with either the Dask **multiprocessing or
+> distributed** schedulers. **(It is fine with the multithreaded scheduler.)**"
+
+That is about writes, and our writes are already within spec (`to_icechunk`).
+But it tells us where the sharp edges are: one session per process, and the
+distributed scheduler is the case they had to build `fork`/`merge` machinery
+for. Distributed *reads* are not documented at all.
+
+**The cheapest untried experiment follows directly from it:** run the whole
+single-date read in ONE process with Dask's threaded scheduler. No pickling, no
+scheduler, no nannies — and it keeps the parallelism. See
+`ICECHUNK_DASK_GUIDANCE.md` §3.1. Run it on a worker VM, not the 8 GiB
+JupyterHub session.
+
+---
+
 ## 5. On your question: design the DAG from the single-machine test?
 
 **Yes — and go further: consider not using Dask for the read at all.**
