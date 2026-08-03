@@ -45,6 +45,11 @@ Usage
     # ramp the variable count -- the actual hypothesis under test
     $P test_single_date.py --ramp --members 4 --steps 2
 
+    # THREADED scheduler, in this process -- no pickling, no scheduler, no
+    # nannies. Icechunk's docs say the multithreaded scheduler is the one that
+    # works; this is the cheapest way to test that claim.
+    $P test_single_date.py --cluster threads --threads 8 --ramp
+
     # local cluster instead (bounded by the 8 GiB jupyter cgroup, so small)
     $P test_single_date.py --cluster local --vars t2m --members 4 --steps 2
 
@@ -101,10 +106,24 @@ def open_store():
                                                max_arrays_to_scan=0))
     repo = icechunk.Repository.open(storage, config=cfg,
                                     authorize_virtual_chunk_access=auth)
-    # chunks={} is the whole point: lazy dask arrays, one task per GRIB
-    # message, so dask controls concurrency and releases chunks as it reduces.
+    # NOTE: deliberately NOT chunks={}.
+    #
+    # chunks={} turns the WHOLE array into a dask array, so the graph is built
+    # over every chunk in the store *before* any selection is applied:
+    #
+    #     t2m  221,085 store chunks ->   665,966 graph tasks  (1.4 s)
+    #     u  3,097,290 store chunks -> ~9,300,000 graph tasks (never finishes)
+    #
+    # That is the hang. It happens in the CLIENT, during graph construction,
+    # before anything is submitted -- which is why the dashboard shows no
+    # movement and why it made no difference whether the scheduler was
+    # distributed or threaded.
+    #
+    # Opening without `chunks` gives lazily-indexed xarray (not dask), so
+    # .sel() is a cheap metadata operation. Call .chunk() AFTER selecting to
+    # parallelise just the subset -- see build_graph().
     return xr.open_zarr(repo.readonly_session("main").store, group="50r1/00z",
-                        consolidated=False, zarr_format=3, chunks={},
+                        consolidated=False, zarr_format=3,
                         decode_timedelta=True)
 
 
@@ -130,9 +149,16 @@ def build_graph(ds, names, date, members, steps_h, eager=False):
                longitude=slice(LON_MIN, LON_MAX))
     items, n_chunks = [], 0
     for name in names:
-        da = ds[name].sel(**sel)
+        da = ds[name]
+        # Select the LEVEL FIRST, while this is still lazy xarray and the
+        # selection costs nothing. Doing it after .sel() built the graph
+        # across all 14 levels.
         if "isobaricInhPa" in da.dims:
-            da = da.isel(isobaricInhPa=0)     # one level, keeps the count honest
+            da = da.isel(isobaricInhPa=0)
+        da = da.sel(**sel)
+        # Only now make it a dask array -- over the SUBSET, so the graph is
+        # members x steps tasks rather than every chunk in the store.
+        da = da.chunk({"number": 1, "step": 1})
         n_chunks += members * len(steps_h)
         if eager:
             items.append(("EAGER", name, da))
@@ -181,7 +207,75 @@ def run_one(client, ds, names, args):
     }
 
 
+class ThreadedShim:
+    """Stand-in for a distributed Client, for dask's THREADED scheduler.
+
+    Why this mode exists: icechunk's own Dask guide says the distributed and
+    multiprocessing schedulers do not work with the standard zarr write path
+    and that "it is fine with the multithreaded scheduler". Reads are not
+    documented either way, but the shape of that limitation points at one
+    session per process being the assumption the library is built around --
+    which is exactly what a client-side store pickled across six worker
+    processes violates.
+
+    Running in-process removes, in one move: pickling the store, the
+    scheduler, the nannies, worker OOM kills, orphaned `processing` tasks and
+    zombie clients. It keeps the parallelism, because the threaded scheduler
+    still runs `num_workers` chunk reads at once and the GIL is released
+    during the S3 fetch and the Rust GRIB decode.
+
+    Exposes only the three methods run_one() needs, so that code is unchanged.
+    """
+
+    def __init__(self, nthreads):
+        self.nthreads = nthreads
+
+    def run(self, fn):                       # client.run(fn) -> {addr: result}
+        return {"in-process": fn()}
+
+    def scheduler_info(self):
+        return {"workers": {"in-process": {"id": "in-process",
+                                           "nthreads": self.nthreads,
+                                           "memory_limit": _cgroup_limit_bytes(),
+                                           "metrics": {}}}}
+
+    def compute(self, graphs, sync=True):
+        import dask
+        with dask.config.set(scheduler="threads", num_workers=self.nthreads):
+            return list(dask.compute(*graphs))
+
+    def close(self):
+        pass
+
+
+def _cgroup_limit_bytes():
+    """The cap that actually kills us. `free` reports the host, which is 32 GB
+    and misleading; the JupyterHub session is capped far lower."""
+    import pathlib
+    for pat in ("/sys/fs/cgroup/memory.max",
+                f"/sys/fs/cgroup/system.slice/jupyter-{os.environ.get('JUPYTERHUB_USER','')}.service/memory.max"):
+        try:
+            v = pathlib.Path(pat).read_text().strip()
+            if v.isdigit():
+                return int(v)
+        except OSError:
+            pass
+    return 0
+
+
 def make_client(args):
+    if args.cluster == "threads":
+        lim = _cgroup_limit_bytes()
+        print(f"THREADED scheduler, in-process: {args.threads} threads, "
+              f"no scheduler, no workers, nothing pickled")
+        if lim:
+            print(f"  process memory cap: {lim/2**30:.1f} GiB (cgroup)")
+            if lim < 12 * 2**30:
+                print(f"  ! this looks like the JupyterHub session cap. For a "
+                      f"full 30-channel run,\n    run this ON A WORKER VM "
+                      f"(16.77 GB) instead.")
+        return ThreadedShim(args.threads), None
+
     from dask.distributed import Client
     if args.cluster == "local":
         from dask.distributed import LocalCluster
@@ -215,11 +309,18 @@ def main():
     ap.add_argument("--eager", action="store_true",
                     help="reproduce the materialise-everything pattern that "
                          "realize_smoke_test.py used, for comparison")
-    ap.add_argument("--cluster", choices=["ewc", "local"], default="ewc")
+    ap.add_argument("--cluster", choices=["ewc", "local", "threads"],
+                    default="ewc",
+                    help="ewc = distributed cluster (currently hangs); "
+                         "local = LocalCluster processes; "
+                         "threads = dask threaded scheduler IN THIS PROCESS "
+                         "-- no pickling, no scheduler, no nannies")
     ap.add_argument("--scheduler", default=os.environ.get(
         "DASK_SCHEDULER_ADDRESS", "tcp://127.0.0.1:8786"))
     ap.add_argument("--workers", type=int, default=3, help="local only")
-    ap.add_argument("--threads", type=int, default=2, help="local only")
+    ap.add_argument("--threads", type=int, default=2,
+                    help="threads per worker (local), or total threads "
+                         "(--cluster threads; try 8)")
     ap.add_argument("--memory-limit", default="1.5GB", help="local only")
     args = ap.parse_args()
     args.steps_h = list(range(0, 3 * args.steps, 3))
@@ -232,7 +333,7 @@ def main():
     client, cluster = make_client(args)
     try:
         ds = client.submit(open_store, pure=False).result(timeout=900) \
-            if args.cluster == "ewc" else open_store()
+            if args.cluster == "ewc" else open_store()   # local/threads: here
     except Exception as e:                                      # noqa: BLE001
         # Opening on a worker returns an unpicklable handle in some setups;
         # fall back to opening client-side, which is fine for graph building
@@ -270,6 +371,11 @@ def main():
             lim = float(args.memory_limit.rstrip("GB")) * 1000
             check("worker peak RSS bounded", peak < 0.9 * lim,
                   f"{peak:.0f} MB vs {args.memory_limit} limit")
+        elif args.cluster == "threads":
+            lim = _cgroup_limit_bytes() / 1e6
+            check("process peak RSS inside the cgroup cap",
+                  bool(lim) and peak < 0.9 * lim,
+                  f"{peak:.0f} MB vs {lim:.0f} MB cap")
         else:
             check("worker peak RSS under 12 GB", peak < 12_000,
                   f"{peak:.0f} MB")
