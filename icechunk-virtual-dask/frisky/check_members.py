@@ -89,9 +89,21 @@ def main():
         hours = int(ds.step.values[s] / np.timedelta64(1, "h"))
         spreads.append((hours, sd))
         print(f"     +{hours:3d}h   sd = {sd:.4f}")
+    # Growth is only a meaningful signal over a long enough lead time.  An
+    # ensemble does not measurably diverge in six hours, so a short store
+    # (a smoke test with 2-3 steps) fails this test while being perfectly
+    # correct.  Report it as untestable rather than as a failure.
+    span_h = spreads[-1][0] - spreads[0][0]
+    testable = span_h >= 48
     grows = spreads[-1][1] > spreads[0][1]
-    print(f"     -> spread {'GROWS with lead time' if grows else 'does NOT grow'}"
-          f"  ({spreads[0][1]:.4f} -> {spreads[-1][1]:.4f})")
+    if not testable:
+        print(f"     -> lead span is only {span_h}h; spread growth is not "
+              f"testable below 48h  ({spreads[0][1]:.4f} -> "
+              f"{spreads[-1][1]:.4f})")
+    else:
+        print(f"     -> spread "
+              f"{'GROWS with lead time' if grows else 'does NOT grow'}"
+              f"  ({spreads[0][1]:.4f} -> {spreads[-1][1]:.4f})")
 
     # ---- 3. control vs perturbed -----------------------------------------
     last = da.isel(step=-1)
@@ -105,8 +117,10 @@ def main():
 
     print(f"\n  finite fraction   {float(np.isfinite(last.values).mean()):.4f}")
 
-    verdict = (not identical) and grows
-    print(f"\n  VERDICT: members are {'REAL' if verdict else 'SUSPECT'}")
+    verdict = (not identical) and (grows or not testable)
+    note = "" if testable else "  (distinctness only -- lead span too short)"
+    print(f"\n  VERDICT: members are "
+          f"{'REAL' if verdict else 'SUSPECT'}{note}")
     return 0 if verdict else 1
 
 

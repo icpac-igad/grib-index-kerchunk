@@ -120,6 +120,75 @@ def write_channel(repo, name, arr, coords, date, first_channel, first_date):
     return snap
 
 
+def create_schema(repo, channel_names, coords, date, dtype="float32"):
+    """Lay down empty arrays for every channel, metadata only, and commit.
+
+    Written from the coordinator before any fork, because a ForkSession can
+    only fill regions of arrays that already exist.
+
+    `to_zarr(compute=False)` writes the metadata and none of the data, so this
+    costs nothing even though the arrays total 7.8 GB.  It goes through xarray
+    rather than `zarr.create_array` deliberately: the `realized-test` store in
+    this same bucket was written with raw zarr and is unreadable by xarray to
+    this day because its arrays carry no `dimension_names`.
+
+    Returns the snapshot id.
+    """
+    import dask.array as dsa
+    import numpy as np
+    import xarray as xr
+
+    shape = (1, len(coords["step"]), len(coords["number"]),
+             len(coords["latitude"]), len(coords["longitude"]))
+    chunks = (1, 1, shape[2], shape[3], shape[4])
+    dims = ("time", "step", "number", "latitude", "longitude")
+
+    ds = xr.Dataset(
+        {name: (dims, dsa.zeros(shape, chunks=chunks, dtype=dtype))
+         for name in channel_names},
+        coords={
+            "time": np.array([np.datetime64(date, "ns")]),
+            "step": coords["step"],
+            "number": coords["number"],
+            "latitude": coords["latitude"],
+            "longitude": coords["longitude"],
+        },
+    )
+    session = repo.writable_session("main")
+    ds.to_zarr(session.store, compute=False, zarr_format=3,
+               consolidated=False, mode="w")
+    return session.commit(f"schema for {date}: {len(channel_names)} channels")
+
+
+def merge_and_commit(repo, forks, message):
+    """Collect the workers' changesets into one commit.
+
+    `Session.fork()` refuses to fork a session that already has uncommitted
+    changes, so the coordinator session used here must be freshly opened after
+    the schema commit.
+    """
+    session = repo.writable_session("main")
+    session.merge(*forks)
+    return session.commit(message)
+
+
+def existing_channels(repo):
+    """Channels already committed, so a killed run can resume.
+
+    Every channel is its own commit, so whatever landed before a crash is
+    durable and must not be redone -- each one costs 2,703 GRIB messages and
+    ~2 GB of AWS egress.
+    """
+    import xarray as xr
+
+    try:
+        ds = xr.open_zarr(repo.readonly_session("main").store,
+                          consolidated=False, zarr_format=3)
+    except Exception:
+        return set()          # nothing but the initial commit
+    return set(ds.data_vars)
+
+
 def date_exists(repo, date):
     """Is this date already on the `time` axis?  Makes a rerun idempotent."""
     import numpy as np

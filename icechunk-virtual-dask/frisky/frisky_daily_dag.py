@@ -206,6 +206,32 @@ def stack_members(*fields):
     return np.stack(fields, axis=0)
 
 
+def write_block(fork, name, step_idx, *fields):
+    """Stack members and write THIS chunk straight to Ceph from the worker.
+
+    The whole point of icechunk's fork/merge model
+    (https://icechunk.io/en/latest/understanding/parallel/): the 259 MB of a
+    channel never travels to the client.  Each worker writes its own region
+    and returns only a changeset, so
+
+      * the client stops being a funnel -- it was gathering 259 MB per channel
+        into an 8 GiB cgroup and got SIGKILLed at channel 21
+      * the 7.8 GB write happens on six VMs at once instead of serially
+      * one commit covers the date, instead of one per channel
+
+    Safe because our store chunk is (1, 1, number, lat, lon), so a
+    (channel, step) block is EXACTLY one chunk: aligned, and no two workers
+    can touch the same one.  Those are the two constraints the icechunk docs
+    put on the caller.
+    """
+    import zarr
+
+    block = np.stack(fields, axis=0)          # (number, y, x)
+    arr = zarr.open_array(fork.store, path=name, mode="r+")
+    arr[0, step_idx] = block
+    return fork
+
+
 def stack_steps(*per_step):
     """(step, y, x) mean and sd for one channel on one date."""
     return (np.stack([m for m, _ in per_step], axis=0),
@@ -401,8 +427,23 @@ def run(args):
         here = os.path.dirname(os.path.abspath(__file__))
         ak, sk = sink.load_env(args.env or os.path.join(here, "..", ".env"))
         repo, created = sink.open_sink(args.sink, ak, sk)
+        already = sink.existing_channels(repo)
         print(f"sink     must-icechunk/{args.sink}"
               f"  ({'created' if created else 'existing'})")
+        if already:
+            print(f"already  {len(already)} channel(s) committed: "
+                  f"{', '.join(sorted(already))}")
+            if args.resume:
+                before = len(channels)
+                channels = [c for c in channels if c[2] not in already]
+                print(f"resume   skipping {before - len(channels)}, "
+                      f"{len(channels)} to go: "
+                      f"{', '.join(c[2] for c in channels)}")
+                if not channels:
+                    print("\nnothing left to do")
+                    client.close()
+                    return True
+                n_leaf = len(channels) * len(members) * len(steps)
         coords = subset_coords(args.era, args.date, members, steps,
                                args.synthetic)
 
@@ -414,15 +455,29 @@ def run(args):
         t_submit = time.time() - t0
         print(f"submitted in {t_submit:.2f}s -- now waiting\n")
 
-        first = True
+        # mode="w" would wipe the channels a previous run committed.
+        first = not already
         for name, fut in futures.items():
             try:
                 if keep:
-                    # Gather ONE channel: 53 futures of (number, y, x) ->
-                    # (step, number, y, x) = 259 MB.  Written and dropped
-                    # before the next channel is touched, so the client peak
-                    # stays ~0.5 GB against the 8 GiB cgroup.
-                    arr = np.stack([f.result() for f in fut], axis=0)
+                    # Gather ONE channel into a PREALLOCATED buffer.
+                    #
+                    # The obvious `np.stack([f.result() for f in fut])` holds
+                    # all 53 results (259 MB) AND the stacked copy (259 MB) at
+                    # once.  Churning 518 MB per channel across 30 channels
+                    # got the client SIGKILLed at channel 21 on the gateway's
+                    # 8 GiB cgroup -- the exit-137 in BLOCKERS.md, self
+                    # inflicted.  Filling slot by slot and dropping each
+                    # result as it lands halves the peak.
+                    arr = None
+                    for i, f in enumerate(fut):
+                        block = f.result()
+                        if arr is None:
+                            arr = np.empty((len(fut),) + block.shape,
+                                           dtype=np.float32)
+                        arr[i] = block
+                        del block
+                    fut.clear()          # drop the client's future refs too
                 else:
                     arr = fut.result()
 
@@ -503,6 +558,9 @@ def main():
     p.add_argument("--store-members", action="store_true",
                    help="keep every member instead of reducing to mean/sd.  "
                         "51x53x163x147 f32 = 259 MB per channel, 7.8 GB/date")
+    p.add_argument("--resume", action="store_true",
+                   help="skip channels already committed to --sink.  Each is "
+                        "its own commit, so a killed run loses nothing")
     p.add_argument("--first-date", action="store_true",
                    help="this date lays down the schema (mode=w); omit to "
                         "append along `time`")
