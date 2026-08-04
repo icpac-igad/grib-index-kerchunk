@@ -152,8 +152,22 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
         return rng.standard_normal((163, 147), dtype=np.float32)
 
     import numpy as _np
+    import random as _random
 
-    ds = _open_era(era)
+    # _open_era used to sit OUTSIDE the retry below.  It fetches the store
+    # manifest, so it is an S3 call like any other and gets throttled like any
+    # other -- and with 12 worker processes starting at once, all of them open
+    # the store simultaneously.  A SlowDown there killed the task outright.
+    delay = 0.5
+    for attempt in range(8):
+        try:
+            ds = _open_era(era)
+            break
+        except Exception as exc:
+            if "SlowDown" not in str(exc) or attempt == 7:
+                raise
+            time.sleep(delay + _random.random() * delay)
+            delay = min(delay * 2, 30)
     da = ds[var]
     # Level FIRST, while this is still lazily-indexed xarray -- DAG_METHOD.md
     # §5. There is no dask graph here to blow up, but the composed lazy index
@@ -170,18 +184,29 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
 
     # §4.4 -- icechunk surfaces AWS throttling as `unhandled error (SlowDown)`
     # and does not retry.  One 503 anywhere otherwise fails the whole read.
+    #
+    # This went untested through every run until 192 concurrent readers finally
+    # provoked AWS, and then two things were wrong with it. Six attempts at
+    # 0.5-16 s is only ~31 s of total backoff, which a sustained throttle
+    # outruns; and with no jitter every throttled reader retried in lockstep,
+    # so each wave arrived together and was refused together. Eight attempts
+    # capped at 30 s with full jitter gives ~2 min of headroom and spreads the
+    # retries out.
+    #
+    # Backoff is damage control, not a fix. The real lever is not exceeding
+    # ~96 concurrent readers in the first place -- see SCALING.md.
     delay = 0.5
-    for attempt in range(6):
+    for attempt in range(8):
         try:
             return _np.asarray(da.values, dtype=_np.float32)
         except Exception as exc:
             msg = str(exc)
             throttled = ("SlowDown" in msg or "503" in msg
                          or "ServiceUnavailable" in msg)
-            if not throttled or attempt == 5:
+            if not throttled or attempt == 7:
                 raise
-            time.sleep(delay)
-            delay *= 2
+            time.sleep(delay + _random.random() * delay)
+            delay = min(delay * 2, 30)
     raise RuntimeError("unreachable")
 
 
@@ -206,7 +231,7 @@ def stack_members(*fields):
     return np.stack(fields, axis=0)
 
 
-def write_block(fork, name, step_idx, *fields):
+def write_block(fork, name, time_idx, step_idx, *fields):
     """Stack members and write THIS chunk straight to Ceph from the worker.
 
     The whole point of icechunk's fork/merge model
@@ -228,7 +253,7 @@ def write_block(fork, name, step_idx, *fields):
 
     block = np.stack(fields, axis=0)          # (number, y, x)
     arr = zarr.open_array(fork.store, path=name, mode="r+")
-    arr[0, step_idx] = block
+    arr[time_idx, step_idx] = block
     return fork
 
 

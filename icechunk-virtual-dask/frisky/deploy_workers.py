@@ -106,7 +106,8 @@ def _push_module(dirname, name, source):
     return {"host": socket.gethostname(), "wrote": name, "bytes": len(source)}
 
 
-def _start_worker(dirname, frisky_bin, sched, nthreads, memory_limit):
+def _start_worker(dirname, frisky_bin, sched, nthreads, memory_limit,
+                  n_per_vm=1):
     """Launch `frisky worker` detached, with AWS_* scrubbed from ITS env only.
 
     The Dask worker process keeps its own AWS_* untouched -- this is a child
@@ -117,14 +118,17 @@ def _start_worker(dirname, frisky_bin, sched, nthreads, memory_limit):
     env["PYTHONPATH"] = dirname
     env["FRISKY_EA_HOME"] = dirname
     log = open(f"{dirname}/worker.log", "ab")
-    p = subprocess.Popen(
-        [frisky_bin, "worker", sched, "--nthreads", str(nthreads),
-         "--memory-limit", memory_limit],
-        env=env, cwd=dirname, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True)
+    pids = []
+    for _ in range(n_per_vm):
+        p = subprocess.Popen(
+            [frisky_bin, "worker", sched, "--nthreads", str(nthreads),
+             "--memory-limit", memory_limit],
+            env=env, cwd=dirname, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        pids.append(p.pid)
     with open(f"{dirname}/worker.pid", "w") as f:
-        f.write(str(p.pid))
-    return {"host": socket.gethostname(), "pid": p.pid}
+        f.write("\n".join(str(x) for x in pids))
+    return {"host": socket.gethostname(), "pids": pids}
 
 
 def _start_scheduler(dirname, frisky_bin, bind, dashboard, tracing_capacity):
@@ -263,6 +267,11 @@ def main():
     p.add_argument("--scheduler", default="192.168.1.129:8796",
                    help="the FRISKY scheduler the workers should dial")
     p.add_argument("--nthreads", type=int, default=4)
+    p.add_argument("--workers-per-vm", type=int, default=1,
+                   help="Frisky worker PROCESSES per VM.  icechunk caps "
+                        "in-flight connections per process: 1 proc tops out "
+                        "at ~25 MB/s, 2 reach ~47, and past 2 it is flat. "
+                        "Threads cannot substitute -- see procs_probe.py")
     p.add_argument("--memory-limit", default="10GB")
     p.add_argument("--dask", default=DASK_SCHEDULER)
     p.add_argument("--timeout", type=int, default=900,
@@ -384,12 +393,14 @@ def main():
             time.sleep(3)
             show("starting frisky workers",
                  c.run(_start_worker, REMOTE_DIR, REMOTE_FRISKY,
-                       args.scheduler, args.nthreads, args.memory_limit))
+                       args.scheduler, args.nthreads, args.memory_limit,
+                       args.workers_per_vm))
             time.sleep(5)
             show("status", c.run(_worker_status, REMOTE_DIR))
-            print(f"\nfrisky workers dialling {args.scheduler} "
-                  f"at {args.nthreads} threads each "
-                  f"({6 * args.nthreads} concurrent readers)")
+            n = 6 * args.workers_per_vm
+            print(f"\n{n} frisky workers ({args.workers_per_vm}/VM) dialling "
+                  f"{args.scheduler} at {args.nthreads} threads each "
+                  f"({n * args.nthreads} concurrent readers)")
 
         if args.status:
             show("status", c.run(_worker_status, REMOTE_DIR))

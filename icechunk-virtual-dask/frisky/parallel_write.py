@@ -87,7 +87,7 @@ def main():
     t0 = time.time()
     coords = dag.subset_coords(args.era, args.date, members, steps)
     names = [c[2] for c in channels]
-    snap = sink.create_schema(repo, names, coords, args.date)
+    snap = sink.create_schema(repo, names, coords, [args.date])
     print(f"schema   {len(names)} arrays, metadata only, "
           f"{str(snap)[:12]} in {time.time() - t0:.1f}s")
 
@@ -104,7 +104,7 @@ def main():
                                    args.date, m, step_h) for m in members]
             futures.append(client.submit(dag.write_block,
                                          shared_fork or session.fork(),
-                                         name, si, *reads))
+                                         name, 0, si, *reads))
     print(f"submitted {len(futures)} write blocks in {time.time() - t1:.2f}s"
           f" -- now waiting\n")
 

@@ -120,7 +120,7 @@ def write_channel(repo, name, arr, coords, date, first_channel, first_date):
     return snap
 
 
-def create_schema(repo, channel_names, coords, date, dtype="float32"):
+def create_schema(repo, channel_names, coords, dates, dtype="float32"):
     """Lay down empty arrays for every channel, metadata only, and commit.
 
     Written from the coordinator before any fork, because a ForkSession can
@@ -138,7 +138,9 @@ def create_schema(repo, channel_names, coords, date, dtype="float32"):
     import numpy as np
     import xarray as xr
 
-    shape = (1, len(coords["step"]), len(coords["number"]),
+    if isinstance(dates, str):
+        dates = [dates]
+    shape = (len(dates), len(coords["step"]), len(coords["number"]),
              len(coords["latitude"]), len(coords["longitude"]))
     chunks = (1, 1, shape[2], shape[3], shape[4])
     dims = ("time", "step", "number", "latitude", "longitude")
@@ -147,7 +149,7 @@ def create_schema(repo, channel_names, coords, date, dtype="float32"):
         {name: (dims, dsa.zeros(shape, chunks=chunks, dtype=dtype))
          for name in channel_names},
         coords={
-            "time": np.array([np.datetime64(date, "ns")]),
+            "time": np.array([np.datetime64(d, "ns") for d in dates]),
             "step": coords["step"],
             "number": coords["number"],
             "latitude": coords["latitude"],
@@ -157,7 +159,9 @@ def create_schema(repo, channel_names, coords, date, dtype="float32"):
     session = repo.writable_session("main")
     ds.to_zarr(session.store, compute=False, zarr_format=3,
                consolidated=False, mode="w")
-    return session.commit(f"schema for {date}: {len(channel_names)} channels")
+    return session.commit(
+        f"schema: {len(channel_names)} channels x {len(dates)} dates "
+        f"({dates[0]} .. {dates[-1]})")
 
 
 def merge_and_commit(repo, forks, message):
