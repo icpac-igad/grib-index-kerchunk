@@ -60,38 +60,68 @@ def committed_dates(repo):
     return done
 
 
-def run_one_date(client, repo, channels, members, steps, era, date, date_idx):
-    """1,590 blocks for one date, one shared fork, one commit."""
+def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
+                 rounds=4, pause=45):
+    """1,590 blocks for one date, one shared fork, one commit.
+
+    Blocks that fail are RESUBMITTED rather than failing the date.  AWS
+    throttles this workload even at 96 concurrent readers: the per-read
+    backoff in `read_message` absorbs most of it, but a few blocks exhaust
+    all 8 attempts. Discarding the date for 6 bad blocks out of 1,590 throws
+    away 81,090 messages and ~64 GB of egress to avoid redoing ~300.
+
+    Between rounds we pause: the whole point is to stop asking for a while,
+    and immediately resubmitting into a throttling window just burns the
+    retries again.
+    """
     session = repo.writable_session("main")
     fork = session.fork()
 
+    pending = [(var, level, name, si, step_h)
+               for var, level, name in channels
+               for si, step_h in enumerate(steps)]
+
     t0 = time.time()
-    futures = []
-    for var, level, name in channels:
-        for si, step_h in enumerate(steps):
+    forks, submit_s, retried = [], 0.0, 0
+
+    for rnd in range(rounds):
+        ts = time.time()
+        futures = []
+        for var, level, name, si, step_h in pending:
             reads = [client.submit(dag.read_message, era, var, level, date,
                                    m, step_h) for m in members]
             futures.append(client.submit(dag.write_block, fork, name,
                                          date_idx, si, *reads))
-    submit_s = time.time() - t0
+        if rnd == 0:
+            submit_s = time.time() - ts
 
-    forks, failed = [], []
-    for f in futures:
-        try:
-            forks.append(f.result())
-        except Exception as exc:
-            failed.append(f"{type(exc).__name__}: {exc}")
+        still, errs = [], []
+        for spec, f in zip(pending, futures):
+            try:
+                forks.append(f.result())
+            except Exception as exc:
+                still.append(spec)
+                errs.append(f"{type(exc).__name__}: {exc}")
+
+        if not still:
+            break
+        retried += len(still)
+        pending = still
+        if rnd < rounds - 1:
+            print(f"          retry {len(still)} block(s) "
+                  f"(round {rnd + 2}/{rounds}) after {pause}s pause",
+                  flush=True)
+            time.sleep(pause)
+    else:
+        return None, submit_s, time.time() - t0, 0.0, errs, retried
+
     read_s = time.time() - t0
-
-    if failed:
-        return None, submit_s, read_s, 0.0, failed
-
     t2 = time.time()
     snap = sink.merge_and_commit(
         repo, forks,
         f"{DONE_PREFIX}{date}: {len(channels)} channels, {len(members)} "
         f"members, {len(steps)} steps")
-    return snap, submit_s, read_s, time.time() - t2, []
+    return snap, submit_s, read_s, time.time() - t2, [], retried
 
 
 def main():
@@ -108,6 +138,11 @@ def main():
     p.add_argument("--steps", type=int, default=53)
     p.add_argument("--env", default="../.env")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--rounds", type=int, default=4,
+                   help="resubmit rounds for blocks AWS throttled out")
+    p.add_argument("--pause", type=int, default=45,
+                   help="seconds between retry rounds -- the point is to "
+                        "stop asking for a while")
     args = p.parse_args()
 
     import frisky
@@ -119,12 +154,14 @@ def main():
     names = [c[2] for c in channels]
     per_date = len(channels) * len(steps)
 
-    gb = len(dates) * len(channels) * len(members) * len(steps) * 0.788 / 1000
+    n_msg = len(dates) * len(channels) * len(members) * len(steps)
+    tb = n_msg * 0.788 / 1e6          # 0.788 MB per message -> TB
     print(f"corpus   {dates[0]} .. {dates[-1]}  ({len(dates)} dates)")
     print(f"shape    {len(channels)} channels x {len(members)} members x "
           f"{len(steps)} steps")
     print(f"work     {per_date} blocks/date, "
-          f"{len(dates) * per_date} total, ~{gb:.2f} TB of AWS egress\n")
+          f"{len(dates) * per_date} total, {n_msg:,} messages, "
+          f"~{tb:.2f} TB of AWS egress\n")
 
     ak, sk = sink.load_env(args.env)
     repo, created = sink.open_sink(args.sink, ak, sk)
@@ -151,8 +188,9 @@ def main():
         if date in done:
             print(f"[{i + 1:2d}/{len(dates)}] {date}  skipped (committed)")
             continue
-        snap, sub, rd, mg, failed = run_one_date(
-            client, repo, channels, members, steps, args.era, date, i)
+        snap, sub, rd, mg, failed, retried = run_one_date(
+            client, repo, channels, members, steps, args.era, date, i,
+            rounds=args.rounds, pause=args.pause)
         if failed:
             bad.append((date, failed))
             print(f"[{i + 1:2d}/{len(dates)}] {date}  FAILED "
@@ -163,7 +201,8 @@ def main():
         eta = (time.time() - t_all) / len(ok) * (len(dates) - i - 1)
         print(f"[{i + 1:2d}/{len(dates)}] {date}  {rd:6.1f}s  "
               f"{rate:6.1f} msg/s  submit {sub:4.1f}s  merge {mg:4.1f}s  "
-              f"-> {str(snap)[:12]}   eta {eta / 60:.0f}m", flush=True)
+              f"retried {retried:4d}  -> {str(snap)[:12]}   "
+              f"eta {eta / 60:.0f}m", flush=True)
 
     client.close()
     mins = (time.time() - t_all) / 60
