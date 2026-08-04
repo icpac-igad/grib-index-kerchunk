@@ -197,6 +197,15 @@ def reduce_members(*fields):
             stack.std(axis=0, dtype=np.float32))
 
 
+def stack_members(*fields):
+    """Keep every member: (number, y, x) for one (channel, step).
+
+    The alternative fan-in to `reduce_members`, used when the store is to hold
+    individual members.  ~5 MB out instead of ~0.2 MB, still bounded.
+    """
+    return np.stack(fields, axis=0)
+
+
 def stack_steps(*per_step):
     """(step, y, x) mean and sd for one channel on one date."""
     return (np.stack([m for m, _ in per_step], axis=0),
@@ -207,14 +216,24 @@ def stack_steps(*per_step):
 # Client-side: build the graph, submit once, gather.
 # ===========================================================================
 
-def build_and_submit(client, date, channels, members, steps, era, synthetic):
-    """One submission per date.  Returns {out_name: Future[(mean, sd)]}.
+def build_and_submit(client, date, channels, members, steps, era, synthetic,
+                     keep_members=False):
+    """One submission per date.
+
+    Returns {out_name: Future[(mean, sd)]}, or with keep_members
+    {out_name: [Future[(number, y, x)] per step]} -- a LIST, deliberately.
+
+    The list matters for memory.  A whole channel with members kept is
+    51 x 53 x 163 x 147 float32 = 259 MB, and 30 of those is 7.8 GB against an
+    8 GiB client cgroup.  Returning per-step futures lets the caller gather one
+    channel, write it, and drop it before touching the next.
 
     Note what is NOT here: no `client.compute()` called from inside a task, no
     graph materialised on the client beyond a list of futures, and no single
     task that holds every member x step at once.  That combination is what
     hung the Dask runs.
     """
+    fold = stack_members if keep_members else reduce_members
     out = {}
     for var, level, name in channels:
         step_futures = []
@@ -224,9 +243,35 @@ def build_and_submit(client, date, channels, members, steps, era, synthetic):
                               synthetic)
                 for m in members
             ]
-            step_futures.append(client.submit(reduce_members, *member_futures))
-        out[name] = client.submit(stack_steps, *step_futures)
+            step_futures.append(client.submit(fold, *member_futures))
+        out[name] = step_futures if keep_members else \
+            client.submit(stack_steps, *step_futures)
     return out
+
+
+def subset_coords(era, date, members, steps, synthetic=False):
+    """Coordinate values for the EA box, read once on the client.
+
+    Metadata only -- `.sel()` on lazily-indexed xarray fetches no chunks, so
+    this costs one store open (~5 s) and no data.
+    """
+    import numpy as _np
+
+    if synthetic:
+        return {"step": _np.array([_np.timedelta64(h, "h") for h in steps]),
+                "number": _np.array(members),
+                "latitude": _np.linspace(LAT_MAX, LAT_MIN, 163),
+                "longitude": _np.linspace(LON_MIN, LON_MAX, 147)}
+
+    ds = _open_era(era)
+    box = ds["t2m"].sel(latitude=slice(LAT_MAX, LAT_MIN),
+                        longitude=slice(LON_MIN, LON_MAX))
+    return {
+        "step": _np.array([_np.timedelta64(h, "h") for h in steps]),
+        "number": _np.array(members),
+        "latitude": box.latitude.values,
+        "longitude": box.longitude.values,
+    }
 
 
 def select_channels(args):
@@ -349,17 +394,52 @@ def run(args):
         print(f"cluster  {args.workers}x{args.threads} local, "
               f"dashboard {cluster.dashboard_link}")
 
+    keep = args.store_members
+    repo = coords = None
+    if args.sink:
+        import sink_icechunk as sink
+        here = os.path.dirname(os.path.abspath(__file__))
+        ak, sk = sink.load_env(args.env or os.path.join(here, "..", ".env"))
+        repo, created = sink.open_sink(args.sink, ak, sk)
+        print(f"sink     must-icechunk/{args.sink}"
+              f"  ({'created' if created else 'existing'})")
+        coords = subset_coords(args.era, args.date, members, steps,
+                               args.synthetic)
+
     t0 = time.time()
+    written, failed, results = [], [], {}
     try:
         futures = build_and_submit(client, args.date, channels, members, steps,
-                                   args.era, args.synthetic)
+                                   args.era, args.synthetic, keep_members=keep)
         t_submit = time.time() - t0
         print(f"submitted in {t_submit:.2f}s -- now waiting\n")
 
-        results, failed = {}, []
+        first = True
         for name, fut in futures.items():
             try:
-                results[name] = fut.result()
+                if keep:
+                    # Gather ONE channel: 53 futures of (number, y, x) ->
+                    # (step, number, y, x) = 259 MB.  Written and dropped
+                    # before the next channel is touched, so the client peak
+                    # stays ~0.5 GB against the 8 GiB cgroup.
+                    arr = np.stack([f.result() for f in fut], axis=0)
+                else:
+                    arr = fut.result()
+
+                if repo is not None and keep:
+                    t1 = time.time()
+                    snap = sink.write_channel(repo, name, arr, coords,
+                                              args.date, first,
+                                              first_date=args.first_date)
+                    written.append((name, arr.nbytes, time.time() - t1))
+                    print(f"  {name:7s} {arr.shape}  "
+                          f"{arr.nbytes / 1e6:7.1f} MB  "
+                          f"finite {float(np.isfinite(arr).mean()):.3f}  "
+                          f"-> {str(snap)[:12]}  {time.time() - t1:5.1f}s")
+                    first = False
+                    del arr
+                else:
+                    results[name] = arr
             except Exception as exc:
                 failed.append((name, f"{type(exc).__name__}: {exc}"))
         elapsed = time.time() - t0
@@ -376,9 +456,16 @@ def run(args):
     for name, err in failed:
         print(f"  {name:7s} FAILED  {err}")
 
+    ok = len(results) + len(written)
     rate = n_leaf / elapsed if elapsed else 0
-    print(f"\n{len(results)}/{len(futures)} channels in {elapsed:.1f}s "
-          f"({rate:.1f} messages/s, {elapsed / max(len(results), 1):.1f}s per channel)")
+    print(f"\n{ok}/{len(futures)} channels in {elapsed:.1f}s "
+          f"({rate:.1f} messages/s, {elapsed / max(ok, 1):.1f}s per channel)")
+    if written:
+        total = sum(b for _, b, _ in written)
+        wtime = sum(t for _, _, t in written)
+        print(f"wrote    {total / 1e9:.2f} GB raw float32 to "
+              f"must-icechunk/{args.sink} in {wtime:.0f}s "
+              f"({total / 1e6 / max(wtime, 1e-9):.0f} MB/s)")
 
     if args.out and results:
         os.makedirs(args.out, exist_ok=True)
@@ -410,6 +497,17 @@ def main():
     p.add_argument("--dashboard", default="127.0.0.1:8790",
                    help="8787 is taken by the Dask scheduler on this VM")
     p.add_argument("--out", default=None, help="directory for .npz output")
+    p.add_argument("--sink", default=None,
+                   help="prefix under must-icechunk to write, e.g. "
+                        "ea-cgan/v1-7day.  Requires --store-members")
+    p.add_argument("--store-members", action="store_true",
+                   help="keep every member instead of reducing to mean/sd.  "
+                        "51x53x163x147 f32 = 259 MB per channel, 7.8 GB/date")
+    p.add_argument("--first-date", action="store_true",
+                   help="this date lays down the schema (mode=w); omit to "
+                        "append along `time`")
+    p.add_argument("--env", default=None,
+                   help="path to the .env holding AK/SK (default ../.env)")
     p.add_argument("--synthetic", action="store_true",
                    help="no network: prove the DAG shape only")
     p.add_argument("--ramp", action="store_true",
@@ -418,6 +516,9 @@ def main():
                    help="print the DAG size and exit; opens nothing, submits "
                         "nothing")
     args = p.parse_args()
+
+    if args.sink and not args.store_members:
+        p.error("--sink writes the member dimension; pass --store-members")
 
     if args.count:
         sys.exit(0 if count_only(args) else 1)

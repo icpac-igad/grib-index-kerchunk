@@ -127,6 +127,71 @@ def _start_worker(dirname, frisky_bin, sched, nthreads, memory_limit):
     return {"host": socket.gethostname(), "pid": p.pid}
 
 
+def _start_scheduler(dirname, frisky_bin, bind, dashboard, tracing_capacity):
+    """Run the Frisky scheduler on a worker VM, not the gateway.
+
+    The gateway is the JupyterHub session and is capped at 8 GiB
+    (BLOCKERS.md). A scheduler left up across several 82,710-task runs grew
+    past that and was OOM-killed mid-run -- the client saw only
+    `RuntimeError: Failed to send: channel closed`, and the store was left
+    with nothing but its initial commit. A worker VM has 15 GB and no cgroup
+    cap, and FRISKY_TRACING_CAPACITY bounds the span buffer that does most of
+    the growing.
+    """
+    import os, subprocess, socket
+    subprocess.run(["pkill", "-f", f"{dirname}/.venv/bin/frisky scheduler"],
+                   capture_output=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}
+    env["FRISKY_TRACING_CAPACITY"] = str(tracing_capacity)
+    log = open(f"{dirname}/scheduler.log", "ab")
+    p = subprocess.Popen(
+        [frisky_bin, "scheduler", "--address", bind,
+         "--dashboard-address", dashboard],
+        env=env, cwd=dirname, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)
+    with open(f"{dirname}/scheduler.pid", "w") as f:
+        f.write(str(p.pid))
+    return {"host": socket.gethostname(), "pid": p.pid, "bind": bind}
+
+
+def _stop_scheduler(dirname):
+    import socket, subprocess
+    r = subprocess.run(["pkill", "-f",
+                        f"{dirname}/.venv/bin/frisky scheduler"],
+                       capture_output=True)
+    return {"host": socket.gethostname(), "pkill_rc": r.returncode}
+
+
+def _kick_off_probe(dirname, python, messages, levels):
+    """Run bandwidth_probe.py on this VM, detached.
+
+    All six fire at once, so the summed result answers the only question that
+    matters for sizing: does per-VM throughput ADD, or is there a shared EWC
+    egress ceiling? Six VMs measured one at a time cannot tell the difference.
+    """
+    import os, subprocess, socket
+    os.makedirs(dirname, exist_ok=True)
+    lv = " ".join(str(x) for x in levels)
+    cmd = (f"cd {dirname} && rm -f PROBE_OK bw.log && "
+           f"{python} bandwidth_probe.py --messages {messages} "
+           f"--levels {lv} > bw.log 2>&1; touch PROBE_OK")
+    subprocess.Popen(["/bin/bash", "-c", cmd], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"host": socket.gethostname(), "started": True}
+
+
+def _check_probe(dirname):
+    import os, socket
+    done = os.path.exists(f"{dirname}/PROBE_OK")
+    body = ""
+    try:
+        with open(f"{dirname}/bw.log") as f:
+            body = f.read()
+    except Exception:
+        pass
+    return {"host": socket.gethostname(), "done": done, "log": body}
+
+
 def _worker_status(dirname):
     import os, socket
     pid, alive, tail = None, False, ""
@@ -148,16 +213,23 @@ def _worker_status(dirname):
 
 
 def _stop_worker(dirname):
-    import os, signal, socket
-    killed = None
-    try:
-        with open(f"{dirname}/worker.pid") as f:
-            pid = int(f.read().strip())
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-        killed = pid
-    except Exception as e:
-        killed = f"none ({type(e).__name__})"
-    return {"host": socket.gethostname(), "killed": killed}
+    """Kill EVERY frisky worker on this VM, not just the pid we last recorded.
+
+    worker.pid holds only the most recent launch, so a --start that did not
+    stop first leaves orphans the pid file can no longer name.  That is not
+    cosmetic: an orphan runs whatever version of the task module it was
+    started with, and Frisky pickles task functions by reference -- so a stale
+    worker fails every task calling a function added since.  Match on the
+    command line instead.
+    """
+    import socket, subprocess
+    r = subprocess.run(["pkill", "-f", f"{dirname}/.venv/bin/frisky worker"],
+                       capture_output=True, text=True)
+    left = subprocess.run(["pgrep", "-fc",
+                           f"{dirname}/.venv/bin/frisky worker"],
+                          capture_output=True, text=True).stdout.strip()
+    return {"host": socket.gethostname(), "pkill_rc": r.returncode,
+            "still_running": left or "0"}
 
 
 # ── client side ────────────────────────────────────────────────────────────
@@ -174,9 +246,20 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--install", action="store_true")
+    p.add_argument("--scheduler-on", metavar="IP",
+                   help="worker IP to host the Frisky scheduler, e.g. "
+                        "192.168.1.74.  Keeps it off the 8 GiB gateway")
     p.add_argument("--start", action="store_true")
     p.add_argument("--status", action="store_true")
     p.add_argument("--stop", action="store_true")
+    p.add_argument("--bandwidth", action="store_true",
+                   help="run bandwidth_probe.py on ALL VMs simultaneously and "
+                        "sum the peaks -- tests whether egress scales")
+    p.add_argument("--probe-messages", type=int, default=200)
+    p.add_argument("--probe-levels", type=int, nargs="+", default=[32])
+    p.add_argument("--tracing-capacity", type=int, default=20000,
+                   help="scheduler span buffer; the default 200k is what "
+                        "grew unbounded across runs")
     p.add_argument("--scheduler", default="192.168.1.129:8796",
                    help="the FRISKY scheduler the workers should dial")
     p.add_argument("--nthreads", type=int, default=4)
@@ -186,8 +269,10 @@ def main():
                    help="seconds to wait for the venv build")
     args = p.parse_args()
 
-    if not any([args.install, args.start, args.status, args.stop]):
-        p.error("pick one of --install / --start / --status / --stop")
+    if not any([args.install, args.start, args.status, args.stop,
+                args.scheduler_on, args.bandwidth]):
+        p.error("pick one of --install / --scheduler-on / --start / "
+                "--status / --stop / --bandwidth")
 
     from distributed import Client
 
@@ -214,6 +299,76 @@ def main():
                 sys.exit(1)
             print("\nvenv ready on all workers")
 
+        if args.bandwidth:
+            here = os.path.dirname(os.path.abspath(__file__))
+            for mod in ("frisky_daily_dag.py", "bandwidth_probe.py"):
+                with open(os.path.join(here, mod)) as f:
+                    c.run(_push_module, REMOTE_DIR, mod, f.read())
+            show("probing all six at once",
+                 c.run(_kick_off_probe, REMOTE_DIR, REMOTE_PY,
+                       args.probe_messages, args.probe_levels))
+            t0 = time.time()
+            while time.time() - t0 < 900:
+                time.sleep(20)
+                res = c.run(_check_probe, REMOTE_DIR)
+                n = sum(r["done"] for r in res.values())
+                print(f"  {time.time() - t0:5.0f}s  done={n}/{len(res)}")
+                if n == len(res):
+                    break
+            total = 0.0
+            for addr, r in sorted(res.items(), key=lambda kv: kv[1]["host"]):
+                print(f"\n--- {r['host']}")
+                for line in r["log"].splitlines():
+                    if line.strip() and not line.startswith(("warming", "-")):
+                        print("   ", line)
+                for line in r["log"].splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0].isdigit():
+                        total = max(total, 0) + 0  # placeholder, summed below
+            # Sum each VM's PEAK MB/s
+            peaks = []
+            for r in res.values():
+                best = 0.0
+                for line in r["log"].splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0].isdigit():
+                        try:
+                            best = max(best, float(parts[3]))
+                        except ValueError:
+                            pass
+                peaks.append(best)
+            agg = sum(peaks)
+            print(f"\n{'=' * 62}")
+            print(f"per-VM peaks : {['%.1f' % x for x in sorted(peaks)]}")
+            print(f"AGGREGATE    : {agg:.1f} MB/s  ({agg * 8 / 1000:.2f} Gbps)"
+                  f"  across {len(peaks)} VMs")
+            print(f"mean per VM  : {agg / max(len(peaks), 1):.1f} MB/s")
+            if agg:
+                print(f"\nVMs for 1 GB/s at this per-VM rate: "
+                      f"{1000 / (agg / len(peaks)):.0f}")
+            print("Linear scaling holds only if the mean per-VM rate here "
+                  "matches\nthe 31 MB/s measured on ONE VM alone. If it is "
+                  "lower, the EWC\negress is shared and no VM count reaches "
+                  "1 GB/s.")
+            return
+
+        if args.scheduler_on:
+            host = args.scheduler_on
+            target = [a for a in c.scheduler_info()["workers"]
+                      if f"//{host}:" in a]
+            if not target:
+                p.error(f"no Dask worker at {host}; known: "
+                        f"{list(c.scheduler_info()['workers'])}")
+            bind = f"{host}:8796"
+            show(f"starting frisky scheduler on {host}",
+                 c.run(_start_scheduler, REMOTE_DIR, REMOTE_FRISKY, bind,
+                       f"{host}:8791", args.tracing_capacity,
+                       workers=target[:1]))
+            args.scheduler = bind
+            print(f"\nscheduler  {bind}   dashboard http://{host}:8791")
+            print(f"tracing capacity {args.tracing_capacity} "
+                  f"(default 200k is what grew unbounded)")
+
         if args.install or args.start:
             here = os.path.dirname(os.path.abspath(__file__))
             with open(os.path.join(here, "frisky_daily_dag.py")) as f:
@@ -222,6 +377,11 @@ def main():
                  c.run(_push_module, REMOTE_DIR, "frisky_daily_dag.py", src))
 
         if args.start:
+            # Always clear first.  Starting on top of a running worker leaves
+            # an orphan holding a stale copy of the task module.
+            show("clearing any running workers",
+                 c.run(_stop_worker, REMOTE_DIR))
+            time.sleep(3)
             show("starting frisky workers",
                  c.run(_start_worker, REMOTE_DIR, REMOTE_FRISKY,
                        args.scheduler, args.nthreads, args.memory_limit))
