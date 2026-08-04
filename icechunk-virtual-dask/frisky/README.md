@@ -137,7 +137,53 @@ frisky observe overview                       # diagnostics
 
 ## Status
 
-### One full date, six EWC VMs — 2026-08-03
+### `ea-cgan/v2-7day` — a full date with members, via fork/merge
+
+```
+30 channels x 51 members x 53 steps, 2026-07-02, era 50r1
+  81,090 reads + 1,590 chunk writes
+  schema        15.0 s   (metadata only, 30 arrays)
+  submit       476.4 s   <-- 1,590 x session.fork()
+  read+write   477.0 s   (overlapped with submit)
+  merge          2.6 s   1,590 changesets -> 4BX3QNEG92Q7
+  TOTAL        494.6 s   ONE commit, 0 failed blocks
+```
+
+Verified: 30/30 channels, finite 1.000, and `gh500` spread 1.4285 → 5.8914
+from +0h to +168h — **the same numbers the client-side v1 store produced**, so
+two independent write paths agree.
+
+#### Compression: the 40% assumption holds
+
+| | |
+|---|---|
+| raw float32 | 7.77 GB |
+| on Ceph | **3.09 GB** (3.01 GB chunks, 6,400 objects) |
+| ratio | **39.8%** |
+
+**This corrects an earlier entry in this file.** A previous run reported 77.2%
+and called the 40% assumption in `NEXT_SESSION.md` §6.7 badly wrong. That
+measurement was `numpy.savez_compressed` (zlib) over mean/sd fields — not the
+store's codec, and not the store's data. Measured through icechunk on the real
+payload, 40% was right. June 2026 with members is ~93 GB, not ~180 GB.
+
+#### The bottleneck is now `session.fork()`, not I/O
+
+476 s of the 494 s was **submission** — `session.fork()` called once per write
+block, at ~0.30 s each. Every block was written within a second of submission
+finishing, so the cluster was starved the whole run and the true read time was
+never exposed.
+
+`--fork-once` forks a single session and pickles it to every task; each
+unpickled copy records its own changes, so the merge is unchanged. Verified
+correct on 8 blocks, where submission went 1.80 s → **0.23 s**. At 1,590 blocks
+that should take the run to roughly the read-bound ~390 s, and matters far more
+for 30 dates, where per-block forking would cost ~4 hours of pure overhead.
+
+**Not yet verified at 1,590 shared-fork copies** — only the mechanism is
+proven, at 8.
+
+### One full date, mean/sd, client-side — 2026-08-03
 
 ```
 30 channels x 51 members x 53 steps, date 2026-07-02, era 50r1

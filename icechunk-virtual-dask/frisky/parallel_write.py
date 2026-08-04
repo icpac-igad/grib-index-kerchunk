@@ -55,6 +55,12 @@ def main():
     p.add_argument("--members", type=int, default=51)
     p.add_argument("--steps", type=int, default=53)
     p.add_argument("--env", default="../.env")
+    p.add_argument("--fork-once", action="store_true",
+                   help="fork ONE session and pickle it to every task, "
+                        "instead of calling session.fork() per block. "
+                        "Each unpickled copy records its own changes, so the "
+                        "merge is unchanged -- but 1,590 fork() calls cost "
+                        "476s of the 494s a full date took")
     args = p.parse_args()
 
     import frisky
@@ -90,12 +96,14 @@ def main():
     session = repo.writable_session("main")
 
     t1 = time.time()
+    shared_fork = session.fork() if args.fork_once else None
     futures = []
     for var, level, name in channels:
         for si, step_h in enumerate(steps):
             reads = [client.submit(dag.read_message, args.era, var, level,
                                    args.date, m, step_h) for m in members]
-            futures.append(client.submit(dag.write_block, session.fork(),
+            futures.append(client.submit(dag.write_block,
+                                         shared_fork or session.fork(),
                                          name, si, *reads))
     print(f"submitted {len(futures)} write blocks in {time.time() - t1:.2f}s"
           f" -- now waiting\n")
