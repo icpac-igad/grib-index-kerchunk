@@ -1,267 +1,320 @@
-# Frisky: a DAG whose size tracks the request
+# Realizing the ECMWF IFS ensemble with Frisky + Icechunk
 
-`DAG_METHOD.md` §6 leaves one thing unsolved:
+Reads the published virtual Icechunk store on `source.coop` (chunks live on AWS
+`s3://ecmwf-forecasts`) and writes a **realized** store to EWC Ceph, using a
+[Frisky](https://getfrisky.dev/) futures DAG across the six EWC worker VMs.
 
-> **The select-first pattern builds a 3.76 M-task graph for `u`.** [...] it is
-> wasted work, it scales with the store rather than with the request [...]
-> A graph whose size tracks the *request* rather than the *store* is the goal.
-> We are not there; we have only made it not hang.
+**Status: working.** `must-icechunk/ea-cgan/v3-june2026` holds June 2026 —
+30 dates × 30 channels × 51 members × 53 steps, 47,700 chunks, 94.6 GB, verified
+complete. Built in 176 minutes.
 
-This directory is an answer to that: `frisky_daily_dag.py` builds the same
-daily reduction as a **futures DAG** — one task per GRIB message — so there is
-no dask-array graph to construct, and the task count is exactly what was asked
-for.
-
-|  | tasks to read 2 members × 1 step of `u` |
+| document | contents |
 |---|---|
-| `chunks={}` then `.sel()` | never finishes constructing — **hang** |
-| `.sel()` then `.chunk()` | 3,761,156 |
-| Frisky futures | **3** |
-
-Both dask numbers are `graph_size.py`'s, measured on this store. The full
-production shape (30 channels × 51 members × 53 steps, one date) is
-**82,710 Frisky tasks** — 1.02 tasks per message, sized by the request.
+| this file | the A-to-Z runbook |
+| [`SCALING.md`](SCALING.md) | what limits throughput, measured — read before asking for more VMs |
+| `../DAG_METHOD.md` | why the Dask path hung, and how to measure a graph before running it |
+| `../BLOCKERS.md` | the earlier evidence trail |
 
 ---
 
-## What Frisky does and does not fix
+## 1. Throughput actually achieved
 
-**Does not.** Frisky cannot rescue a dask collection from §6. `frisky.hijack`
-and `client.compute` both receive the graph *after* the client has built it, so
-the 3.76 M tasks — or the hang — happen before Frisky is involved.
-**`graph_size.py` stays the right tool for measuring a dask graph.**
-
-Frisky's `submit_expression` does expand graphs scheduler-side in Rust rather
-than materialising them in the client, which is the one path that would help.
-It needs `dask@main` plus the `dask-array` Rust backend, which would break the
-client/worker version parity `README.md` §1 depends on — and it still expands
-to 3.76 M tasks, just elsewhere. Not worth it while the futures form is
-available.
-
-**Does.** Measured on this VM, 2026-08-03:
+June 2026, six VMs, 2 worker processes each × 8 threads = 96 concurrent readers:
 
 | | |
 |---|---|
-| Worker sizing reads the **cgroup** limit | Frisky sees the real 8 GiB cap here; psutil — and so Dask — reports the host's 31.3 GiB. That gap is the exit-137 client kills in `BLOCKERS.md` |
-| `--threads 1` is a flag | The §4.2 fix without a cloud-init change, and no nanny in the loop |
-| Fresh scheduler state | No 236 stale tasks, no zombie clients, and `client.restart()` works — no `assert not self.tasks` |
-| ~3 µs/task vs Dask's ~1 ms | 0.25 s vs ~83 s of pure submission per date at 82,710 tasks |
+| wall clock | **176.3 min** (10,578 s) for 29 dates |
+| messages | **2,432,700** GRIB messages |
+| pulled from AWS | **1.92 TB** |
+| **pull rate** | **181.2 MB/s = 1.45 Gbps = 0.18 GB/s** |
+| messages/s | 230 |
+| per VM | 30.2 MB/s |
+| per worker process | 15.1 MB/s |
+| written to Ceph | 94.6 GB at 8.9 MB/s |
 
-Frisky does **not** solve the root memory problem: icechunk and gribberish
-allocate in Rust, so `managed` reads ~0 against GBs resident, and Frisky sizes
-from managed memory just as Dask does. What fixes that here is the task shape —
-one message in, ~0.1 MB out, ~5 MB held per reduction — not the scheduler.
+### On the 1 GB/s target
 
----
+**We are at 0.18 GB/s. 1 GB/s is 5.5× further.** Worth separating two units that
+are easy to conflate: we reached **1.45 Gbps**, which is already past 1 Gbps —
+but 1 GB/s is 8 Gbps, a different target entirely.
 
-## Against icechunk's own limitation (`81affcd`, `ICECHUNK_DASK_GUIDANCE.md`)
+Two things stand in the way, and only one of them is fixable by adding hardware:
 
-The documented hard limit is a **write** limit:
+- **Per-VM ceiling ~50 MB/s** (icechunk caps connections per process; two
+  processes reach it). We are running at 30.2 MB/s per VM, so there is ~1.6×
+  of headroom here.
+- **AWS request rate**, which is *shared across the whole cluster* and already
+  refuses at 96 concurrent readers. This does not improve with more VMs — more
+  VMs means more requests against the same quota. See `SCALING.md` §4.
 
-> "it's not possible to use the existing `Dask.Array.to_zarr` or
-> `Xarray.Dataset.to_zarr` functions with either the Dask multiprocessing or
-> distributed schedulers. (It is fine with the multithreaded scheduler.)"
+So 1 GB/s is **not** reachable from EWC by adding VMs. Reading in-region
+(`eu-central-1`) is the only route. `BLOCKERS.md` §10.
 
-`81affcd` reads the *shape* of that limitation correctly: **one session per
-process** is the assumption the library is built around, and the untested thing
-in our read path was "open the store client-side and let Dask pickle it into
-six worker processes."
+### The 95% you cannot avoid
 
-This DAG never does that. `_open_era()` runs **inside the worker process** and
-caches at module level; the session is never an argument to a task and never
-crosses a process boundary. One session per process, which is the supported
-shape — reached by construction rather than by care.
+**Only 4.9% of the bytes pulled are kept** — 94.6 GB retained out of 1,917 GB
+pulled. This is not waste in the tuning sense: a GRIB message is the atomic
+unit of the store, so fetching the East Africa box (163×147) still means
+pulling the whole global message (721×1440) and discarding the rest. No amount
+of concurrency or chunk tuning changes it; only a differently-encoded source
+would.
 
-Two related rules, and where this differs from `test_single_date.py`:
-
-| rule | `test_single_date.py` | here |
-|---|---|---|
-| never `chunks={}` before `.sel()` | ✅ opens lazily-indexed, selects, then `.chunk()` | ✅ opens lazily-indexed and **never calls `.chunk()`** — there is no dask array at any point, so `.sel().values` is a direct single-chunk icechunk read |
-| level before `.sel()` | ✅ `.isel(isobaricInhPa=0)` first | ✅ `.sel(isobaricInhPa=level)` first |
-| one session per process | ⚠️ distributed mode pickles a client-side store | ✅ opened on the worker |
-
-**On writes, the limitation still binds and is not yet addressed here.** When
-the sink write is added it must use `icechunk.xarray.to_icechunk` (which
-handles the fork), not `to_zarr` on a `zarr.open_array`, and the sink chunking
-must keep dividing the dask chunks. `--out` currently writes `.npz`, so nothing
-here is on that path yet.
+It does mean the *useful* output rate is 8.9 MB/s while the *network* rate is
+181 MB/s. Size the network for the latter.
 
 ---
 
-## Environment
+## 2. Environment
 
 Deliberately **not** `/opt/mamba/envs/dask`. That env is version-pinned to all
-six workers (`README.md` §1) and must not drift. Frisky lives in an isolated
-venv here:
+six Dask workers (`../README.md` §1) and must not drift.
 
 ```bash
 cd ~/cGAN_tutorial/icechunk-virtual-dask/frisky
+
 /opt/mamba/envs/dask/bin/python -m venv .venv
+.venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install "frisky>=0.3.0" icechunk==2.1.1 zarr==3.2.1 \
-                      xarray==2026.7.0 gribberish==1.6.0 numpy
+                      xarray==2026.7.0 gribberish==1.6.0 numpy==2.5.1 \
+                      dask==2026.7.1
 ```
 
-Installed and verified: frisky 0.7.2, icechunk 2.1.1, zarr 3.2.1,
-xarray 2026.7.0, gribberish 1.6.0.
+`dask` is needed only on the **client**, and only by `create_schema`, which
+uses `dask.array.zeros` to declare the arrays without materialising them.
 
-> The upstream "Try it out" recipe (`dask-array`, `dask@main`, `xarray@main`,
-> `dask_array.xarray.register()`) is for accelerating **dask collections**.
-> This DAG uses futures, so it needs none of it — which is just as well, since
-> those git-main pins are exactly what would break worker parity.
+Verified: frisky 0.7.2, icechunk 2.1.1, zarr 3.2.1, xarray 2026.7.0,
+gribberish 1.6.0, Python 3.12.13.
 
----
+> The upstream Frisky "Try it out" recipe (`dask-array`, `dask@main`,
+> `xarray@main`, `dask_array.xarray.register()`) accelerates **dask
+> collections**. This DAG uses futures and needs none of it — which is as well,
+> since those git-main pins are exactly what would break worker parity.
 
-## Usage
+Set once per shell:
 
 ```bash
 P=~/cGAN_tutorial/icechunk-virtual-dask/frisky/.venv/bin/python
-
-$P frisky_daily_dag.py --count --channels 30 --members 51 --steps 53   # size only
-$P frisky_daily_dag.py --synthetic --channels 30 --members 51 --steps 6 # shape, no network
-$P frisky_daily_dag.py --date 2026-07-02 --channels 1 --members 4 --steps 2
-$P frisky_daily_dag.py --date 2026-07-02 --ramp --members 4 --steps 2
+D=/opt/mamba/envs/dask/bin/python     # only for deploy_workers.py
 ```
 
-Dashboard defaults to `127.0.0.1:8790` — 8787 is the Dask scheduler's on this VM.
+`deploy_workers.py` runs under `$D` because it talks to the **Dask** cluster,
+which is used purely as a remote-exec channel (there is no SSH key on the
+gateway).
 
-For a cluster, run Frisky standalone rather than hijacking the Dask one
-(`hijack` inherits `worker.state.nthreads`, which is 4 here — the
-over-subscription `NEXT_SESSION.md` §4.2 warns about):
+---
+
+## 3. Credentials
+
+Two sets, and keeping them apart is the single most error-prone part.
+
+| | store | credentials |
+|---|---|---|
+| **source** (read) | `source.coop` → virtual chunks on AWS | **anonymous**, `from_env=False` |
+| **sink** (write) | EWC Ceph, `s3://must-icechunk` | `AK`/`SK` from `../.env` |
+
+`../.env` (gitignored, one level up in `icechunk-virtual-dask/`):
+
+```
+AK=<ewc access key>
+SK=<ewc secret key>
+```
+
+### How the workers get write permission
+
+**They are never given the keys, and never read `.env`.**
+
+The client opens the sink with explicit `access_key_id` / `secret_access_key`,
+then calls `session.fork()`. The resulting `ForkSession` carries its storage
+configuration — including those credentials — and is **pickled to the worker**
+as a task argument. The worker writes through `fork.store` and returns the
+changeset. Nothing else is distributed.
+
+This matters because of the `AWS_*` trap (`../README.md` §2): the Dask workers
+carry `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` for Ceph, and if the
+icechunk **virtual-chunk** client sees those it tries to resolve a hostname
+that does not exist. So:
+
+- `frisky_daily_dag.py` pops every `AWS_*` **at import**, before anything
+  builds an S3 client — the config is cached process-wide, so popping later
+  does not help.
+- `deploy_workers.py` launches each `frisky worker` with `AWS_*` scrubbed from
+  **that child process only**. The Dask worker keeps its own environment
+  untouched, so no other job on the VM is affected.
+- The Ceph write therefore *cannot* use env vars — it uses the credentials
+  embedded in the pickled `ForkSession`. The two paths never contend.
+
+---
+
+## 4. A-to-Z runbook
+
+### Step 1 — build the venv on all six VMs (~40 s, once)
 
 ```bash
-frisky scheduler                              # gateway
-frisky worker <sched>:8786 --nthreads 1       # each worker VM, AWS_* unset
-$P frisky_daily_dag.py --scheduler tcp://<sched>:8786 --date 2026-07-02
-frisky observe overview                       # diagnostics
+$D deploy_workers.py --install
 ```
 
-## Status
+Creates `/tmp/frisky-ea/.venv` on each VM from the pinned interpreter,
+installing nothing into `/opt/mamba/envs/dask`. Also ships
+`frisky_daily_dag.py`, which the workers need because **Frisky pickles task
+functions by reference** — the defining module must be importable there.
 
-### `ea-cgan/v2-7day` — a full date with members, via fork/merge
+### Step 2 — scheduler on a worker VM, then the workers
 
-```
-30 channels x 51 members x 53 steps, 2026-07-02, era 50r1
-  81,090 reads + 1,590 chunk writes
-  schema        15.0 s   (metadata only, 30 arrays)
-  submit       476.4 s   <-- 1,590 x session.fork()
-  read+write   477.0 s   (overlapped with submit)
-  merge          2.6 s   1,590 changesets -> 4BX3QNEG92Q7
-  TOTAL        494.6 s   ONE commit, 0 failed blocks
+```bash
+$D deploy_workers.py --scheduler-on 192.168.1.74 --start \
+     --workers-per-vm 2 --nthreads 8 --memory-limit 6GB
 ```
 
-Verified: 30/30 channels, finite 1.000, and `gh500` spread 1.4285 → 5.8914
-from +0h to +168h — **the same numbers the client-side v1 store produced**, so
-two independent write paths agree.
+One command does both, in order. What each flag is for:
 
-#### Compression: the 40% assumption holds
-
-| | |
+| flag | why |
 |---|---|
-| raw float32 | 7.77 GB |
-| on Ceph | **3.09 GB** (3.01 GB chunks, 6,400 objects) |
-| ratio | **39.8%** |
+| `--scheduler-on 192.168.1.74` | **not** the gateway. The JupyterHub session is capped at 8 GiB and the scheduler was OOM-killed there mid-run; the client saw only `Failed to send: channel closed` and the store kept nothing but its initial commit. A worker VM has 15 GB. Also sets `FRISKY_TRACING_CAPACITY=20000`, since the default 200k span buffer is what grew across runs. |
+| `--workers-per-vm 2` | icechunk caps in-flight connections **per process**: one process tops out at ~25–31 MB/s, two reach ~47. Threads cannot substitute. `SCALING.md` §2. |
+| `--nthreads 8` | 12 × 8 = **96 concurrent readers**. 192 drew `SlowDown` from AWS and failed 56 of 1,590 blocks. |
+| `--memory-limit 6GB` | 2 workers × 6 GB fits the 15 GB VM. Each holds a pinned ~332 MB store session. |
 
-**This corrects an earlier entry in this file.** A previous run reported 77.2%
-and called the 40% assumption in `NEXT_SESSION.md` §6.7 badly wrong. That
-measurement was `numpy.savez_compressed` (zlib) over mean/sd fields — not the
-store's codec, and not the store's data. Measured through icechunk on the real
-payload, 40% was right. June 2026 with members is ~93 GB, not ~180 GB.
+`--start` always kills existing workers first. Skipping that once left 12
+workers registered, six of them running a stale copy of the task module.
 
-#### The bottleneck is now `session.fork()`, not I/O
+Check and tear down:
 
-476 s of the 494 s was **submission** — `session.fork()` called once per write
-block, at ~0.30 s each. Every block was written within a second of submission
-finishing, so the cluster was starved the whole run and the true read time was
-never exposed.
-
-`--fork-once` forks a single session and pickles it to every task; each
-unpickled copy records its own changes, so the merge is unchanged. Verified
-correct on 8 blocks, where submission went 1.80 s → **0.23 s**. At 1,590 blocks
-that should take the run to roughly the read-bound ~390 s, and matters far more
-for 30 dates, where per-block forking would cost ~4 hours of pure overhead.
-
-**Not yet verified at 1,590 shared-fork copies** — only the mechanism is
-proven, at 8.
-
-### One full date, mean/sd, client-side — 2026-08-03
-
-```
-30 channels x 51 members x 53 steps, date 2026-07-02, era 50r1
-  81,090 leaves + 1,590 reductions + 30 stacks = 82,710 tasks
-  submitted in 2.02 s
-  682.4 s  (11 min 22 s)   118.8 messages/s   22.7 s per channel
-  30/30 channels, every one finite 1.000
-  erred 0   spilled 0 B
+```bash
+$D deploy_workers.py --status
+$D deploy_workers.py --stop      # Dask workers untouched
 ```
 
-Peak memory, per `frisky observe workers`:
+### Step 3 — dashboard (optional)
 
-```
-Address              Memory              Managed   Unacct
-192.168.1.74:34511   374.64 MiB / 10 GiB   0 B     374.64 MiB
-...                  ~372 MiB each         0 B     ~372 MiB
-TOTAL                  2.17 GiB / 60 GiB   0 B       2.17 GiB
+```bash
+setsid nohup $P dashboard_forward.py --to 192.168.1.74:8791 --listen 8791 \
+    > dashboard_forward.log 2>&1 < /dev/null &
 ```
 
-**`Managed 0 B` against 2.17 GiB resident is the `BLOCKERS.md` §5 blindness,
-reproduced exactly under Frisky.** Frisky cannot see icechunk's Rust
-allocations any better than Dask can. It did not matter: the task shape caps
-each worker at ~372 MiB — of which ~332 MiB is the pinned per-process store
-session — so there was nothing for a memory manager to get wrong. That is the
-argument of this whole directory in one table.
+Then `https://<hub>/user/<user>/proxy/8791/` — **trailing slash, no `/status`**
+(that is a Dask path; Frisky serves at `/`).
 
-`--nthreads 4` was the right call. 24 concurrent readers, 4% of the memory
-budget, no spilling, no worker deaths.
+The relay is needed because jupyter-server-proxy's bare `/proxy/<port>/` route
+always targets `127.0.0.1`, while the scheduler is bound to the LAN address the
+workers must reach; its `/proxy/<host>:<port>/` route is gated by
+`host_allowlist`, which defaults to localhost. Raw TCP, so the dashboard's
+WebSocket upgrade passes through.
 
-Output: `out/2026-07-02.npz`, **235.3 MB** against 304.8 MB of raw float32
-(30 channels x 2 arrays x 53 x 163 x 147 x 4 B) — **77.2%**. `NEXT_SESSION.md`
-§6.7 carried an assumed 40%; the measured figure is much worse than that.
-**Caveat: this is `numpy.savez_compressed` (zlib), not the icechunk/zarr codec
-path**, so treat it as indicative of the payload's compressibility, not as the
-store's ratio. The real number needs the sink write.
+No proxying needed for the terminal view:
 
-Two things this run did **not** establish:
+```bash
+$P -m frisky observe overview http://192.168.1.74:8791
+```
 
-- **Whether any 503s occurred.** `erred 0` only means no task failed
-  permanently. The backoff in `read_message` retries silently, so a throttled
-  read that succeeded on retry leaves no trace anywhere. That is an
-  instrumentation gap, not a clean bill of health — the retry should count and
-  report.
-- **AWS ingress volume.** The ~64 GB figure is derived from `MSG_MB = 0.788`
-  in `materialize_ea_icechunk_ewc.py`, not measured here. Frisky's byte
-  counters cover task output and worker-to-worker transfer, not the S3 fetch.
+### Step 4 — one day
 
-### Earlier, local, on the JupyterHub VM (8 GiB cgroup)
+```bash
+$P parallel_write.py --sink ea-cgan/v2-7day --date 2026-07-02 \
+     --channels 30 --members 51 --steps 53 --fork-once --env ../.env
+```
 
-| | |
+`--fork-once` forks a single session and pickles it to every task. Forking per
+block costs ~0.30 s each — 476 s of the 494 s a date took before.
+
+Expect ~340 s, ~1,590 blocks, one commit.
+
+### Step 5 — a month
+
+```bash
+$P build_corpus.py --sink ea-cgan/v3-june2026 \
+     --start 2026-06-01 --days 30 --env ../.env
+```
+
+Preallocates the whole `time` axis, so every write is a region write and dates
+are independent. One commit per date. Add `--resume` to skip dates already in
+the commit log — a date costs 81,090 messages and ~64 GB, so it should never be
+redone because a later one failed.
+
+Failed blocks are resubmitted over 4 rounds with a 45 s pause. The pause is the
+point: resubmitting into an active throttling window just burns the retries.
+
+### Step 6 — verify
+
+```bash
+$P check_chunks.py   --prefix ea-cgan/v3-june2026 --env ../.env   # completeness
+$P check_members.py  --prefix ea-cgan/v3-june2026 --env ../.env   # ensemble is real
+$P check_complete.py --prefix ea-cgan/v2-7day     --env ../.env   # single date only
+```
+
+**Do not trust "0 failed blocks".** `create_schema` pre-fills with zeros, so a
+write that never happened is indistinguishable from data: no error, right
+shape, right dtype, finite fraction 1.000.
+
+- `check_chunks.py` reads the **manifest** (~17 MB) and lists what was actually
+  written. Use this on a corpus.
+- `check_complete.py` reads every block. Right for one date (7.8 GB), hopeless
+  for 30 (233 GB).
+- `check_members.py` catches a `number` selection that silently broadcast, by
+  checking that ensemble **spread grows with lead time** — physics a broadcast
+  bug cannot fake.
+
+Expected on June 2026:
+
+```
+47,700 / 47,700 chunks, every channel 1,590, none missing
+gh500 spread 1.3073 -> 5.9305 from +0h to +168h
+VERDICT: members are REAL
+```
+
+---
+
+## 5. Reading the result
+
+```python
+import icechunk as ic, xarray as xr
+st = ic.s3_storage(bucket="must-icechunk", prefix="ea-cgan/v3-june2026",
+                   region="RegionOne",
+                   endpoint_url="https://object-store.os-api.cci1.ecmwf.int",
+                   access_key_id=AK, secret_access_key=SK,
+                   force_path_style=True, from_env=False)
+ds = xr.open_zarr(ic.Repository.open(st).readonly_session("main").store,
+                  consolidated=False, zarr_format=3, decode_timedelta=True)
+# (time: 30, step: 53, number: 51, latitude: 163, longitude: 147) x 30 channels
+```
+
+Chunks are `(1, 1, number, lat, lon)` — one chunk per (date, step), 4.9 MB.
+
+---
+
+## 6. Files
+
+| file | |
 |---|---|
-| `frisky demo`, 6,295 tasks | ✅ 15.7 s |
-| DAG shape, synthetic, 30 channels / 9,390 tasks | ✅ 33.0 s, 6 workers |
-| **Real read of `u700`**, 4 members × 2 steps | ✅ 29.0 s — dominated by 4 cold store opens |
-| **Real read of `u700 u850 u500`**, 16 members × 4 steps | ✅ **192 messages, 19.4 s, 6 workers** |
-| Write to `must-icechunk` | ⬜ not implemented; `--out` writes `.npz` only |
+| `frisky_daily_dag.py` | task functions: `read_message`, `write_block`, the channel table. Shipped to workers |
+| `parallel_write.py` | one date via fork/merge |
+| `build_corpus.py` | many dates, one commit each, resumable |
+| `sink_icechunk.py` | schema creation, merge+commit. Client only |
+| `deploy_workers.py` | install / scheduler / start / status / stop / bandwidth |
+| `check_chunks.py` | completeness from the manifest |
+| `check_complete.py` | completeness by reading blocks |
+| `check_members.py` | is the ensemble dimension real |
+| `bandwidth_probe.py` | throughput vs thread concurrency |
+| `procs_probe.py` | throughput vs **process** count — the one that found the real ceiling |
+| `dashboard_forward.py` | TCP relay so jupyter-server-proxy can serve the dashboard |
 
-The `u` runs are the point: `u` is the array that **never finishes graph
-construction** under `chunks={}`, and still costs 3.76 M tasks select-first.
-Read as futures it is 207 tasks and 19.4 s.
+---
 
-```
-tasks:   31/s   waiting=2 processing=8 finished=197
-cluster: workers=6  memory=878.2 MiB / 8.0 GiB (11%)
-sched:   busy=0.1%
-```
+## 7. Corrections
 
-- **9.9 messages/s** aggregate including cold opens; **31 tasks/s** warm on 6
-  single-threaded workers, i.e. ~0.19 s/message — consistent with the
-  0.23–0.25 s single-machine figure in `NEXT_SESSION.md` §2.
-- **878 MiB peak across all six workers** (~146 MB each), against
-  `test_single_date.py`'s 1,329 MB for `u` under the threaded scheduler.
-  Bounded by the task shape, not by a memory manager.
-- Scheduler **0.1% busy**. Submission of the whole graph took 0.01 s.
-- **No 503s** on this run; the backoff was never exercised, so it remains
-  untested against a real `SlowDown`.
-- The first run's 29 s for 8 messages is the store-open cost: ~5 s per worker
-  process, paid once per process, not per task.
+Claims made in this repo and later disproven, kept so they are not re-litigated:
 
-Extrapolating 31 tasks/s to the full 82,710-task date gives ~45 min on 6
-workers, ~11 min on 24. Not yet measured at that scale.
+1. **"Compression is 77.2%, the 40% assumption was badly wrong."** Wrong. That
+   measured `savez_compressed` over mean/sd, not the store. Measured three
+   times through icechunk on real payloads: 39.8%, 40.6%. The assumption held.
+2. **"The limit is bandwidth, not in-flight count; ~36 VMs for 1 GB/s."**
+   Wrong. Raising threads in one process cannot distinguish a saturated network
+   from a per-process connection cap. It was the latter.
+3. **"~20 VMs for 1 GB/s."** Also wrong, for a different reason: it counted
+   only the per-VM ceiling and ignored the shared AWS request-rate quota, which
+   already refuses at 96 concurrent readers.
+4. **"0 failed blocks means the date is complete."** No — the zero-fill hides
+   missing writes. Hence `check_chunks.py`.
+5. **A retry path that has never executed is not a working retry path.** The
+   `SlowDown` backoff went untested through every run until 192 concurrent
+   readers provoked AWS, and then had two bugs: the store open sat outside the
+   retry, and 6 attempts with no jitter meant every reader retried in lockstep.
