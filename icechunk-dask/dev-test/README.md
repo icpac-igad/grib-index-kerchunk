@@ -1,4 +1,9 @@
-# icechunk-virtual-dask
+# dev-test: how the realization was arrived at
+
+> **Archived.** These are the scripts and diagnoses from the Dask attempt
+> that preceded the working routine. The routine itself is one level up;
+> start at [`../README.md`](../README.md). Kept because the record of what
+> was tried and withdrawn is the useful part.
 
 Materialising an East Africa subset of the published **ECMWF IFS ensemble
 virtual Icechunk store** into a **realized Icechunk store** on the ECMWF
@@ -150,7 +155,7 @@ Two limits worth knowing before you debug anything:
 
 ```bash
 P=/opt/mamba/envs/dask/bin/python
-cd ~/cGAN_tutorial/icechunk-virtual-dask
+cd ~/grib-index-kerchunk/icechunk-dask/dev-test
 ```
 
 **1. Does the store read at all?** No cluster, no credentials needed. This is
