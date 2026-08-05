@@ -26,7 +26,7 @@ memory note in the header of `run()` -- but it is not nothing.
 
 Usage
 -----
-    P=/var/lib/private/nishadhka/cGAN_tutorial/icechunk-virtual-dask/frisky/.venv/bin/python
+    P=.venv/bin/python
 
     # exercise the DAG shape with no network at all
     $P frisky_daily_dag.py --synthetic --channels 4 --members 6 --steps 3
@@ -450,7 +450,7 @@ def run(args):
     if args.sink:
         import sink_icechunk as sink
         here = os.path.dirname(os.path.abspath(__file__))
-        ak, sk = sink.load_env(args.env or os.path.join(here, "..", ".env"))
+        ak, sk = sink.load_env(args.env or os.path.join(here, ".env"))
         repo, created = sink.open_sink(args.sink, ak, sk)
         already = sink.existing_channels(repo)
         print(f"sink     must-icechunk/{args.sink}"
@@ -590,7 +590,7 @@ def main():
                    help="this date lays down the schema (mode=w); omit to "
                         "append along `time`")
     p.add_argument("--env", default=None,
-                   help="path to the .env holding AK/SK (default ../.env)")
+                   help="path to the .env holding AK/SK (default ./.env)")
     p.add_argument("--synthetic", action="store_true",
                    help="no network: prove the DAG shape only")
     p.add_argument("--ramp", action="store_true",

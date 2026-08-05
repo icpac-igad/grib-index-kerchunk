@@ -54,7 +54,7 @@ def main():
     p.add_argument("--vars", nargs="+", default=None)
     p.add_argument("--members", type=int, default=51)
     p.add_argument("--steps", type=int, default=53)
-    p.add_argument("--env", default="../.env")
+    p.add_argument("--env", default=".env")
     p.add_argument("--fork-once", action="store_true",
                    help="fork ONE session and pickle it to every task, "
                         "instead of calling session.fork() per block. "

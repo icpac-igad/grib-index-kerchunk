@@ -26,7 +26,7 @@ EP_DEFAULT = "https://object-store.os-api.cci1.ecmwf.int"
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prefix", default="ea-cgan/v1-7day")
-    p.add_argument("--env", default="../.env")
+    p.add_argument("--env", default=".env")
     p.add_argument("--var", default=None, help="which channel to inspect")
     p.add_argument("--endpoint", default=EP_DEFAULT)
     args = p.parse_args()

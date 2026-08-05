@@ -71,7 +71,7 @@ async def main_async(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--prefix", required=True)
-    p.add_argument("--env", default="../.env")
+    p.add_argument("--env", default=".env")
     p.add_argument("--endpoint", default=EP_DEFAULT)
     args = p.parse_args()
     raise SystemExit(asyncio.run(main_async(args)))

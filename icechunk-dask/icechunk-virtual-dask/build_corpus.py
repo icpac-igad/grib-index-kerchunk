@@ -136,7 +136,7 @@ def main():
     p.add_argument("--channels", type=int, default=30)
     p.add_argument("--members", type=int, default=51)
     p.add_argument("--steps", type=int, default=53)
-    p.add_argument("--env", default="../.env")
+    p.add_argument("--env", default=".env")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--rounds", type=int, default=4,
                    help="resubmit rounds for blocks AWS throttled out")
