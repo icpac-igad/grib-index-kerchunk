@@ -114,18 +114,40 @@ self-consistent (1,247 commits, single branch, no tags, last written
 2026-07-07), but whether the GCS original is *ahead* of it was not checked —
 that needs GCS credentials.
 
-**2. `49r1/00z` is missing ten March 2026 dates.** 794 entries across the 804
-days it spans; every hole is in March 2026:
+**2. Date coverage, all three eras.** Full audit against `s3://ecmwf-forecasts/`:
+
+| era | span | dates | interior gaps | at source? | channels usable |
+|---|---|---|---|---|---|
+| `0p4` | 2023-01-18 → 2024-02-28 | 401/407 | **6** — 2023-04-27…05-02 | **no** — upstream | 22/30 |
+| `49r1` | 2024-02-29 → 2026-05-12 | 794/804 | **10** — March 2026 | **yes** — ours | 30/30 |
+| `50r1` | 2026-05-13 → 2026-07-02 | 51/51 | 0 | — | 30/30 |
+
+**The ten March 2026 dates are the only recoverable gap in the archive:**
 
 ```
 03-19, 03-22, 03-23, 03-24, 03-25, 03-26, 03-27, 03-29, 03-30, 03-31
 ```
 
-ECMWF **did** publish all ten — each has 177 objects and 87 `.index` files in
-`s3://ecmwf-forecasts/`, identical to a date that resolves. So this is a Stage 1
-gap, not an upstream one, and fixing it means re-scanning those dates into the
-virtual store and re-mirroring. Until then `ea-cgan/v4-mar2026-49r1` holds 21 of
-31 March dates, with the other ten reserved as unwritten slots.
+Each has 177 objects and 87 `.index` files at source, identical to a date that
+resolves — so this is a Stage 1 gap. Fixing it means re-scanning those dates and
+re-mirroring. Until then `ea-cgan/v4-mar2026-49r1` holds 21 of 31, the other ten
+reserved as unwritten slots.
+
+Everything else is not fixable or not a gap:
+
+- **`0p4`'s six days are upstream.** `20230427/` … `20230502/` return zero
+  objects even at the bare date prefix. Verified not to be a wrong-path
+  artifact: 2023-04-26 and 2023-05-03 both return 177 objects at
+  `{date}/00z/0p4-beta/enfo/`.
+- **Era boundaries are contiguous** — no date falls between eras.
+- **~35 days of tail staleness** after 2026-07-02. The last commit is
+  2026-07-07; the scan simply has not run since. Not corruption.
+
+**`0p4` also publishes only 19 variables** (49r1 has 59), so 8 of the 30
+channels do not exist there — `ssr`, `ttr`, `tcw`, `mucape`, and all four `w`
+levels (`w` is absent entirely). Its 9-level set covers every level the channel
+table uses, so the losses are variables, not levels. Realizing 0p4 would need
+era-aware channel trimming, which 49r1 and 50r1 do not.
 
 #### How big are they? (three different numbers -- don't conflate them)
 
