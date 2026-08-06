@@ -74,10 +74,45 @@ Consequences, both verified:
   not enter an exact lookup. That is why `read_message` works and why the June
   2026 realization (50r1, clean) never surfaced this.
 
-The cause is `append_dim="time"`. `build_corpus.py` never takes that path: it
-preallocates the whole coordinate sorted and writes regions into it, so the
-sink stores cannot acquire this defect no matter what order dates are committed
-in.
+**The fix, for a reader, is one line** — no re-scan, no rewrite:
+
+```python
+ds = ds.sortby("time")     # monotonic; slicing works; reads still resolve
+```
+
+**Cause, confirmed from the store's own commit log.** Each commit message
+carries `<group> <YYYYMMDD>: ... (time index N)`, so the log is a full record of
+what went where. Auditing all 1,246 date-commits:
+
+| | `0p4` | `49r1` | `50r1` |
+|---|---|---|---|
+| two different dates on one time index | **0** | **0** | **0** |
+| dates committed more than once | 0 | 0 | 0 |
+| `index == write order` | yes | yes | yes |
+| backfills (written after a later date) | 2 | 1 | 0 |
+
+**Nothing was lost or overwritten.** The whole defect is three backfill commits
+made on 2026-07-07:
+
+```
+0p4   20231206 -> index 399   (written after 20240228)
+0p4   20231207 -> index 400   (written after 20240228)
+49r1  20260506 -> index 793   (written after 20260512)
+```
+
+Those three displaced 85 dates in `0p4` and 7 in `49r1` from their sorted
+position. A backfill of an *earlier* date has nowhere to go but the tail — that
+is all this is. It is **not** a speed/ordering tradeoff; nothing about read
+throughput requires it.
+
+`build_corpus.py` never takes that path: it preallocates the whole coordinate
+sorted and writes regions into it, so the sink stores cannot acquire this defect
+no matter what order dates are committed in.
+
+**Not verified:** source.coop is a *mirror* of a GCS store. Its `main` is
+self-consistent (1,247 commits, single branch, no tags, last written
+2026-07-07), but whether the GCS original is *ahead* of it was not checked —
+that needs GCS credentials.
 
 **2. `49r1/00z` is missing ten March 2026 dates.** 794 entries across the 804
 days it spans; every hole is in March 2026:
