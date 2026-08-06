@@ -325,6 +325,30 @@ def subset_coords(era, date, members, steps, synthetic=False):
     }
 
 
+def available_dates(era, dates):
+    """Which of `dates` are actually on the source era's `time` axis.
+
+    The published virtual store is not gap-free.  `49r1/00z` carries 794 of the
+    804 calendar days it spans, and all ten holes fall in March 2026
+    (03-19, 03-22..27, 03-29..31) -- ECMWF published those dates, our Stage 1
+    scan simply never picked them up.  Without this check `build_corpus.py`
+    submits 1,590 blocks for a date that cannot resolve, waits out four retry
+    rounds at 45 s each, and only then calls it FAILED: ~3 minutes of pure
+    waiting per absent date, plus 81,090 doomed reads.
+
+    Membership is tested against the raw values, NOT a slice.  The 49r1 and
+    0p4 axes are non-monotonic -- one date was appended after a later batch, so
+    `t[0]`/`t[-1]` are not the min and max -- and pandas refuses partial slicing
+    on a non-monotonic DatetimeIndex with `KeyError`.  Exact-label lookup is
+    unaffected by the ordering, which is also why `read_message` keeps working.
+    """
+    import numpy as _np
+
+    ds = _open_era(era)
+    have = set(_np.datetime_as_string(ds.time.values, "D").tolist())
+    return [d for d in dates if d in have]
+
+
 def select_channels(args):
     """--vars by name, else the first --channels of the table."""
     if not getattr(args, "vars", None):

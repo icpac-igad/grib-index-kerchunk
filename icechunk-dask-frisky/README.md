@@ -11,9 +11,20 @@ Stage 1 is cheap and global: 15 GB of metadata standing in for ~620 TB of GRIB.
 Stage 2 is where the bytes actually move — reading a subset out of stage 1 and
 writing it down as arrays you can train on.
 
-**Status:** stage 2 is working. `must-icechunk/ea-cgan/v3-june2026` holds June
-2026 for East Africa — 30 dates × 30 channels × 51 members × 53 steps, 47,700
-chunks, 94.6 GB, verified complete, built in 176 minutes at 181 MB/s.
+**Status:** stage 2 is working. Two realized stores, both East Africa,
+30 channels × 51 members × 53 steps:
+
+| store | era | dates | chunks | built |
+|---|---|---|---|---|
+| `must-icechunk/ea-cgan/v3-june2026` | 50r1 | 30 (Jun 2026) | 47,700 | 176 min, 181 MB/s |
+| `must-icechunk/ea-cgan/v4-mar2026-49r1` | 49r1 | **21 of 31** (Mar 2026) | 33,390 | 134 min, ~215 msg/s |
+
+Both verified complete for every date they claim. March is 21 of 31 because the
+*source* store is missing ten dates (see "Known defects" below); their `time`
+slots are reserved and unwritten, so `--resume` fills them in place once Stage 1
+publishes them. The two stores are separate because a `time` axis is fixed at
+schema creation and 49r1/50r1 are different model versions — read them together
+with `xr.concat([mar, jun], dim="time").sortby("time")`.
 
 | document | contents |
 |---|---|
@@ -36,6 +47,50 @@ Published stores (bucket `e4drr-project`, endpoint `https://data.source.coop`):
 |---|---|---|---|
 | GEFS  | `forecasts/noaa_gefs_aws_s3_icechunk_vd`     | `0p25/00z`                     | 2031 |
 | ECMWF | `forecasts/ecmwf_ifs_ens_aws_s3_icechunk_vd` | `0p4/00z`, `49r1/00z`, `50r1/00z` | 401 / 794 / 51 |
+
+#### Known defects in the published store (measured 2026-08-05)
+
+Two problems, both in the ECMWF store, neither of which blocks a realization
+run but both of which will bite a reader. **Not yet fixed.**
+
+**1. Two of the three time axes are not sorted.** A date appended after a later
+batch stays where it was written, and nothing sorts it afterwards:
+
+| group | monotonic | where it breaks |
+|---|---|---|
+| `0p4/00z` | **no** | `… 2024-02-27, 2024-02-28, 2023-12-06, 2023-12-07` — an 83-date block landed ahead of two earlier dates |
+| `49r1/00z` | **no** | `… 2026-05-11, 2026-05-12, 2026-05-06` — one date backfilled after a later batch |
+| `50r1/00z` | yes | clean |
+
+Consequences, both verified:
+
+- `ds.sel(time=slice(a, b))` **raises** `KeyError: Value based partial slicing
+  on non-monotonic DatetimeIndexes` on `0p4` and `49r1`. It does not silently
+  return the wrong span — the failure is loud.
+- `t[0]` and `t[-1]` are **not** the min and max. `49r1`'s last positional entry
+  is 2026-05-06 while its true maximum is 2026-05-12. Any code deriving a date
+  range from the ends of the axis is wrong on these two groups; sort first.
+- Exact-label `ds.sel(time=np.datetime64(d))` is **unaffected** — ordering does
+  not enter an exact lookup. That is why `read_message` works and why the June
+  2026 realization (50r1, clean) never surfaced this.
+
+The cause is `append_dim="time"`. `build_corpus.py` never takes that path: it
+preallocates the whole coordinate sorted and writes regions into it, so the
+sink stores cannot acquire this defect no matter what order dates are committed
+in.
+
+**2. `49r1/00z` is missing ten March 2026 dates.** 794 entries across the 804
+days it spans; every hole is in March 2026:
+
+```
+03-19, 03-22, 03-23, 03-24, 03-25, 03-26, 03-27, 03-29, 03-30, 03-31
+```
+
+ECMWF **did** publish all ten — each has 177 objects and 87 `.index` files in
+`s3://ecmwf-forecasts/`, identical to a date that resolves. So this is a Stage 1
+gap, not an upstream one, and fixing it means re-scanning those dates into the
+virtual store and re-mirroring. Until then `ea-cgan/v4-mar2026-49r1` holds 21 of
+31 March dates, with the other ten reserved as unwritten slots.
 
 #### How big are they? (three different numbers -- don't conflate them)
 

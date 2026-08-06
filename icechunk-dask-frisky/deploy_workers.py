@@ -197,23 +197,66 @@ def _check_probe(dirname):
 
 
 def _worker_status(dirname):
-    import os, socket
-    pid, alive, tail = None, False, ""
+    """What is actually running on this VM.
+
+    `worker.pid` holds ONE line per launched process, so the old
+    `int(f.read().strip())` raised ValueError the moment --workers-per-vm was
+    2 -- and the bare `except` swallowed it, reporting `alive: False` for a VM
+    whose workers were healthy and executing tasks.  A status check that says
+    "dead" for a live cluster is worse than no status check.
+
+    `pgrep` is the authoritative count, not the pid file: --start records only
+    the most recent launch, so orphans from an earlier one are invisible to it
+    (the same reason `_stop_worker` matches on the command line).  A `running`
+    that exceeds `alive` means orphans -- and an orphan runs whatever version
+    of the task module it started with, which is the stale-module trap.
+    """
+    import os, socket, subprocess
+
+    def _count(pattern):
+        r = subprocess.run(["pgrep", "-fc", pattern],
+                           capture_output=True, text=True)
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return 0
+
+    pids = []
     try:
         with open(f"{dirname}/worker.pid") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        alive = True
+            pids = [int(x) for x in f.read().split() if x.strip()]
     except Exception:
         pass
+
+    alive = 0
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive += 1
+        except Exception:
+            pass
+
+    running = _count(f"{dirname}/.venv/bin/frisky worker")
+    sched = _count(f"{dirname}/.venv/bin/frisky scheduler")
+
+    # worker.log is mostly multi-KB JSON state dumps; slicing the last 300
+    # bytes of one is unreadable noise.  Show the last human-readable lines.
+    tail = []
     try:
         with open(f"{dirname}/worker.log") as f:
-            tail = f.read()[-300:]
+            for line in f.read().splitlines():
+                line = line.strip()
+                if line and not line.startswith("{") and len(line) < 200:
+                    tail.append(line)
     except Exception:
         pass
-    have_frisky = os.path.exists(f"{dirname}/.venv/bin/frisky")
-    return {"host": socket.gethostname(), "pid": pid, "alive": alive,
-            "venv": have_frisky, "log": tail.strip()[-200:]}
+
+    return {"host": socket.gethostname(),
+            "alive": f"{alive}/{len(pids)}" if pids else "0/0",
+            "running": running, "orphans": max(running - alive, 0),
+            "sched": sched, "venv": os.path.exists(
+                f"{dirname}/.venv/bin/frisky"),
+            "log": " | ".join(tail[-2:])}
 
 
 def _stop_worker(dirname):
@@ -403,7 +446,26 @@ def main():
                   f"({n * args.nthreads} concurrent readers)")
 
         if args.status:
-            show("status", c.run(_worker_status, REMOTE_DIR))
+            res = c.run(_worker_status, REMOTE_DIR)
+            # Totalled BEFORE show(), which pops "host" out of each dict.
+            running = sum(r["running"] for r in res.values())
+            orphans = sum(r["orphans"] for r in res.values())
+            sched = sum(r["sched"] for r in res.values())
+            show("status", res)
+            print(f"\n{running} frisky worker process(es) across "
+                  f"{len(res)} VMs, {sched} scheduler(s)")
+            if orphans:
+                print(f"WARNING: {orphans} orphan(s) -- not in any pid file, "
+                      f"so --start never stopped them.  An orphan runs the "
+                      f"task module it was\n         launched with, and "
+                      f"Frisky pickles task functions by reference.  "
+                      f"Run --stop, then --start.")
+            if not running:
+                print("no workers running -- ./deploy_workers.py "
+                      "--scheduler-on <ip> --start")
+            elif not sched:
+                print("workers are up but NO scheduler is running on these "
+                      "VMs; they cannot be dialling one here.")
 
         if args.stop:
             show("stopping", c.run(_stop_worker, REMOTE_DIR))

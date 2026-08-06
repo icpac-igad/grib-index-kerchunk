@@ -28,6 +28,20 @@ Resume
 Each date is its own commit, so `--resume` reads the commit log and skips
 dates already done.  A date costs 81,090 messages and ~64 GB of egress; none
 of that should ever be repeated because a later date failed.
+
+Holes in the source
+-------------------
+The published virtual store is not gap-free -- `49r1/00z` is missing ten March
+2026 dates that ECMWF did publish.  Requested dates absent from the source axis
+are SKIPPED, but their `time` slots are still reserved by the schema.  An
+unwritten slot has no chunks in the manifest, so `check_chunks.py` names it
+precisely instead of `create_schema`'s zero-fill passing it off as data.  When
+Stage 1 catches up, `--resume` writes those slots in place: they are region
+writes into a coordinate that was laid down sorted, so filling March 19th after
+March 31st cannot put the axis out of order.  That ordering guarantee is a
+property of preallocation, NOT of the commit sequence -- the source store's own
+non-monotonic axes came from `append_dim="time"`, a path this script never
+takes.
 """
 from __future__ import annotations
 
@@ -40,6 +54,19 @@ import frisky_daily_dag as dag
 import sink_icechunk as sink
 
 DONE_PREFIX = "date "          # commit message marker, parsed by --resume
+
+
+def _rss_gb():
+    """Client resident memory. The gateway cgroup is 8 GiB and the client
+    gathers one ForkSession per block, so this is worth watching."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        pass
+    return float("nan")
 
 
 def date_range(start, days):
@@ -108,9 +135,23 @@ def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
         retried += len(still)
         pending = still
         if rnd < rounds - 1:
-            print(f"          retry {len(still)} block(s) "
+            # Print WHY, not just how many.  This path used to report a bare
+            # count, which is useless for telling AWS throttling (retrying is
+            # the right response) apart from the client's channel dropping
+            # (retrying cannot possibly work, and the pause just delays the
+            # inevitable).  Group by exception type and show one example each.
+            tally = {}
+            for e in errs:
+                tally.setdefault(e.split(":")[0], []).append(e)
+            print(f"          retry {len(still)} block(s) of {len(futures)} "
                   f"(round {rnd + 2}/{rounds}) after {pause}s pause",
                   flush=True)
+            for kind, group in sorted(tally.items(),
+                                      key=lambda kv: -len(kv[1])):
+                print(f"            {len(group):5d}x {kind}: "
+                      f"{group[0][:150]}", flush=True)
+            print(f"            client rss {_rss_gb():.2f} GB, "
+                  f"{len(forks)} forks held", flush=True)
             time.sleep(pause)
     else:
         return None, submit_s, time.time() - t0, 0.0, errs, retried
@@ -175,6 +216,18 @@ def main():
     client = frisky.Client(args.scheduler)
     coords = dag.subset_coords(args.era, dates[0], members, steps)
 
+    # Which dates does the SOURCE actually have?  The schema still reserves a
+    # slot for every requested date -- an absent one is left unwritten, so it
+    # is absent from the manifest too and `check_chunks.py` names it exactly,
+    # rather than being zero-filled into something that looks like data.
+    # A later `--resume` fills those reserved slots in place as region writes.
+    present = set(dag.available_dates(args.era, dates))
+    absent = [d for d in dates if d not in present]
+    if absent:
+        print(f"source   {len(present)}/{len(dates)} dates on the {args.era} "
+              f"axis; {len(absent)} absent, slots reserved but unwritten:")
+        print(f"         {', '.join(absent)}")
+
     if created or not args.resume:
         t = time.time()
         snap = sink.create_schema(repo, names, coords, dates)
@@ -183,10 +236,15 @@ def main():
 
     print()
     t_all = time.time()
+    todo = [d for d in dates if d in present and d not in done]
     ok, bad = [], []
     for i, date in enumerate(dates):
         if date in done:
             print(f"[{i + 1:2d}/{len(dates)}] {date}  skipped (committed)")
+            continue
+        if date not in present:
+            print(f"[{i + 1:2d}/{len(dates)}] {date}  skipped "
+                  f"(absent from {args.era} source)")
             continue
         snap, sub, rd, mg, failed, retried = run_one_date(
             client, repo, channels, members, steps, args.era, date, i,
@@ -198,7 +256,9 @@ def main():
             continue
         ok.append(date)
         rate = len(channels) * len(members) * len(steps) / rd
-        eta = (time.time() - t_all) / len(ok) * (len(dates) - i - 1)
+        # ETA over the dates still to DO, not the calendar days left -- with
+        # ten absent dates those differ by a third of the month.
+        eta = (time.time() - t_all) / len(ok) * max(len(todo) - len(ok), 0)
         print(f"[{i + 1:2d}/{len(dates)}] {date}  {rd:6.1f}s  "
               f"{rate:6.1f} msg/s  submit {sub:4.1f}s  merge {mg:4.1f}s  "
               f"retried {retried:4d}  -> {str(snap)[:12]}   "
@@ -206,7 +266,12 @@ def main():
 
     client.close()
     mins = (time.time() - t_all) / 60
-    print(f"\n{len(ok)}/{len(dates)} dates in {mins:.1f} min")
+    print(f"\n{len(ok)}/{len(todo)} available dates in {mins:.1f} min "
+          f"({len(dates)} slots reserved)")
+    if absent:
+        print(f"absent from source ({len(absent)}): {', '.join(absent)}")
+        print("  slots reserved and unwritten -- rerun with --resume once "
+              "Stage 1 publishes them")
     if bad:
         print(f"FAILED dates: {[d for d, _ in bad]}")
         print("rerun with --resume to retry only those")
