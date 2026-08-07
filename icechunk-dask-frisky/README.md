@@ -129,6 +129,47 @@ arbitrary message (decoded: `t`→300 hPa, `gh`→400 hPa — random survivors),
 12 of 13 levels are simply absent. `build_ecmwf_icechunk.py:103-111` detects
 this up front and refuses the date rather than writing silently-wrong refs.
 
+> ### UPDATE 2026-08-07 — the ten dates are FIXED in the GCS store
+>
+> Root cause confirmed: the pars were generated 2026-04-08 against the
+> **pre-per-level-fix** template, so every pl chunk key lost its level segment.
+> The three March dates that *were* in the store (`20260320/21/28`) had been
+> regenerated 2026-06-22/23, after the fix — same window, different template.
+>
+> Regenerated all ten with `gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz`:
+>
+> | | refs | pl refs | malformed | levels |
+> |---|---|---|---|---|
+> | `20260320` (known good) | 13,175 | 9,945 | 0 | 13 |
+> | the ten, **before** | 3,995 | 765 | **765** | **0** |
+> | the ten, **after** | 13,175 | 9,945 | 0 | 13 |
+>
+> Then folded into `gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens`:
+> **1,257 commits** (was 1,247), **49r1 axis 804** (was 794),
+> **March 2026 31/31**, **zero interior gaps in the whole era**.
+>
+> Verified by decode, not just by structure — `t` at 500/700/850 hPa returns
+> **266.7 / 282.3 / 290.1 K**: distinct, and increasing with pressure. A
+> collapsed-level par returns three *identical* values, so this is the check
+> that actually proves the fix.
+>
+> **Two things this did NOT fix:**
+> - **source.coop still lacks them.** The table above describes the *published*
+>   store, which is unchanged until `mirror_gcs_to_source_coop.py` is re-run.
+> - **HuggingFace `E4DRR/gik-ecmwf-par-v2` still holds the defective pars** —
+>   verified: `20260319` there is still `malformed=765, levels=0`. Anyone
+>   rebuilding from HF reintroduces the bug. This is also why
+>   `backfill_all_eras.py` could **not** be used: it fetches pars from HF. The
+>   fix was applied by driving `build_ecmwf_icechunk.py` directly — the same
+>   builder that driver shells out to — with pars pulled from the GCS path the
+>   HF catalog itself records as `gcs_path`. Re-mirroring to HF needs a write
+>   token.
+>
+> Rollback: reset `main` to `2PAFARG4ADKVXFKWHDD0` to undo all ten commits.
+>
+> Remaining to make `ea-cgan/v4-mar2026-49r1` complete: re-mirror to
+> source.coop, then `build_corpus.py --resume` fills the ten reserved slots.
+
 **They cannot be filled from the existing pars.** The chain is:
 
 1. regenerate the pars — `run_lithops_ecmwf.py` for those 10 dates at 00z, era
