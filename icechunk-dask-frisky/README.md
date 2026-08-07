@@ -605,3 +605,34 @@ Claims made in this repo and later disproven, kept so they are not re-litigated:
    `SlowDown` backoff went untested through every run until 192 concurrent
    readers provoked AWS, and then had two bugs: the store open sat outside the
    retry, and 6 attempts with no jitter meant every reader retried in lockstep.
+6. **"A missing flag is a no-op."** No — on 2026-08-07 it destroyed the corpus.
+   `create_schema` writes with `mode="w"`, and the schema step used to fire on
+   `created or not args.resume`. `--repair` does not set `--resume`, so the
+   first `--repair` run laid a fresh schema over a live store: **30 committed
+   dates, 47,700 chunks, unreachable in one commit**, and it had begun
+   rewriting 2026-03-01 onward before it was killed.
+
+   Recovered in full, and *only* because icechunk keeps history:
+
+   ```python
+   repo.reset_branch("main", "4T207CZEYKTR6SQHVSCG")   # last good snapshot
+   ```
+
+   Verified by reading data back, not by counting commits — a restored commit
+   count proves nothing about chunks.
+
+   Three habits this cost, all cheap, none of which were followed:
+
+   - **Note the HEAD snapshot id before any run that can write.** It is the
+     entire recovery path. `list(repo.ancestry(branch="main"))[0].id`.
+   - **Dry-run a new destructive code path read-only first.** The manifest diff
+     was correct all along; one read-only call would have shown `1,590 missing
+     on one date` instead of `49,290 across 31`, and the wipe would have been
+     obvious before any write.
+   - **Distrust a suspiciously fast answer.** The wiped store's manifest read
+     took 0.1 s against 2.0 s healthy. That number was visible on screen and
+     misread as a query bug rather than an empty store.
+
+   Guard now in place: the schema is written only for a store the invocation
+   *created*; overwriting an existing one needs `--recreate`; the bare command
+   exits 1 naming `--resume` / `--repair` / `--recreate`.
