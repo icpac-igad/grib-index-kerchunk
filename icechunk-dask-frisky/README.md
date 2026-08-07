@@ -572,8 +572,35 @@ Claims made in this repo and later disproven, kept so they are not re-litigated:
 3. **"~20 VMs for 1 GB/s."** Also wrong, for a different reason: it counted
    only the per-VM ceiling and ignored the shared AWS request-rate quota, which
    already refuses at 96 concurrent readers.
-4. **"0 failed blocks means the date is complete."** No — the zero-fill hides
-   missing writes. Hence `check_chunks.py`.
+4. **"0 failed blocks means the date is complete."** Still true — a write that
+   never happened is not an error. But the *reason* given here was wrong, and
+   it was wrong in a way that mattered.
+
+   The claim used to read: "the zero-fill hides missing writes … right shape,
+   right dtype, finite fraction 1.000." **There is no zero-fill.**
+   `create_schema` goes through `to_zarr(compute=False)`, which writes metadata
+   only — the `dask.zeros` are never materialised — and xarray's float32
+   encoding leaves `fill_value` as **NaN**. Measured 2026-08-07 on both stores:
+
+   ```
+   ea-cgan/v3-june2026        dtype float32  fill_value nan
+   ea-cgan/v4-mar2026-49r1    dtype float32  fill_value nan
+   ```
+
+   So an unwritten chunk reads back **all-NaN, `finite 0.000`** — loud, not
+   plausible. It cannot masquerade as data. That is what makes `--repair` and
+   PARTIAL commits safe: a hole announces itself.
+
+   `check_chunks.py` is still the right tool, for a different reason: reading
+   every block to find the NaNs costs the whole store (233 GB for a month),
+   while the manifest answers the same question in ~17 MB. And since dates can
+   now be committed `PARTIAL`, the commit log alone is no longer a completeness
+   signal either.
+
+   One trap this leaves in `check_complete.py`: its `all-zero, MISSING` counter
+   uses `np.any(blk)`, and `np.any` on an all-NaN block is **True** — so an
+   unwritten block never reaches that counter. It surfaces under `nonfinite`
+   instead. Read that line, not the "MISSING" one.
 5. **A retry path that has never executed is not a working retry path.** The
    `SlowDown` backoff went untested through every run until 192 concurrent
    readers provoked AWS, and then had two bugs: the store open sat outside the
