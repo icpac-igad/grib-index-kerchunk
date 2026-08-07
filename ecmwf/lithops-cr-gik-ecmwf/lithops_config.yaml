@@ -29,7 +29,7 @@ gcp:
     credentials_path: service_account/ecmwf-lithops-deployer-key.json
 
 gcp_cloudrun:
-    runtime: gcr.io/e4drr-crafd/ecmwf-lithops-runtime
+    runtime: gcr.io/e4drr-crafd/ecmwf-lithops-runtime:50r1
     runtime_memory: 2048       # 2 GB
     runtime_cpu: 2             # 2 vCPUs
     runtime_timeout: 3600      # 1 hour

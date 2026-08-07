@@ -4,13 +4,125 @@ Lithops-native Cloud Run deployment for ECMWF ensemble forecast parquet generati
 
 **Project**: `e4drr-crafd`
 **Region**: `europe-west3` (Frankfurt - co-located with ECMWF S3 data in AWS `eu-central-1`)
-**GCS Output**: `gs://gik-ecmwf-aws-tf/run_par_ecmwf/`
+**GCS Output**: `gs://gik-ecmwf-aws-tf/v20260623_run_par_ecmwf/`
+(the `run_par_ecmwf/` path without the version prefix is the **legacy, pre-per-level-fix** catalog — never write there)
 **Service Account**: `ecmwf-lithops-deployer@e4drr-crafd.iam.gserviceaccount.com`
+
+---
+
+## Upstream sync — porting the working method from the private repo
+
+> **Status: APPLIED 2026-08-07** from `cno-e4drr/devops/lithops_cr_ecmwf_gik/`
+> (private). `run_lithops_ecmwf.py`, `Dockerfile` and `lithops_config.yaml` are
+> now byte-identical to the private copies; 23 files were added. Verified: no
+> key material, `terraform/`, `service_account/`, `*.orig` or
+> `.ipynb_checkpoints/` crossed over.
+>
+> ⚠️ **One post-sync action required** — see *Credential path* below.
+
+### ⚠️ Credential path — action required
+
+`lithops_config.yaml:29` expects the deployer key at:
+
+```
+service_account/ecmwf-lithops-deployer-key.json
+```
+
+but in this repo the key currently sits at the directory root
+(`ecmwf-lithops-deployer-key.json`). **A run will fail to authenticate until
+these agree.** Pick one:
+
+```bash
+# (a) match the private layout -- covered by the root .gitignore rule
+#     `**/service_account/*.json`
+mkdir -p service_account && git mv --force 2>/dev/null; \
+  mv ecmwf-lithops-deployer-key.json service_account/
+
+# (b) or point the config at the current location
+#     lithops_config.yaml: credentials_path: ecmwf-lithops-deployer-key.json
+#     (already ignored by the root rule `**/*-key.json`)
+```
+
+Option (a) keeps this directory identical to the private one, which is why
+`lithops_config.yaml` is shipped that way. After either, confirm the key is
+still ignored:
+
+```bash
+git check-ignore -v <path-to-key>      # must print a matching rule
+```
+
+The authoritative deployment lives in the **private** `cno-e4drr` repo. This
+public copy has drifted: **3 code files differ** and **24 files are absent**.
+Two of the three differences are correctness traps, not cosmetics.
+
+### Where the template is actually chosen — it is NOT `TEMPLATE_URL`
+
+This is the part that is easy to get wrong. `TEMPLATE_URL` is **dead code on
+Cloud Run**. The real chain is build-time:
+
+```
+cloudbuild.yaml  --substitutions=_TEMPLATE_ARTIFACT=<tarball>
+   -> Dockerfile ARG TEMPLATE_ARTIFACT           (default: ...-50r1.tar.gz)
+   -> curl into /opt/ecmwf_templates/<tarball>   (baked into the image)
+   -> ENV ECMWF_TEMPLATE_PATH=/opt/ecmwf_templates/<tarball>
+   -> ensure_template() returns ECMWF_TEMPLATE_PATH BEFORE reading TEMPLATE_URL
+```
+
+So **the image tag *is* the template**, and `lithops_config.yaml: runtime:`
+picks the tag. Exporting `TEMPLATE_URL` cannot override an era.
+
+| era | image tag | `_TEMPLATE_ARTIFACT` | `_REFERENCE_DATE` | `_RESOLUTION` | `_CONTROL_STREAM` |
+|---|---|---|---|---|---|
+| 0p4 | `:0p4` | `gik-fmrc-v2ecmwf_fmrc-0p4-beta.tar.gz` | `20230601` | `0p4` | `enfo` |
+| 49r1 | `:49r1` | `gik-fmrc-v2ecmwf_fmrc-49r1-perlevel.tar.gz` | `20250515` | `0p25` | `enfo` |
+| 50r1 | `:50r1` | `gik-fmrc-v2ecmwf_fmrc-50r1.tar.gz` | `20260513` | `0p25` | `oper` |
+
+`cloudbuild.yaml` here is **already identical** to the private copy, so the
+per-era build substitutions are in place. Only the three files below need work.
+
+### Files to update
+
+| file | change | why it matters |
+|---|---|---|
+| `run_lithops_ecmwf.py` | `GCS_PARQUET_PREFIX` default `run_par_ecmwf` → **`v20260623_run_par_ecmwf`** | **Correctness.** The legacy path holds *pre-fix* pars whose pl chunk keys lost the level segment — 13 pressure levels collapsed onto one arbitrary message. Anyone running this copy without exporting the env var silently uses the broken catalog. |
+| `run_lithops_ecmwf.py` | add **`forecast_hours_for_run(run)`**; use it at the two `ALL_FORECAST_HOURS` call sites | **Correctness + cost.** 00z/12z are 85 steps; 06z/18z stop at +144h (49 steps). Without it a 06z date issues 36 × 51 = **1,836 futile ranged GETs** against a throttling bucket. |
+| `run_lithops_ecmwf.py` | PEP 723 pin `lithops==3.6.3` → **`3.6.4`** | Must match the deployed runtime. |
+| `Dockerfile` | `lithops` → **`lithops==3.6.4`**; drop `namegenerator` | Client/runtime version parity — an unpinned install drifts from the client. |
+| `lithops_config.yaml` | `runtime: …/ecmwf-lithops-runtime` → **`…:50r1`** (era tag) | **Switch 2.** An untagged runtime does not name an era; a mismatch against the exported `ECMWF_*` env is **silent** — it writes 0 files or 50, never an error. |
+
+### Files added (23)
+
+| group | files |
+|---|---|
+| **era/cycle tooling** | `era_check.py` (era reference + preflight + GCS verify), `fix_cycle_boundary_dates.sh` |
+| **cycle runbooks** | `cycles/README.md`, `cycles/{06z,12z,18z}/PLAN.md`, `cycles/{06z,12z,18z}/RESULTS.md` |
+| **wave drivers** | `run_cycle_waves.sh`, `run_cycle_herbie_gate.sh`, `rebake_50r1_00z.sh`, `run_jan2026_backfill.sh` |
+| **build/deploy notes** | `.dockerignore`, `DEPLOYMENT_PLAN.md`, `DEPLOYMENT_SUCCESS.md`, `ECFLOW_50R1_OPERATIONALIZATION.md`, `ECMWF_00Z_BACKFILL_SUMMARY.md`, `FILENAME_STRUCTURE_UPDATE.md`, the three `*-DONE*.md` era build records |
+| **misc** | `logs/.gitignore` |
+
+### Never copy
+
+`service_account/*.json` (live deployer key), `terraform/terraform.tfvars`,
+`logs/*.log`, `**/.ipynb_checkpoints/`, `*.orig`. The repo-root `.gitignore`
+covers the key patterns — verify with `git check-ignore -v <path>` before adding.
+
+### Verify after syncing
+
+```bash
+export GCS_PARQUET_PREFIX=v20260623_run_par_ecmwf AWS_NO_SIGN_REQUEST=YES
+export ECMWF_REFERENCE_DATE=20250515 ECMWF_RESOLUTION=0p25 ECMWF_CONTROL_STREAM=enfo
+uv run era_check.py preflight --run 00 --date 20260319   # do both switches agree?
+uv run era_check.py verify --run 00 --start 20260319 --end 20260319
+```
+
+`preflight` is the check that catches the silent era mismatch; it compares the
+exported env against the `runtime:` tag in `lithops_config.yaml`.
 
 ---
 
 ## Table of Contents
 
+0. [Upstream sync — porting the working method](#upstream-sync--porting-the-working-method-from-the-private-repo)
 1. [What This Does](#what-this-does)
 2. [How Lithops Works](#how-lithops-works)
 3. [Architecture](#architecture)

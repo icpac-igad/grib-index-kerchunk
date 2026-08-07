@@ -1,0 +1,5 @@
+# Per-wave lithops logs are large (~2 MB/cycle, mostly stack traces) and are
+# reproducible from the run. The distilled record for each cycle is committed
+# under cycles/<cycle>/ (summary.log, driver_final.log, RESULTS.md).
+*
+!.gitignore

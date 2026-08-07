@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+
+# Documentation (keep README.md for uv sync)
+CHANGELOG.md
+RELEASING.md
+DEPLOYMENT_GUIDE.md
+*.mdx
+
+# Terraform
+*.tf
+*.tfvars
+.terraform/
+*.tfstate
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Data files (large, not needed in container)
+*.nc
+*.grib2
+*.parquet
+*.zarr/
+*.zip
+*.tar.gz
+output_parquet/
+ecmwf_*/
+cgan_output/
+
+# Test files
+test_*.py
+*_test.py
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+cloudbuild.yaml

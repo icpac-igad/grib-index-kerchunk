@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install lithops + proxy dependencies + processing dependencies in one layer
 RUN pip install --no-cache-dir \
-        lithops \
+        lithops==3.6.4 \
         gunicorn \
         flask \
         gevent \
@@ -34,7 +34,6 @@ RUN pip install --no-cache-dir \
         numpy \
         ps-mem \
         tblib \
-        namegenerator \
         cryptography \
         httplib2 \
         google-cloud-storage \

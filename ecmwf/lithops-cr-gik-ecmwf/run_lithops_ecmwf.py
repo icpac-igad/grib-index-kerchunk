@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "lithops==3.6.3",
+#     "lithops==3.6.4",  # MUST match the deployed Cloud Run runtime (Dockerfile pins ==3.6.4)
 #     "google-cloud-storage",
 #     "google-cloud-pubsub",
 #     "google-api-python-client",
@@ -106,7 +106,9 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 GCS_BUCKET = os.environ.get('GCS_BUCKET', 'gik-ecmwf-aws-tf')
-GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', 'run_par_ecmwf')
+# v20260623 = versioned catalog of the per-level-keys-FIXED reprocess (4ca1c21).
+# The legacy 'run_par_ecmwf' path holds pre-fix (collapsed pressure-level) data.
+GCS_PARQUET_PREFIX = os.environ.get('GCS_PARQUET_PREFIX', 'v20260623_run_par_ecmwf')
 PARALLEL_WORKERS = int(os.environ.get('PARALLEL_WORKERS', '4'))
 
 TEMPLATE_URL = os.environ.get(
@@ -118,6 +120,17 @@ TEMPLATE_URL = os.environ.get(
 HOURS_3H = list(range(0, 145, 3))       # 0-144h at 3h intervals (49 steps)
 HOURS_6H = list(range(150, 361, 6))     # 150-360h at 6h intervals (36 steps)
 ALL_FORECAST_HOURS = HOURS_3H + HOURS_6H  # Total: 85 steps
+
+
+def forecast_hours_for_run(run: str) -> List[int]:
+    """Forecast hours published for a given cycle.
+
+    00z/12z are full-length ensembles (0-360h, 85 steps); 06z/18z are short
+    (0-144h, 49 steps) -- S3-verified: +150h and beyond are 404 for those cycles.
+    Asking for the missing 36 steps still costs 36 x 51 = 1836 futile ranged GETs
+    per date against a bucket that throttles, so scope the loop to the cycle.
+    """
+    return ALL_FORECAST_HOURS if str(run).zfill(2) in ('00', '12') else HOURS_3H
 
 REFERENCE_DATE = os.environ.get('ECMWF_REFERENCE_DATE', '20240529')
 S3_BUCKET = "ecmwf-forecasts"
@@ -366,7 +379,7 @@ def build_refs_from_indices(
 ) -> Dict[str, Any]:
     """Build references for a member using S3 index files."""
     if hours is None:
-        hours = ALL_FORECAST_HOURS
+        hours = forecast_hours_for_run(run)
 
     all_refs = {}
 
@@ -470,7 +483,7 @@ def process_single_member_stage2(args: tuple) -> Tuple:
             date_str=date_str,
             run=run,
             member_name=member_normalized,
-            hours=ALL_FORECAST_HOURS
+            hours=forecast_hours_for_run(run)
         )
 
         if refs:
