@@ -1,6 +1,11 @@
 # local-only working data
 pars/
 stores/
+
+# Service-account keys live in this directory.  No .json here is ever meant to
+# be tracked, so ignore the extension outright rather than chase key names --
+# that is exactly how coiled-data-e4drr_202505.json escaped the root patterns.
+*.json
 note.txt
 .ipynb_checkpoints/
 note*.txt

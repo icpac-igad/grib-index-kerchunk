@@ -1,9 +1,16 @@
 # --- Secrets / service-account credentials (NEVER commit) ---
+# Patterns are GLOBBED, not exact: `**/coiled-data.json` did NOT match
+# `coiled-data-e4drr_202505.json`, which sat untracked-but-unignored in
+# ecmwf/icechunk-par/ -- one `git add .` from being published.
 **/service_account/*.json
-**/coiled-data.json
+**/coiled-data*.json
 **/*-key.json
 *-deployer-key.json
 gcp-*-key.json
+**/*service_account*.json
+**/*service-account*.json
+**/*credentials*.json
+**/*-sa.json
 # .env files (HF tokens etc.)
 .env
 **/.env
