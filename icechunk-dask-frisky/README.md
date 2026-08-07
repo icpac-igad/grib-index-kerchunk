@@ -109,10 +109,40 @@ throughput requires it.
 sorted and writes regions into it, so the sink stores cannot acquire this defect
 no matter what order dates are committed in.
 
-**Not verified:** source.coop is a *mirror* of a GCS store. Its `main` is
-self-consistent (1,247 commits, single branch, no tags, last written
-2026-07-07), but whether the GCS original is *ahead* of it was not checked —
-that needs GCS credentials.
+**source.coop is NOT behind the GCS original.** The counts reconcile exactly:
+
+```
+0p4    407 days - 6 never published = 401    store has 401
+49r1   804 days - 10 defective pars = 794    store has 794
+50r1    51 days                     =  51    store has  51
+                                      1,246  = 1,256 buildable - 10 defective
+```
+
+and `ecmwf/icechunk-par/era_check.py` §F puts the full 00z corpus at 1,256. So
+the mirror is complete and the ten March dates are the only absentees.
+
+**Why those ten are missing — they were rejected, not missed.**
+`ecmwf/icechunk-par/BACKFILL_RETRY_RUNBOOK.md` §4–5 documents them: the pars for
+`20260319`, `20260322`–`20260327`, `20260329`–`20260331` have **pl chunk keys
+missing the level segment**, so all 13 pressure levels collapsed onto one
+arbitrary message (decoded: `t`→300 hPa, `gh`→400 hPa — random survivors), and
+12 of 13 levels are simply absent. `build_ecmwf_icechunk.py:103-111` detects
+this up front and refuses the date rather than writing silently-wrong refs.
+
+**They cannot be filled from the existing pars.** The chain is:
+
+1. regenerate the pars — `run_lithops_ecmwf.py` for those 10 dates at 00z, era
+   49r1 (`ECMWF_REFERENCE_DATE=20250515`, `ECMWF_RESOLUTION=0p25`,
+   `ECMWF_CONTROL_STREAM=enfo`, runtime tag `:49r1`), mirror to HF/GCS
+2. `backfill_all_eras.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens`
+   — resume finds the gaps and folds them in as out-of-order appends
+3. re-mirror the store to source.coop
+4. `build_corpus.py --resume` fills the ten reserved slots in
+   `ea-cgan/v4-mar2026-49r1`
+
+Step 1 needs the **deployer** identity
+(`ecmwf-lithops-deployer@e4drr-crafd`); the `coiled-data-e4drr` key is 403 on
+`gik-ecmwf-aws-tf` and `gik-gefs-aws-tf` and cannot list buckets in the project.
 
 **2. Date coverage, all three eras.** Full audit against `s3://ecmwf-forecasts/`:
 
