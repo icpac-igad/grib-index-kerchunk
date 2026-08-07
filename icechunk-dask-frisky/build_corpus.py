@@ -76,19 +76,62 @@ def date_range(start, days):
 
 
 def committed_dates(repo):
-    """Dates already committed, read back off the commit log."""
-    done = set()
+    """(complete, partial) date sets, read back off the commit log.
+
+    A commit no longer implies a COMPLETE date -- `run_one_date` now commits
+    the blocks that landed rather than discarding a whole date for one bad
+    block, and labels such a commit PARTIAL. So `--resume` must key off
+    completeness, not mere presence, or it would skip a date full of holes.
+
+    Ancestry is newest-first, so the first mention of a date is its current
+    state: a repaired date's later complete commit correctly overrides the
+    earlier PARTIAL one.
+    """
+    complete, partial = set(), set()
     try:
         for s in repo.ancestry(branch="main"):
-            if s.message.startswith(DONE_PREFIX):
-                done.add(s.message[len(DONE_PREFIX):].split(":")[0].strip())
+            msg = s.message or ""
+            if not msg.startswith(DONE_PREFIX):
+                continue
+            d = msg[len(DONE_PREFIX):].split(":")[0].strip()
+            if d in complete or d in partial:
+                continue                      # already saw a newer commit
+            (partial if "PARTIAL" in msg else complete).add(d)
     except Exception:
         pass
-    return done
+    return complete, partial
+
+
+def missing_blocks(repo, channel_names, n_dates, n_steps):
+    """Blocks in the schema but absent from the MANIFEST -> [(t_idx, name, s_idx)].
+
+    The manifest is the only honest source here. A chunk that was never
+    written simply is not in it; reading the array instead would return
+    `fill_value` (nan for this store) which tells you nothing about whether a
+    write was attempted.
+
+    Costs one manifest read, not a data read -- the same trick `check_chunks.py`
+    uses to audit a corpus without pulling 233 GB.
+    """
+    import asyncio
+
+    sess = repo.readonly_session("main")
+
+    async def go():
+        miss = []
+        for name in channel_names:
+            have = {(c[0], c[1]) async for c in sess.chunk_coordinates(f"/{name}")}
+            for ti in range(n_dates):
+                for si in range(n_steps):
+                    if (ti, si) not in have:
+                        miss.append((ti, name, si))
+        return miss
+
+    return asyncio.run(go())
 
 
 def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
-                 rounds=4, pause=45):
+                 rounds=4, pause=45, pending=None):
     """1,590 blocks for one date, one shared fork, one commit.
 
     Blocks that fail are RESUBMITTED rather than failing the date.  AWS
@@ -104,9 +147,11 @@ def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
     session = repo.writable_session("main")
     fork = session.fork()
 
-    pending = [(var, level, name, si, step_h)
-               for var, level, name in channels
-               for si, step_h in enumerate(steps)]
+    if pending is None:
+        pending = [(var, level, name, si, step_h)
+                   for var, level, name in channels
+                   for si, step_h in enumerate(steps)]
+    n_total = len(pending)
 
     t0 = time.time()
     forks, submit_s, retried = [], 0.0, 0
@@ -154,7 +199,28 @@ def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
                   f"{len(forks)} forks held", flush=True)
             time.sleep(pause)
     else:
-        return None, submit_s, time.time() - t0, 0.0, errs, retried
+        # Rounds exhausted.  COMMIT WHAT LANDED rather than discarding it.
+        #
+        # This path used to `return None` before merging, so one unrecovered
+        # block out of 1,590 threw away the other 1,589 -- ~81,000 GRIB
+        # messages and ~64 GB of egress already paid for.  That happened to
+        # 2026-03-23 on the March fill.
+        #
+        # Committing the partial set is safe because every write is a region
+        # write into an array `create_schema` already laid out: a missing chunk
+        # is simply absent from the manifest, and reads return the array's
+        # fill_value (nan here), so a hole is loud rather than plausible.
+        # The commit is labelled PARTIAL so `--resume` will not mistake it for
+        # a finished date, and `--repair` can fill just the gaps.
+        read_s = time.time() - t0
+        t2 = time.time()
+        snap = None
+        if forks:
+            snap = sink.merge_and_commit(
+                repo, forks,
+                f"{DONE_PREFIX}{date}: PARTIAL {n_total - len(pending)}/"
+                f"{n_total} blocks, {len(members)} members")
+        return snap, submit_s, read_s, time.time() - t2, errs, retried, pending
 
     read_s = time.time() - t0
     t2 = time.time()
@@ -162,7 +228,7 @@ def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
         repo, forks,
         f"{DONE_PREFIX}{date}: {len(channels)} channels, {len(members)} "
         f"members, {len(steps)} steps")
-    return snap, submit_s, read_s, time.time() - t2, [], retried
+    return snap, submit_s, read_s, time.time() - t2, [], retried, []
 
 
 def main():
@@ -179,6 +245,15 @@ def main():
     p.add_argument("--steps", type=int, default=53)
     p.add_argument("--env", default=".env")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--recreate", action="store_true",
+                   help="DESTRUCTIVE: rewrite the schema over an existing "
+                        "store, making every committed date unreachable from "
+                        "`main`. Without this, an existing store is never "
+                        "overwritten")
+    p.add_argument("--repair", action="store_true",
+                   help="fill ONLY the chunks the manifest reports missing, "
+                        "instead of redoing whole dates. A date that lost two "
+                        "blocks costs two blocks, not 1,590")
     p.add_argument("--rounds", type=int, default=4,
                    help="resubmit rounds for blocks AWS throttled out")
     p.add_argument("--pause", type=int, default=45,
@@ -209,12 +284,26 @@ def main():
     print(f"sink     must-icechunk/{args.sink} "
           f"({'created' if created else 'existing'})")
 
-    done = committed_dates(repo) if args.resume else set()
+    done, partial = (committed_dates(repo) if (args.resume or args.repair)
+                     else (set(), set()))
     if done:
-        print(f"resume   {len(done)} date(s) already committed, skipping")
+        print(f"resume   {len(done)} date(s) complete, skipping")
+    if partial:
+        print(f"partial  {len(partial)} date(s) committed WITH HOLES: "
+              f"{', '.join(sorted(partial))}")
+        print(f"         run --repair to fill just the missing blocks")
 
     client = frisky.Client(args.scheduler)
-    coords = dag.subset_coords(args.era, dates[0], members, steps)
+
+    # Only `create_schema` consumes `coords`, so a --resume or --repair run has
+    # no use for it -- and fetching it opens the SOURCE store, which is one more
+    # thing that can fail before any work starts. source.coop returns sporadic
+    # 5xx ("error parsing XML: no root element"), and one of those killed a
+    # repair run at this line before it had written a single block. Don't pay
+    # for what we are not going to use.
+    coords = None
+    if created or args.recreate:
+        coords = dag.subset_coords(args.era, dates[0], members, steps)
 
     # Which dates does the SOURCE actually have?  The schema still reserves a
     # slot for every requested date -- an absent one is left unwritten, so it
@@ -228,11 +317,76 @@ def main():
               f"axis; {len(absent)} absent, slots reserved but unwritten:")
         print(f"         {', '.join(absent)}")
 
-    if created or not args.resume:
+    # `create_schema` writes with mode="w", which WIPES an existing store.
+    # This used to fire on `created or not args.resume`, so any invocation that
+    # merely forgot --resume silently destroyed the corpus. On 2026-08-07 a
+    # --repair run (which does not set --resume) did exactly that: 30 committed
+    # dates, 47,700 chunks, gone in one commit. Recovered only because icechunk
+    # keeps history -- repo.reset_branch("main", <pre-wipe snapshot>).
+    #
+    # Now: lay down the schema ONLY for a store this run created, and refuse to
+    # overwrite an existing one unless asked in so many words.
+    if created:
         t = time.time()
         snap = sink.create_schema(repo, names, coords, dates)
         print(f"schema   {len(names)} arrays x {len(dates)} dates, "
               f"metadata only, {str(snap)[:12]} in {time.time() - t:.1f}s")
+    elif args.recreate:
+        print(f"WARNING  --recreate: overwriting the existing schema at "
+              f"must-icechunk/{args.sink}; every committed date becomes "
+              f"unreachable from `main`")
+        t = time.time()
+        snap = sink.create_schema(repo, names, coords, dates)
+        print(f"schema   rewritten, {str(snap)[:12]} in {time.time() - t:.1f}s")
+    elif not (args.resume or args.repair):
+        raise SystemExit(
+            f"must-icechunk/{args.sink} already exists.\n"
+            f"Writing a fresh schema over it would make every committed date "
+            f"unreachable.\n"
+            f"  --resume   continue, skipping complete dates\n"
+            f"  --repair   fill only the chunks the manifest reports missing\n"
+            f"  --recreate deliberately start the store over")
+
+    if args.repair:
+        # Fill ONLY the chunks the manifest says are absent.  A date that lost
+        # two blocks costs two blocks to fix, not 1,590 -- the whole point of
+        # writing into a preallocated schema.
+        t_r = time.time()
+        miss = missing_blocks(repo, names, len(dates), len(steps))
+        if not miss:
+            print("repair   nothing missing -- store is complete")
+            client.close()
+            return 0
+        by_date = {}
+        for ti, name, si in miss:
+            by_date.setdefault(ti, []).append((name, si))
+        print(f"repair   {len(miss):,} missing chunk(s) across "
+              f"{len(by_date)} date(s)  (manifest read {time.time()-t_r:.1f}s)")
+        by_name = {c[2]: c for c in channels}
+        bad = []
+        for ti in sorted(by_date):
+            date = dates[ti]
+            if date not in present:
+                print(f"  {date}  {len(by_date[ti]):5d} missing -- but absent "
+                      f"from the {args.era} source, cannot fill")
+                continue
+            spec = [(by_name[n][0], by_name[n][1], n, si, steps[si])
+                    for n, si in by_date[ti]]
+            t0 = time.time()
+            snap, sub, rd, mg, failed, retried, still = run_one_date(
+                client, repo, channels, members, steps, args.era, date, ti,
+                rounds=args.rounds, pause=args.pause, pending=spec)
+            state = ("STILL INCOMPLETE" if still else "repaired")
+            if still:
+                bad.append(date)
+            print(f"  {date}  {len(spec):5d} block(s)  {time.time()-t0:6.1f}s  "
+                  f"retried {retried:3d}  -> {str(snap)[:12]}  {state}"
+                  + (f"  ({len(still)} left)" if still else ""), flush=True)
+        client.close()
+        print(f"\nrepair done in {(time.time()-t_r)/60:.1f} min")
+        if bad:
+            print(f"still incomplete: {bad} -- rerun --repair")
+        return 1 if bad else 0
 
     print()
     t_all = time.time()
@@ -246,13 +400,18 @@ def main():
             print(f"[{i + 1:2d}/{len(dates)}] {date}  skipped "
                   f"(absent from {args.era} source)")
             continue
-        snap, sub, rd, mg, failed, retried = run_one_date(
+        snap, sub, rd, mg, failed, retried, still = run_one_date(
             client, repo, channels, members, steps, args.era, date, i,
             rounds=args.rounds, pause=args.pause)
-        if failed:
+        if still:
+            # No longer a total loss: the blocks that landed are committed and
+            # labelled PARTIAL. Only `still` needs redoing, via --repair.
             bad.append((date, failed))
-            print(f"[{i + 1:2d}/{len(dates)}] {date}  FAILED "
-                  f"{len(failed)} blocks: {failed[0][:90]}", flush=True)
+            n_blk = len(channels) * len(steps)
+            print(f"[{i + 1:2d}/{len(dates)}] {date}  PARTIAL "
+                  f"{n_blk - len(still)}/{n_blk} blocks committed -> "
+                  f"{str(snap)[:12]}   {len(still)} missing: "
+                  f"{failed[0][:70] if failed else ''}", flush=True)
             continue
         ok.append(date)
         rate = len(channels) * len(members) * len(steps) / rd
@@ -273,8 +432,9 @@ def main():
         print("  slots reserved and unwritten -- rerun with --resume once "
               "Stage 1 publishes them")
     if bad:
-        print(f"FAILED dates: {[d for d, _ in bad]}")
-        print("rerun with --resume to retry only those")
+        print(f"PARTIAL dates: {[d for d, _ in bad]}")
+        print("rerun with --repair to fill only the missing blocks "
+              "(--resume would redo the whole date)")
     print(f"\nverify: check_complete.py --prefix {args.sink}")
     return 0 if not bad else 1
 
