@@ -78,6 +78,44 @@ for _era in ERAS.values():
 del _era
 
 
+# Era boundaries as inclusive (YYYYMMDD, run_hour) pairs. `None` means open.
+#
+# EVERY transition happens at 06z, mid-date -- verified 2026-08-11 by reading the
+# pars themselves (grid from the referenced GRIB URL, era from the pl-level
+# count) at each of the four runs across the three boundary dates:
+#
+#   20240228  00z 0p4/9L  |  06z 0p25/9L  12z 0p25/9L  18z 0p25/9L
+#   20250114  00z 9L      |  06z 13L      12z 13L      18z 13L
+#   20260512  00z 13L     |  06z 14L      12z 14L      18z 14L
+#
+# CLAUDE.md's era table is date-granular and so is wrong at the first edge: it
+# puts 0p4's end at 2024-02-28 and 49r1's start at 2024-02-29, which is true only
+# of 00z. 2024-02-28's 06z/12z/18z runs are already 0p25/49r1. That never mattered
+# while only 00z was ingested; with all four runs it decides where three days of
+# data belong.
+#
+# The 9L -> 13L change inside 49r1 is NOT a boundary here: both live in one 49r1
+# group built on the 13-level superset, so 9-level dates simply leave the four
+# extra levels empty.
+ERA_BOUNDS = {
+    "0p4":  (("20230118", 0), ("20240228", 0)),
+    "49r1": (("20240228", 6), ("20260512", 0)),
+    "50r1": (("20260512", 6), None),
+}
+
+# 00z/12z run to 360h, 06z/18z stop at 144h. Mirrors STEPS_BY_RUN in the builder.
+LONG_RUNS = (0, 12)
+
+
+def era_for(date: str, run: int | str) -> str:
+    """Which era a (YYYYMMDD, run) initialisation belongs to."""
+    k = (date, int(str(run).rstrip("zZ")))
+    for name, (lo, hi) in ERA_BOUNDS.items():
+        if (lo is None or k >= lo) and (hi is None or k <= hi):
+            return name
+    raise KeyError(f"{date} {run}z is outside every known era window")
+
+
 def grid_of(era: str) -> dict:
     """Grid dict for an era name ('49r1') or a grid name ('0p25')."""
     if era in ERAS:
