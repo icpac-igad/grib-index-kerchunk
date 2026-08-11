@@ -276,7 +276,7 @@ def create_schema(args, storage) -> None:
     grp = f"{args.era}/{args.run}z"
     era = ERAS[args.era]
     steps = np.array(read_steps(args.steps_file) if args.steps_file
-                     else DEFAULT_STEPS_H, dtype="int32")
+                     else STEPS_BY_RUN[args.run], dtype="int32")
     tvals = np.array(sorted(time_value(d, args.run) for d in dates), dtype="int64")
     if tvals.size != len(set(dates)):
         raise SystemExit("duplicate dates in the list")
@@ -401,9 +401,16 @@ def read_steps(path: str) -> list[int]:
     return sorted(int(s) for s in Path(path).read_text().split())
 
 
-# 0-144h at 3h + 150-360h at 6h -- the 00z/12z forecast range. 06z/18z are
-# shorter, so pass --steps-file for those.
-DEFAULT_STEPS_H = list(range(0, 145, 3)) + list(range(150, 361, 6))
+# ECMWF ENS runs come in two lengths, verified against s3://ecmwf-forecasts and
+# the pars for every era: 00z/12z run to 360h (85 steps, 3h then 6h from 150h),
+# 06z/18z stop at 144h (49 steps, 3h throughout). The short axis is exactly the
+# first 49 entries of the long one -- a prefix, not an interleave -- which is why
+# a short run can share a long group's step axis without any index remapping.
+LONG_STEPS_H = list(range(0, 145, 3)) + list(range(150, 361, 6))    # 85
+SHORT_STEPS_H = list(range(0, 145, 3))                              # 49
+STEPS_BY_RUN = {"00": LONG_STEPS_H, "06": SHORT_STEPS_H,
+                "12": LONG_STEPS_H, "18": SHORT_STEPS_H}
+DEFAULT_STEPS_H = LONG_STEPS_H      # kept for callers that predate STEPS_BY_RUN
 COORD_NAMES = {"time", "number", "step", "isobaricInhPa", "latitude", "longitude"}
 
 

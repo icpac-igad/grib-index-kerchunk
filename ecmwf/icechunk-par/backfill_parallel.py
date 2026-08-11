@@ -335,6 +335,9 @@ def main():
                          "2026 pars")
     ap.add_argument("--pars-root", default=None,
                     help="directory of <date>/ subdirs (--par-source local)")
+    ap.add_argument("--par-root-gcs",
+                    default="gs://gik-ecmwf-aws-tf/v20260623_run_par_ecmwf",
+                    help="root of the par tree; date/run path is derived from it")
     ap.add_argument("--catalog", default=None,
                     help="catalog.parquet path; default fetches from HF")
     ap.add_argument("--staging", default="./par-staging",
@@ -399,11 +402,18 @@ def main():
             cat = pd.read_parquet(io.BytesIO(r.content))
         cat = cat[(cat.era == args.era) & (cat.run == f"{args.run}z")]
         cat = cat.set_index(cat.date.astype(str))
+        if cat.empty:      # catalog is 00z-only; paths are derived instead
+            cat = None
 
     def loc_for(d):
+        # Paths are derived from (date, run), not looked up: the published
+        # catalog.parquet only lists 00z, but the bucket holds all four runs for
+        # the whole archive. A catalog row, when present, still wins.
         base = {"source": args.par_source, "pars_root": args.pars_root,
-                "keep_pars": args.keep_pars}
-        if cat is not None:
+                "keep_pars": args.keep_pars,
+                "gcs_path": f"{args.par_root_gcs}/{d[:4]}/{d[4:6]}/{d}/{args.run}z",
+                "hf_path": f"par/{d[:4]}/{d[4:6]}/{d}/{args.run}z"}
+        if cat is not None and d in cat.index:
             r = cat.loc[d]
             base.update(gcs_path=str(r.gcs_path), hf_path=str(r.hf_path))
         return base
