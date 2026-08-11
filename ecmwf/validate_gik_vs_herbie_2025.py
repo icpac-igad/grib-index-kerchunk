@@ -72,10 +72,16 @@ GCS_PREFIX = "run_par_ecmwf/2025"
 # ── Forecast configuration ───────────────────────────────────────────
 TARGET_STEPS = [36, 39, 42, 45, 48, 51, 54, 57, 60]
 
-# ECMWF grid
-ECMWF_GRID_SHAPE = (721, 1440)
-ECMWF_LATS = np.linspace(90, -90, 721)
-ECMWF_LONS = np.linspace(-180, 179.75, 1440)
+# ECMWF grid -- from grids.py, the single source of truth. Do not retype these
+# axes; a hand-written 0-start longitude is what displaced every Icechunk store
+# by 180 deg (HANDOVER_LONGITUDE_FIX.md).
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from grids import field_shape as _field_shape, latitudes as _lats, longitudes as _lons  # noqa: E402
+
+ECMWF_GRID_SHAPE = _field_shape("0p25")
+ECMWF_LATS = _lats("0p25")
+ECMWF_LONS = _lons("0p25")
 
 # ICPAC region
 LAT_MIN, LAT_MAX = -14, 25

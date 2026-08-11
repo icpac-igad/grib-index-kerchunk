@@ -84,14 +84,20 @@ os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
 # ── Domain / grid (must match the GIK streaming pipeline) ─────────────
 # Grid is era-dependent: 0p25 (49r1/50r1, 721x1440) vs 0p4 (0.4-beta, 451x900).
 # Defaults below are 0p25; set_grid() reassigns them for --grid 0p4.
-GRIDS = {
-    "0p25": {"shape": (721, 1440),
-             "lats": np.linspace(90, -90, 721),
-             "lons": np.linspace(-180, 179.75, 1440)},
-    "0p4":  {"shape": (451, 900),
-             "lats": np.linspace(90, -90, 451),
-             "lons": np.linspace(-180, 179.6, 900)},
-}
+#
+# Derived from grids.py -- the single source of truth for the ECMWF grid origin.
+# This file used to spell the axes out by hand. They were correct here, but the
+# same fact hand-written in twelve places is how build_ecmwf_icechunk.py came to
+# assume a 0-start longitude and displace every store by 180 deg. Import, do not
+# retype. See HANDOVER_LONGITUDE_FIX.md.
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import grids as _grids  # noqa: E402
+
+GRIDS = {name: {"shape": _grids.field_shape(name),
+                "lats": _grids.latitudes(name),
+                "lons": _grids.longitudes(name)}
+         for name in ("0p25", "0p4")}
 ECMWF_GRID_SHAPE = GRIDS["0p25"]["shape"]
 ECMWF_LATS = GRIDS["0p25"]["lats"]
 ECMWF_LONS = GRIDS["0p25"]["lons"]

@@ -51,22 +51,41 @@ import icechunk
 import gribberish.zarr  # noqa: F401 -- registers the "gribberish" Zarr v3 codec
 from gribberish.zarr.codec import GribberishCodec
 
+# --- grid definitions come from ONE place: grib-index-kerchunk/ecmwf/grids.py ---
+# This builder used to carry its own copy of the era table and re-derived the
+# longitude origin as 0 deg instead of -180 deg. Every store it wrote was
+# labelled 180 deg out. Never inline a grid constant here again -- import it.
+# See HANDOVER_LONGITUDE_FIX.md and grids.py.
+import sys as _sys
+
+
+def _locate_grids() -> Path:
+    """Find the canonical ecmwf/grids.py. Fails loudly rather than guessing."""
+    env = os.environ.get("GIK_ECMWF_DIR")
+    here = Path(__file__).resolve()
+    cands = ([Path(env)] if env else []) + [here.parent, here.parent.parent]
+    for anc in here.parents:  # works from either repo, no absolute paths baked in
+        cands += [anc / "grib-index-kerchunk" / "ecmwf", anc / "ecmwf"]
+    for c in cands:
+        if (c / "grids.py").is_file():
+            return c
+    raise SystemExit(
+        "FATAL: cannot find the canonical ecmwf/grids.py.\n"
+        "  It holds the ECMWF grid origin (-180 deg) that this builder must not\n"
+        "  re-derive -- see HANDOVER_LONGITUDE_FIX.md.\n"
+        "  Fix: set GIK_ECMWF_DIR=/path/to/grib-index-kerchunk/ecmwf, or symlink\n"
+        f"  grids.py next to {Path(__file__).name}.\n"
+        f"  Searched: {', '.join(str(c) for c in cands[:6])} ...")
+
+
+_sys.path.insert(0, str(_locate_grids()))
+from grids import ERAS, latitudes, longitudes  # noqa: E402
+
 CONTAINER_PREFIX = "s3://ecmwf-forecasts/"
 N_MEMBERS = 51  # number 0 = control, 1..50 = ens_01..ens_50
 SFC_RENAME = {"2t": "t2m", "10u": "u10", "10v": "v10"}
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 MANIFEST_SPLIT_TIME = 1  # 1 date per manifest shard: O(1) appends, linear growth
-
-# era table: grid + canonical pressure-level SUPERSET (dates with fewer levels
-# simply leave those slots empty -> NaN on read, same as the template decision)
-ERAS = {
-    "0p4":  dict(ny=451, nx=900, dlon=0.4,
-                 levels=[50, 200, 250, 300, 500, 700, 850, 925, 1000]),
-    "49r1": dict(ny=721, nx=1440, dlon=0.25,
-                 levels=[50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]),
-    "50r1": dict(ny=721, nx=1440, dlon=0.25,
-                 levels=[10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]),
-}
 
 
 def resolve_storage(store: str, sa_key: str | None):
@@ -146,7 +165,45 @@ def open_or_create_repo(storage):
                                       authorize_virtual_chunk_access=auth)
 
 
-def ensure_group(store, grp: str, era: dict, steps: np.ndarray) -> bool:
+def check_coords(g, era_name: str) -> None:
+    """Refuse to append into a group whose axes disagree with grids.py.
+
+    `ensure_group` writes coordinates only when it CREATES a group, so a store
+    built before the longitude fix keeps its 0-start axis and every date appended
+    afterwards silently inherits the mislabelling. Checking on every append closes
+    that: a stale store fails loudly on the first date instead of growing.
+
+    There is deliberately no in-place repair. Mislabelled stores get rebuilt --
+    relabelling would only ever be right for this global-field store and never for
+    a realized subset, and having the escape hatch here invites using it on the
+    wrong thing. See HANDOVER_LONGITUDE_FIX.md.
+    """
+    for name, want in (("latitude", latitudes(era_name)),
+                       ("longitude", longitudes(era_name))):
+        if name not in g:
+            raise SystemExit(f"group has no {name!r} coordinate -- not an ECMWF "
+                             f"era group?")
+        have = np.asarray(g[name][:])
+        if have.shape != want.shape:
+            raise SystemExit(
+                f"{name} has {have.shape[0]} points, era {era_name} expects "
+                f"{want.shape[0]} -- wrong --era for this group?")
+        if np.allclose(have, want, atol=1e-9):
+            continue
+        off = float(have[0] - want[0])
+        raise SystemExit(
+            f"REFUSING TO APPEND: this group's {name} disagrees with grids.py.\n"
+            f"  stored:   {have[0]:+.4f} .. {have[-1]:+.4f}\n"
+            f"  expected: {want[0]:+.4f} .. {want[-1]:+.4f}"
+            + (f"   (offset {off:+.2f} deg)" if abs(off) > 1e-9 else "") + "\n"
+            f"  The dates already in this group are mislabelled, so appending a\n"
+            f"  correct one would mix two conventions in a single array -- worse\n"
+            f"  than the original bug. Build a new store instead.\n"
+            f"  See HANDOVER_LONGITUDE_FIX.md.")
+
+
+def ensure_group(store, grp: str, era: dict, steps: np.ndarray,
+                 era_name: str) -> bool:
     """Create the era/run group with its coordinate arrays if absent."""
     try:
         zarr.open_group(store=store, path=grp, mode="r", zarr_format=3)
@@ -163,8 +220,11 @@ def ensure_group(store, grp: str, era: dict, steps: np.ndarray) -> bool:
          {"long_name": "ensemble member number (0 = control)"}),
         ("step", steps, {"units": "hours"}),
         ("isobaricInhPa", levels, {"units": "hPa"}),
-        ("latitude", np.linspace(90.0, -90.0, era["ny"]), {"units": "degrees_north"}),
-        ("longitude", np.arange(era["nx"]) * era["dlon"], {"units": "degrees_east"}),
+        # Axes come from grids.py -- the GRIB scans 90 -> -90 and -180 -> +179.75.
+        # Do not inline these; a 0-start longitude here displaces every store by
+        # 180 deg and nothing downstream can detect it (HANDOVER_LONGITUDE_FIX.md).
+        ("latitude", latitudes(era_name), {"units": "degrees_north"}),
+        ("longitude", longitudes(era_name), {"units": "degrees_east"}),
     ]
     for name, data, attrs in coords:
         shape = data.shape if data.size else (0,)
@@ -215,7 +275,7 @@ def main():
     repo = open_or_create_repo(resolve_storage(args.store, args.sa_key))
     session = repo.writable_session("main")
     store = session.store
-    created = ensure_group(store, grp, era, steps)
+    created = ensure_group(store, grp, era, steps, args.era)
     g = zarr.open_group(store=store, path=grp, mode="r+", zarr_format=3)
 
     tarr = g["time"]
@@ -229,6 +289,10 @@ def main():
         print(f"NOTE: {args.date} is earlier than the group tip -> out-of-order "
               f"gap fill; time axis unsorted until consumers sortby('time')")
     if not created:
+        # the group was written by an earlier run -- its axes are whatever that
+        # run believed. A store predating the longitude fix fails here on its
+        # first append rather than quietly growing (HANDOVER_LONGITUDE_FIX.md).
+        check_coords(g, args.era)
         gsteps = g["step"][:]
         assert np.array_equal(gsteps, steps), \
             f"step axis mismatch: group has {len(gsteps)}, date has {len(steps)}"
