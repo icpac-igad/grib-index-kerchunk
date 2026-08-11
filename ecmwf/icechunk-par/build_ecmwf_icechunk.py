@@ -309,6 +309,64 @@ def create_schema(args, storage) -> None:
           f"order, concurrently")
 
 
+def channel_name(var: str, is_pl: bool, pl_vars) -> str:
+    """Zarr array name for a GRIB shortName.
+
+    A var can exist at BOTH sfc and pl (50r1 control: z = orography at surface,
+    geopotential on levels) -- the surface instance gets a _sfc suffix.
+    Shared by the serial builder and the parallel driver: this naming rule is
+    exactly the kind of thing that must not exist in two places.
+    """
+    if is_pl:
+        return var
+    z = SFC_RENAME.get(var, var)
+    return f"{z}_sfc" if var in pl_vars else z
+
+
+def array_geometry(is_pl: bool, n_time: int, n_steps: int, n_levels: int,
+                   ny: int, nx: int):
+    """(shape, chunks, dimension_names) for a data array."""
+    if is_pl:
+        return ((n_time, N_MEMBERS, n_steps, n_levels, ny, nx),
+                (1, 1, 1, 1, ny, nx),
+                ["time", "number", "step", "isobaricInhPa", "latitude", "longitude"])
+    return ((n_time, N_MEMBERS, n_steps, ny, nx),
+            (1, 1, 1, ny, nx),
+            ["time", "number", "step", "latitude", "longitude"])
+
+
+def ref_specs(refs, var: str, is_pl: bool, ti: int, step_idx: dict,
+              lev_idx: dict) -> list:
+    """VirtualChunkSpecs for one (var, levtype) at time index `ti`.
+
+    Every index is unique per (date, member, step, level), which is what makes
+    concurrent dates chunk-disjoint and therefore legal to write from forks.
+    """
+    sub = refs[(refs["var"] == var)
+               & (refs.levtype == "pl" if is_pl
+                  else refs.levtype.isin(["sfc", "sol"]))]
+    if is_pl:
+        return [icechunk.VirtualChunkSpec(
+            index=[ti, int(r.number), step_idx[r.step_h], lev_idx[r.level], 0, 0],
+            location=r.url, offset=int(r.offset), length=int(r.length))
+            for r in sub.itertuples()]
+    return [icechunk.VirtualChunkSpec(
+        index=[ti, int(r.number), step_idx[r.step_h], 0, 0],
+        location=r.url, offset=int(r.offset), length=int(r.length))
+        for r in sub.itertuples()]
+
+
+def split_levtypes(refs):
+    """(sfc_vars, pl_vars) present in a date's refs; raises on anything else."""
+    # levtype "sol" (sot, vsw soil fields, 49r1+) has no level segment -> surface-like
+    sfc = sorted(refs.loc[refs.levtype.isin(["sfc", "sol"]), "var"].unique())
+    pl = sorted(refs.loc[refs.levtype == "pl", "var"].unique())
+    other = set(refs.levtype.unique()) - {"sfc", "sol", "pl"}
+    if other:
+        raise SystemExit(f"unhandled levtypes {other} -- refusing to drop refs silently")
+    return sfc, pl
+
+
 def date_written(session, grp: str, g, ti: int) -> bool:
     """Has any date-`ti` chunk already been written into this group?
 
@@ -393,12 +451,7 @@ def main():
     if bad_levels:
         raise SystemExit(f"refs contain levels {bad_levels} outside the {args.era} "
                          f"superset -- wrong --era?")
-    # levtype "sol" (sot, vsw soil fields, 49r1+) has no level segment -> surface-like
-    sfc_vars = sorted(refs.loc[refs.levtype.isin(["sfc", "sol"]), "var"].unique())
-    pl_vars = sorted(refs.loc[refs.levtype == "pl", "var"].unique())
-    other = set(refs.levtype.unique()) - {"sfc", "sol", "pl"}
-    if other:
-        raise SystemExit(f"unhandled levtypes {other} -- refusing to drop refs silently")
+    sfc_vars, pl_vars = split_levtypes(refs)
     time_val = time_value(args.date, args.run)
     print(f"{grp} {args.date}: {len(refs)} refs, {len(steps)} steps, "
           f"{len(sfc_vars)} sfc + {len(pl_vars)} pl vars")
@@ -470,22 +523,13 @@ def main():
 
     n_set = 0
     for var, is_pl in [(v, False) for v in sfc_vars] + [(v, True) for v in pl_vars]:
-        # a var can exist at BOTH sfc and pl (50r1 control: z = orography at sfc,
-        # geopotential on levels) -- the surface instance gets a _sfc suffix
-        if is_pl:
-            zname = var
-        else:
-            zname = SFC_RENAME.get(var, var)
-            if var in pl_vars:
-                zname = f"{zname}_sfc"
+        zname = channel_name(var, is_pl, pl_vars)
         path = f"{grp}/{zname}"
         # n_time is the group's full time length: the preallocated count, or
         # ti + 1 while appending. A var appearing mid-era is created at full
         # length either way, so earlier dates read NaN.
-        full = ((n_time, N_MEMBERS, len(steps), n_levels, ny, nx) if is_pl
-                else (n_time, N_MEMBERS, len(steps), ny, nx))
-        dims = (["time", "number", "step", "isobaricInhPa", "latitude", "longitude"]
-                if is_pl else ["time", "number", "step", "latitude", "longitude"])
+        full, chunks, dims = array_geometry(is_pl, n_time, len(steps), n_levels,
+                                            ny, nx)
         if zname in g:
             arr = g[zname]
             assert arr.shape[1:] == full[1:], f"{path}: shape drift"
@@ -494,25 +538,12 @@ def main():
         else:
             # first appearance (group creation, or schema drift mid-era):
             # full time length, earlier dates read as NaN
-            zarr.create_array(store, name=path, shape=full,
-                              chunks=(1, 1, 1) + ((1, ny, nx) if is_pl else (ny, nx)),
+            zarr.create_array(store, name=path, shape=full, chunks=chunks,
                               dtype="float32", fill_value=float("nan"),
                               serializer=GribberishCodec(var=zname),
                               compressors=None, filters=None, dimension_names=dims,
                               attributes={"grib_shortName": var}, overwrite=True)
-        sub = refs[(refs["var"] == var)
-                   & (refs.levtype == "pl" if is_pl
-                      else refs.levtype.isin(["sfc", "sol"]))]
-        if is_pl:
-            specs = [icechunk.VirtualChunkSpec(
-                index=[ti, int(r.number), step_idx[r.step_h], lev_idx[r.level], 0, 0],
-                location=r.url, offset=int(r.offset), length=int(r.length))
-                for r in sub.itertuples()]
-        else:
-            specs = [icechunk.VirtualChunkSpec(
-                index=[ti, int(r.number), step_idx[r.step_h], 0, 0],
-                location=r.url, offset=int(r.offset), length=int(r.length))
-                for r in sub.itertuples()]
+        specs = ref_specs(refs, var, is_pl, ti, step_idx, lev_idx)
         bad = store.set_virtual_refs(path, specs)
         assert not bad, f"{path}: rejected refs {bad}"
         n_set += len(specs)
