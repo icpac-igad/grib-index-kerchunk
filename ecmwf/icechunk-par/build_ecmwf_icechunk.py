@@ -202,9 +202,33 @@ def check_coords(g, era_name: str) -> None:
             f"  See HANDOVER_LONGITUDE_FIX.md.")
 
 
+TIME_UNITS = {"units": "hours since 1970-01-01",
+              "calendar": "proleptic_gregorian", "standard_name": "time"}
+APPEND, PREALLOC = "append", "preallocated"
+
+
+def time_value(date: str, run: str) -> int:
+    """Hours since epoch for an init datetime."""
+    return int((datetime.strptime(date, "%Y%m%d").replace(tzinfo=timezone.utc)
+                - EPOCH).total_seconds() // 3600) + int(run)
+
+
+def group_mode(g) -> str:
+    """How this group's time axis grows. Legacy groups predate the marker."""
+    return g.attrs.get("time_mode", APPEND)
+
+
 def ensure_group(store, grp: str, era: dict, steps: np.ndarray,
-                 era_name: str) -> bool:
-    """Create the era/run group with its coordinate arrays if absent."""
+                 era_name: str, prealloc_times: np.ndarray | None = None) -> bool:
+    """Create the era/run group with its coordinate arrays if absent.
+
+    `prealloc_times` writes the whole `time` axis up front, sorted, and marks the
+    group `preallocated`: every date then writes at its own known index instead of
+    extending the tail. That is what makes dates independent of each other -- both
+    parallelisable and immune to the out-of-order axis that `append_dim="time"`
+    produced in the published store. The cost is that the date range is frozen
+    here; see --create-schema.
+    """
     try:
         zarr.open_group(store=store, path=grp, mode="r", zarr_format=3)
         return False
@@ -212,10 +236,10 @@ def ensure_group(store, grp: str, era: dict, steps: np.ndarray,
         pass
     zarr.create_group(store=store, path=grp, zarr_format=3, overwrite=False)
     levels = np.array(era["levels"], dtype="float64")
+    tvals = (np.zeros(0, dtype="int64") if prealloc_times is None
+             else np.asarray(prealloc_times, dtype="int64"))
     coords = [
-        ("time", np.zeros(0, dtype="int64"), {"units": "hours since 1970-01-01",
-                                              "calendar": "proleptic_gregorian",
-                                              "standard_name": "time"}),
+        ("time", tvals, TIME_UNITS),
         ("number", np.arange(N_MEMBERS, dtype="int16"),
          {"long_name": "ensemble member number (0 = control)"}),
         ("step", steps, {"units": "hours"}),
@@ -234,19 +258,127 @@ def ensure_group(store, grp: str, era: dict, steps: np.ndarray,
                                 overwrite=True)
         if data.size:
             arr[:] = data
+    g = zarr.open_group(store=store, path=grp, mode="r+", zarr_format=3)
+    g.attrs["time_mode"] = APPEND if prealloc_times is None else PREALLOC
+    if prealloc_times is not None:
+        g.attrs["n_dates"] = int(tvals.size)
     return True
+
+
+def create_schema(args, storage) -> None:
+    """Lay down a group with its whole time axis preallocated, and commit.
+
+    Metadata only -- no refs, no pars read. Data arrays are still created on a
+    variable's first appearance (schema drift is real across an era), but at FULL
+    time length, so nothing is ever resized afterwards.
+    """
+    dates = read_dates(args.dates_file)
+    grp = f"{args.era}/{args.run}z"
+    era = ERAS[args.era]
+    steps = np.array(read_steps(args.steps_file) if args.steps_file
+                     else DEFAULT_STEPS_H, dtype="int32")
+    tvals = np.array(sorted(time_value(d, args.run) for d in dates), dtype="int64")
+    if tvals.size != len(set(dates)):
+        raise SystemExit("duplicate dates in the list")
+
+    repo = open_or_create_repo(storage)
+    session = repo.writable_session("main")
+    # The mode="w" hazard, guarded: laying a schema over a group that already
+    # holds data makes every committed chunk unreachable from main in one commit
+    # -- that cost 30 committed dates on 2026-08-07 (EWC_REALIZE_NOTES.md #6).
+    try:
+        existing = zarr.open_group(store=session.store, path=grp, mode="r",
+                                   zarr_format=3)
+    except Exception:
+        existing = None
+    if existing is not None:
+        n = len([k for k in existing.array_keys() if k not in COORD_NAMES])
+        raise SystemExit(
+            f"REFUSING: group {grp} already exists in {args.store} with {n} data "
+            f"array(s).\n  Writing a schema over it would make every committed "
+            f"chunk unreachable from main.\n  Use a new --store, or delete that "
+            f"group deliberately first.")
+
+    ensure_group(session.store, grp, era, steps, args.era, prealloc_times=tvals)
+    snap = session.commit(
+        f"{grp}: schema, time axis preallocated to {tvals.size} dates "
+        f"({min(dates)}..{max(dates)}), {len(steps)} steps")
+    print(f"{grp}: preallocated {tvals.size} dates {min(dates)}..{max(dates)}, "
+          f"{len(steps)} steps, {len(era['levels'])} levels -> {snap}")
+    print(f"  time axis is sorted and frozen; dates may now be built in any "
+          f"order, concurrently")
+
+
+def date_written(session, grp: str, g, ti: int) -> bool:
+    """Has any date-`ti` chunk already been written into this group?
+
+    A preallocated time axis is full from the start, so unlike append mode the
+    axis cannot tell you which dates are done -- the manifest can. Probing one
+    chunk of one data array is enough, since a date is committed atomically.
+    Returns False for a group with no data arrays yet.
+    """
+    for name in sorted(g.array_keys()):
+        if name in COORD_NAMES:
+            continue
+        idx = [ti] + [0] * (len(g[name].shape) - 1)
+        try:
+            # chunk_type wants an absolute path; anything other than
+            # "uninitialized" (virtual/inline/native) means it was written.
+            t = str(session.chunk_type(f"/{grp}/{name}", idx))
+        except Exception:
+            return False        # older icechunk without chunk_type -> don't block
+        return t != "ChunkType.uninitialized"
+    return False
+
+
+def read_dates(path: str) -> list[str]:
+    txt = Path(path).read_text().split()
+    bad = [d for d in txt if not re.fullmatch(r"\d{8}", d)]
+    if bad:
+        raise SystemExit(f"not YYYYMMDD: {bad[:5]}")
+    return sorted(txt)
+
+
+def read_steps(path: str) -> list[int]:
+    return sorted(int(s) for s in Path(path).read_text().split())
+
+
+# 0-144h at 3h + 150-360h at 6h -- the 00z/12z forecast range. 06z/18z are
+# shorter, so pass --steps-file for those.
+DEFAULT_STEPS_H = list(range(0, 145, 3)) + list(range(150, 361, 6))
+COORD_NAMES = {"time", "number", "step", "isobaricInhPa", "latitude", "longitude"}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--era", required=True, choices=list(ERAS))
     ap.add_argument("--run", default="00", choices=["00", "06", "12", "18"])
-    ap.add_argument("--date", required=True, help="YYYYMMDD")
-    ap.add_argument("--pars-dir", required=True)
+    ap.add_argument("--date", help="YYYYMMDD (not needed with --create-schema)")
+    ap.add_argument("--pars-dir", help="(not needed with --create-schema)")
     ap.add_argument("--store", required=True, help="local path | s3://... | gs://...")
     ap.add_argument("--sa-key", default=None, help="GCS service-account json")
+    ap.add_argument("--create-schema", action="store_true",
+                    help="create the group with its whole time axis preallocated "
+                         "from --dates-file, then exit. Dates can afterwards be "
+                         "built in any order and concurrently")
+    ap.add_argument("--dates-file",
+                    help="whitespace-separated YYYYMMDD list (--create-schema)")
+    ap.add_argument("--steps-file",
+                    help="whitespace-separated forecast hours; default is the "
+                         "00z/12z range (--create-schema)")
+    ap.add_argument("--overwrite-date", action="store_true",
+                    help="in a preallocated group, rewrite a date whose refs are "
+                         "already present instead of refusing")
     args = ap.parse_args()
     t0 = _time.time()
+
+    if args.create_schema:
+        if not args.dates_file:
+            raise SystemExit("--create-schema needs --dates-file")
+        return create_schema(args, resolve_storage(args.store, args.sa_key))
+    if not (args.date and args.pars_dir):
+        raise SystemExit("--date and --pars-dir are required "
+                         "unless --create-schema")
 
     era = ERAS[args.era]
     grp = f"{args.era}/{args.run}z"
@@ -267,8 +399,7 @@ def main():
     other = set(refs.levtype.unique()) - {"sfc", "sol", "pl"}
     if other:
         raise SystemExit(f"unhandled levtypes {other} -- refusing to drop refs silently")
-    time_val = int((datetime.strptime(args.date, "%Y%m%d").replace(tzinfo=timezone.utc)
-                    - EPOCH).total_seconds() // 3600) + int(args.run)
+    time_val = time_value(args.date, args.run)
     print(f"{grp} {args.date}: {len(refs)} refs, {len(steps)} steps, "
           f"{len(sfc_vars)} sfc + {len(pl_vars)} pl vars")
 
@@ -277,17 +408,10 @@ def main():
     store = session.store
     created = ensure_group(store, grp, era, steps, args.era)
     g = zarr.open_group(store=store, path=grp, mode="r+", zarr_format=3)
+    mode = group_mode(g)
 
     tarr = g["time"]
     existing = tarr[:] if tarr.shape[0] else np.array([], dtype="int64")
-    if time_val in existing:
-        raise SystemExit(f"{args.date} {args.run}z already in group {grp}")
-    if existing.size and time_val < existing[-1]:
-        # gap fill (e.g. retrying a date that failed on a transient error):
-        # appended at the END, so the time axis becomes unsorted -- readers
-        # should ds.sortby("time"); the health check reports it as a WARN
-        print(f"NOTE: {args.date} is earlier than the group tip -> out-of-order "
-              f"gap fill; time axis unsorted until consumers sortby('time')")
     if not created:
         # the group was written by an earlier run -- its axes are whatever that
         # run believed. A store predating the longitude fix fails here on its
@@ -296,20 +420,53 @@ def main():
         gsteps = g["step"][:]
         assert np.array_equal(gsteps, steps), \
             f"step axis mismatch: group has {len(gsteps)}, date has {len(steps)}"
-    ti = int(tarr.shape[0])
-    tarr.resize((ti + 1,))
-    tarr[ti] = time_val
 
-    # resize EVERY existing data array, not just those with refs in this date:
-    # a var that disappears mid-era (e.g. 49r1 cape -> mucape) must keep growing
-    # (NaN for absent dates) or the group's time dims diverge and xarray
-    # refuses to open it (found live by check_store_health.py)
-    coord_names = {"time", "number", "step", "isobaricInhPa", "latitude", "longitude"}
-    for name in list(g.array_keys()):
-        if name not in coord_names:
-            arr = g[name]
-            if arr.shape[0] != ti + 1:
-                arr.resize((ti + 1,) + arr.shape[1:])
+    if mode == PREALLOC:
+        # Region write at a known index. The time axis is already correct and
+        # sorted, so nothing here can reorder it and no array is ever resized --
+        # which is also what lets dates run concurrently.
+        pos = int(np.searchsorted(existing, time_val))
+        if pos >= existing.size or existing[pos] != time_val:
+            raise SystemExit(
+                f"{args.date} {args.run}z is not in group {grp}'s preallocated "
+                f"time axis ({len(existing)} dates). The range is frozen at "
+                f"--create-schema; rebuild the schema in a new store to widen it.")
+        ti = pos
+        n_time = int(existing.size)
+        if not args.overwrite_date and date_written(session, grp, g, ti):
+            raise SystemExit(f"{args.date} {args.run}z already has refs in {grp} "
+                             f"at index {ti} -- pass --overwrite-date to rewrite")
+        print(f"  preallocated group: writing index {ti} of {n_time}")
+    else:
+        if time_val in existing:
+            raise SystemExit(f"{args.date} {args.run}z already in group {grp}")
+        if existing.size and time_val < existing[-1]:
+            # gap fill (e.g. retrying a date that failed on a transient error):
+            # appended at the END, so the time axis becomes unsorted -- readers
+            # should ds.sortby("time"); the health check reports it as a WARN.
+            # --create-schema avoids this class of defect entirely.
+            print(f"NOTE: {args.date} is earlier than the group tip -> out-of-order "
+                  f"gap fill; time axis unsorted until consumers sortby('time')")
+        ti = int(tarr.shape[0])
+        n_time = ti + 1
+        tarr.resize((ti + 1,))
+        tarr[ti] = time_val
+
+    if mode == APPEND:
+        # resize EVERY existing data array, not just those with refs in this date:
+        # a var that disappears mid-era (e.g. 49r1 cape -> mucape) must keep growing
+        # (NaN for absent dates) or the group's time dims diverge and xarray
+        # refuses to open it (found live by check_store_health.py).
+        #
+        # A preallocated group needs none of this -- every array is already full
+        # length. Skipping it is what makes concurrent dates safe: this loop
+        # mutates metadata on ~40 shared arrays, which no amount of chunk
+        # disjointness would protect.
+        for name in list(g.array_keys()):
+            if name not in COORD_NAMES:
+                arr = g[name]
+                if arr.shape[0] != ti + 1:
+                    arr.resize((ti + 1,) + arr.shape[1:])
 
     n_set = 0
     for var, is_pl in [(v, False) for v in sfc_vars] + [(v, True) for v in pl_vars]:
@@ -322,14 +479,18 @@ def main():
             if var in pl_vars:
                 zname = f"{zname}_sfc"
         path = f"{grp}/{zname}"
-        full = ((ti + 1, N_MEMBERS, len(steps), n_levels, ny, nx) if is_pl
-                else (ti + 1, N_MEMBERS, len(steps), ny, nx))
+        # n_time is the group's full time length: the preallocated count, or
+        # ti + 1 while appending. A var appearing mid-era is created at full
+        # length either way, so earlier dates read NaN.
+        full = ((n_time, N_MEMBERS, len(steps), n_levels, ny, nx) if is_pl
+                else (n_time, N_MEMBERS, len(steps), ny, nx))
         dims = (["time", "number", "step", "isobaricInhPa", "latitude", "longitude"]
                 if is_pl else ["time", "number", "step", "latitude", "longitude"])
         if zname in g:
             arr = g[zname]
             assert arr.shape[1:] == full[1:], f"{path}: shape drift"
-            assert arr.shape[0] == ti + 1  # resized above
+            assert arr.shape[0] == n_time, \
+                f"{path}: time length {arr.shape[0]} != {n_time}"
         else:
             # first appearance (group creation, or schema drift mid-era):
             # full time length, earlier dates read as NaN
