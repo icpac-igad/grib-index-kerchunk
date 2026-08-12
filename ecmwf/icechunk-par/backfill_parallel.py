@@ -179,7 +179,13 @@ def peek_vars(pars_dir: Path) -> tuple[list[str], list[str]]:
 # worker
 # ---------------------------------------------------------------------------
 def init_worker() -> None:
-    """Pin each worker to one thread.
+    """Pin each worker to one thread, and make it die with its parent.
+
+    PDEATHSIG is not optional here. ProcessPoolExecutor cleans its spawn children
+    up via atexit, which never runs if the coordinator is SIGKILLed -- e.g. by the
+    OOM killer. Each dead run then left 6 workers holding ~480 MB apiece, so one
+    genuine OOM in an 8 GB cgroup turned into every following group dying at zero
+    batches against memory that was already gone. Observed: 18 orphans, 2.9 GB.
 
     `pd.read_parquet` uses pyarrow, which is multi-threaded by default, so a
     single worker already spreads across cores. Left alone, N workers then fight
@@ -187,6 +193,11 @@ def init_worker() -> None:
     to 45 s at 4 while wall time only fell from 21 s to 14 s. One thread per
     process turns that contention into clean process-level scaling.
     """
+    try:                          # die if the coordinator dies (Linux)
+        import ctypes, signal
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
     try:
         import pyarrow
         pyarrow.set_cpu_count(1)
@@ -259,6 +270,39 @@ def merge_and_commit(session, forks, msg):
         return session.commit(msg)
 
 
+def memory_budget_workers(requested: int) -> int:
+    """Cap workers to what the cgroup allows, not to what `free` reports.
+
+    This host reports 31 GB but the service cgroup is capped at 8 GB, and trusting
+    the former is what got the backfill OOM-killed. A worker peaks around 700 MB
+    parsing 51 pars (13-level dates are the worst), and the coordinator holds two
+    batches of changeset while pipelining, so leave real headroom.
+    """
+    try:
+        for path in ("/sys/fs/cgroup/memory.max",
+                     f"/sys/fs/cgroup{Path('/proc/self/cgroup').read_text().strip().split(':')[-1]}/memory.max"):
+            f = Path(path)
+            if f.is_file() and f.read_text().strip() != "max":
+                cap = int(f.read_text().strip())
+                break
+        else:
+            return requested
+    except Exception:
+        return requested
+    used = 0
+    try:
+        used = int(Path(f.parent / "memory.current").read_text().strip())
+    except Exception:
+        pass
+    free_gb = (cap - used) / 2**30
+    allowed = max(1, int((free_gb - 2.0) / 0.7))     # 2 GB for coordinator+slack
+    if allowed < requested:
+        print(f"  NOTE: cgroup cap {cap/2**30:.1f} GB, {free_gb:.1f} GB free -> "
+              f"capping workers {requested} -> {allowed} (a worker peaks ~0.7 GB)")
+        return allowed
+    return requested
+
+
 def make_executor(args):
     """A local process pool, or the Dask cluster the realize stage already uses.
 
@@ -277,8 +321,8 @@ def make_executor(args):
         print(f"  dask cluster {args.scheduler}: "
               f"{len(client.scheduler_info()['workers'])} worker(s)")
         return client
-    return ProcessPoolExecutor(args.workers, mp_context=MP,
-                               initializer=init_worker)
+    return ProcessPoolExecutor(memory_budget_workers(args.workers),
+                               mp_context=MP, initializer=init_worker)
 
 
 def shutdown_executor(ex) -> None:
