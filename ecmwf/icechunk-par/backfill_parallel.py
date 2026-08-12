@@ -47,7 +47,7 @@ Usage
     # 2. fan out
     uv run backfill_parallel.py --era 49r1 --run 00 \
         --store gs://bucket/icechunk/ecmwf-ens \
-        --par-source gcs --executor dask --scheduler 192.168.1.74:8796 --batch 20
+        --par-source gcs --executor frisky --scheduler 192.168.1.74:8796 --batch 8
 
     # local pars (testing, or a pre-staged corpus)
     uv run backfill_parallel.py --era 0p4 --par-source local \
@@ -106,6 +106,10 @@ def stage_pars(date: str, loc: dict, dest: str | None, limit: int | None = None)
     a single par for its variable peek.
     """
     source = loc["source"]
+    if loc.get("sa_key_path"):
+        # remote workers have no ambient GCS credentials; the coordinator pushes
+        # the key to each VM once and names its path here.
+        os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", loc["sa_key_path"])
     if source == "local":
         d = Path(loc["pars_root"]) / date
         n = len(list(d.glob("*.parquet")))
@@ -304,29 +308,32 @@ def memory_budget_workers(requested: int) -> int:
 
 
 def make_executor(args):
-    """A local process pool, or the Dask cluster the realize stage already uses.
+    """(submit_fn, as_completed_fn, shutdown_fn) for the chosen backend.
 
-    `write_date` is executor-agnostic -- a ForkSession pickles either way -- so the
-    choice is purely about where the network is. Local is right when the pars are
-    already on disk. Dask is right for a real backfill: the work is I/O-bound
-    (~45 s wall per date against ~5.5 s CPU), so what scales is putting the fetch
-    next to more bandwidth, ideally in the bucket's own region. Local process
-    parallelism does not help with that -- measured on this 8-core host, 4
-    concurrent pandas parsers only reached ~1.8x because they contend for memory
-    bandwidth, not CPU.
+    `write_date` is backend-agnostic -- a ForkSession pickles either way -- so the
+    choice is about where the memory and the CPU live.
+
+    local   process pool on this host. Simple, but the gateway cgroup caps at 8 GB
+            and each worker peaks ~0.7 GB parsing 51 pars, so it is the tight one.
+    frisky  the six EWC VMs, 15.6 GB each. Moves the parse off the gateway
+            entirely, which is the point: the coordinator then holds only the
+            changesets it is committing. Costs network -- a fork is ~110 bytes/ref,
+            so a 654k-ref date returns ~72 MB -- but buys ~90 GB of worker RAM.
+
+    Note this is `frisky`, not `distributed`: distributed is not installed on the
+    gateway, and frisky is what parallel_write.py and the realize stage use.
     """
-    if args.executor == "dask":
-        from distributed import Client
-        client = Client(args.scheduler)
-        print(f"  dask cluster {args.scheduler}: "
-              f"{len(client.scheduler_info()['workers'])} worker(s)")
-        return client
-    return ProcessPoolExecutor(memory_budget_workers(args.workers),
+    if args.executor == "frisky":
+        import frisky
+        client = frisky.Client(args.scheduler)
+        print(f"  frisky scheduler {args.scheduler}")
+        return (client.submit, frisky.as_completed, lambda: client.close())
+    pool = ProcessPoolExecutor(memory_budget_workers(args.workers),
                                mp_context=MP, initializer=init_worker)
+    return (pool.submit, as_completed, lambda: pool.shutdown())
 
 
-def shutdown_executor(ex) -> None:
-    (ex.close if hasattr(ex, "scheduler_info") else ex.shutdown)()
+
 
 
 def check_group(session, grp: str, era_name: str):
@@ -403,14 +410,20 @@ def main():
                     help="root of the par tree; date/run path is derived from it")
     ap.add_argument("--catalog", default=None,
                     help="catalog.parquet path; default fetches from HF")
-    ap.add_argument("--staging", default="./par-staging",
-                    help="scratch for downloaded pars; deleted per batch")
-    ap.add_argument("--executor", default="local", choices=["local", "dask"],
-                    help="local process pool, or the Dask cluster the realize "
-                         "stage uses. Dask is what scales a real backfill: the "
-                         "work is I/O-bound, so more workers = more bandwidth")
+    ap.add_argument("--staging", default="/tmp/frisky-ea/staging",
+                    help="scratch for downloaded pars, deleted per batch. With "
+                         "--executor frisky this path is used ON THE WORKER, so "
+                         "it must exist there too -- passing a coordinator-only "
+                         "path fails every date with EACCES")
+    ap.add_argument("--executor", default="local", choices=["local", "frisky"],
+                    help="local process pool, or the frisky cluster the realize "
+                         "stage uses (6 VMs x 15.6 GB). frisky moves the parse "
+                         "off this 8 GB-capped gateway")
     ap.add_argument("--scheduler", default="192.168.1.74:8796",
-                    help="dask scheduler address (--executor dask)")
+                    help="frisky scheduler address (--executor frisky)")
+    ap.add_argument("--worker-sa-key", default=None,
+                    help="path ON THE WORKER to a GCS key, for --executor frisky "
+                         "(push it with push_worker_key.py)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                     help="process count (--executor local)")
     ap.add_argument("--batch", type=int, default=20,
@@ -473,7 +486,7 @@ def main():
         # catalog.parquet only lists 00z, but the bucket holds all four runs for
         # the whole archive. A catalog row, when present, still wins.
         base = {"source": args.par_source, "pars_root": args.pars_root,
-                "keep_pars": args.keep_pars,
+                "keep_pars": args.keep_pars, "sa_key_path": args.worker_sa_key,
                 "gcs_path": f"{args.par_root_gcs}/{d[:4]}/{d[4:6]}/{d}/{args.run}z",
                 "hf_path": f"par/{d[:4]}/{d[4:6]}/{d}/{args.run}z"}
         if cat is not None and d in cat.index:
@@ -486,7 +499,7 @@ def main():
     print(f"  {len(batches)} batch(es) of up to {args.batch}, "
           f"{args.workers} {args.executor} worker(s), pars from {args.par_source}\n")
 
-    ex = make_executor(args)
+    submit, completed, shutdown = make_executor(args)
     # ONE commit in flight at a time, on its own thread. A batch's merge+commit
     # (~27 s) and the next batch's fanout (~27 s) are the two serial phases of
     # equal length; overlapping them is worth ~2x and costs no extra network,
@@ -539,10 +552,10 @@ def main():
         session = repo.writable_session("main")
         t_fan = _time.time()
         forks, nrefs, wrote, wt = [], 0, [], []
-        futs = {ex.submit(write_date, session.fork(), grp, args.era, d,
-                          loc_for(d), args.staging, ti, steps): (d, ti)
+        futs = {submit(write_date, session.fork(), grp, args.era, d,
+                       loc_for(d), args.staging, ti, steps): (d, ti)
                 for (d, ti) in staged}
-        for f in as_completed(futs):
+        for f in completed(list(futs)):
             d, ti = futs[f]
             try:
                 fork, _ti, n, tst, tp, ts = f.result()  # fork carries the changeset
@@ -576,7 +589,7 @@ def main():
     drain()
     committer.shutdown()
 
-    shutdown_executor(ex)
+    shutdown()
     el = _time.time() - t_start
     print(f"\n{done} dates, {total_refs:,} refs in {el/3600:.2f} h "
           f"({el/max(1,done):.1f} s/date)")
@@ -584,7 +597,12 @@ def main():
         print(f"{len(failed)} failed:")
         for d, why in failed[:20]:
             print(f"  {d}: {why}")
+        # Nonzero so a driver script stops instead of marching through every
+        # remaining group repeating the same failure. A wrong --staging path did
+        # exactly that: three groups "succeeded" with rc=0 and 0 dates written.
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
