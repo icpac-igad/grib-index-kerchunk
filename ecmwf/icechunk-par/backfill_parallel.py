@@ -72,6 +72,8 @@ import sys
 import time as _time
 from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
                                 as_completed)
+
+import icechunk
 from pathlib import Path
 
 # icechunk holds a tokio runtime; fork()ing a process that owns one deadlocks the
@@ -240,6 +242,23 @@ def write_date(fork, grp: str, era_name: str, date: str, loc: dict, staging: str
 # ---------------------------------------------------------------------------
 # coordinator
 # ---------------------------------------------------------------------------
+def merge_and_commit(session, forks, msg):
+    """Merge a batch's forks and commit, rebasing if another batch got there first.
+
+    Runs on the committer thread while the NEXT batch is already fanning out. The
+    two sessions are based on different snapshots, so the later commit always
+    conflicts; because every batch writes its own time indices the changes are
+    chunk-disjoint and BasicConflictSolver rebases them cleanly. Verified: two
+    concurrent sessions writing different indices, second rebases, both survive.
+    """
+    session.merge(*forks)
+    try:
+        return session.commit(msg)
+    except icechunk.ConflictError:
+        session.rebase(icechunk.BasicConflictSolver())
+        return session.commit(msg)
+
+
 def make_executor(args):
     """A local process pool, or the Dask cluster the realize stage already uses.
 
@@ -424,6 +443,26 @@ def main():
           f"{args.workers} {args.executor} worker(s), pars from {args.par_source}\n")
 
     ex = make_executor(args)
+    # ONE commit in flight at a time, on its own thread. A batch's merge+commit
+    # (~27 s) and the next batch's fanout (~27 s) are the two serial phases of
+    # equal length; overlapping them is worth ~2x and costs no extra network,
+    # unlike moving the workers off-box (a fork carries ~110 bytes/ref, so a
+    # 654k-ref date is a 72 MB changeset).
+    committer = ThreadPoolExecutor(1)
+    inflight = None            # Future -> snapshot id
+    inflight_label = None
+    have_arrays = set(zarr.open_group(store=repo.readonly_session("main").store,
+                                      path=grp, mode="r", zarr_format=3).array_keys())
+
+    def drain():
+        """Finish the in-flight commit, if any, and report it."""
+        nonlocal inflight, inflight_label
+        if inflight is None:
+            return
+        snap = inflight.result()
+        print(f"    committed {inflight_label} -> {str(snap)[:12]}")
+        inflight, inflight_label = None, None
+
     for bi, batch in enumerate(batches, 1):
         tb = _time.time()
         # --- coordinator: learn this batch's variable set --------------------
@@ -441,11 +480,18 @@ def main():
             print(f"batch {bi}/{len(batches)}: no date could be inspected")
             continue
         t_peek = _time.time() - tb
-        ensure_arrays(repo, grp, args.era, vars_by_date, steps, n_time)
+
+        # Creating an array is group metadata, NOT a disjoint chunk write, so it
+        # cannot be rebased against a pending batch. Serialise it.
+        wanted = {B.channel_name(v, pl, p2)
+                  for sfc, p2 in vars_by_date.values()
+                  for v, pl in [(x, False) for x in sfc] + [(x, True) for x in p2]}
+        if wanted - have_arrays:
+            drain()
+            ensure_arrays(repo, grp, args.era, vars_by_date, steps, n_time)
+            have_arrays |= wanted
 
         # --- fan out: each worker fetches its own pars, parses, sets refs ----
-        # fresh session: fork() refuses one with uncommitted changes, and
-        # ensure_arrays just committed.
         session = repo.writable_session("main")
         t_fan = _time.time()
         forks, nrefs, wrote, wt = [], 0, [], []
@@ -462,23 +508,29 @@ def main():
                 failed.append((d, f"write: {str(e).splitlines()[0][:80]}"))
         t_write = _time.time() - t_fan
 
-        # --- one commit for the whole batch ----------------------------------
         if not forks:
             session.discard_changes()
             print(f"batch {bi}/{len(batches)}: every date failed, nothing committed")
             continue
-        t_m = _time.time()
-        session.merge(*forks)
-        snap = session.commit(
-            f"{grp}: {len(wrote)} dates {min(wrote)}..{max(wrote)}, "
-            f"{nrefs} refs, 51 members")
+
+        # --- hand the commit to the committer, then go straight to the next
+        #     batch's fanout. drain() first so only one is ever in flight, which
+        #     bounds memory at two batches of changeset.
+        drain()
         agg = [sum(x[i] for x in wt) for i in range(3)]
         print(f"batch {bi}/{len(batches)}: {len(wrote)} dates | peek {t_peek:.0f}s "
               f"| fanout {t_write:.0f}s (worker-seconds: fetch {agg[0]:.0f} "
-              f"parse {agg[1]:.0f} setrefs {agg[2]:.0f}) "
-              f"| merge+commit {_time.time()-t_m:.0f}s | {nrefs:,} refs "
-              f"-> {str(snap)[:12]}")
+              f"parse {agg[1]:.0f} setrefs {agg[2]:.0f}) | {nrefs:,} refs "
+              f"-> commit in background")
+        inflight_label = f"batch {bi} ({len(wrote)} dates, {nrefs:,} refs)"
+        inflight = committer.submit(
+            merge_and_commit, session, forks,
+            f"{grp}: {len(wrote)} dates {min(wrote)}..{max(wrote)}, "
+            f"{nrefs} refs, 51 members")
         done += len(wrote); total_refs += nrefs
+
+    drain()
+    committer.shutdown()
 
     shutdown_executor(ex)
     el = _time.time() - t_start
