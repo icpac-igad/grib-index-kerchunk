@@ -136,6 +136,45 @@ def parse_par(path: Path) -> pd.DataFrame:
     return refs[["step_h", "var", "levtype", "level", "url", "offset", "length"]]
 
 
+MEMBERS_PER_CHUNK = 8
+
+
+def stream_date_refs(pars_dir: Path, per_chunk: int = MEMBERS_PER_CHUNK):
+    """Yield refs a few members at a time, in member order.
+
+    Stage 1 (Lithops) emits ONE PAR PER MEMBER because that is the grain of the
+    data: each `.index` line carries a `number` and each member's messages are a
+    distinct byte range. `load_date_refs` then concatenated all 51 into a single
+    654,585-row frame -- and `ref_specs` re-split it by variable one line later.
+    The merge bought nothing and cost everything: measured peak 1,328 MB against
+    a 101 MB resident result, because `frames` pins all 51 while `pd.concat`
+    allocates the union beside them.
+
+    Streaming keeps the stage-1 grain end to end, but ONE member per yield is
+    the wrong extreme: it turns 46 `set_virtual_refs` calls into 2,346 and the
+    per-call overhead doubles spec-building time. Measured on a 49r1 date:
+
+        members/chunk    1      4      8     17     51
+        spec build s   7.1    4.4    4.0    3.8    3.7
+        RSS delta MB     0     13     18     32    105
+
+    Parse time is flat across all of them -- the concat was never the time cost.
+    Eight keeps ~83% of the memory saving for ~8% of the time, so that is the
+    default. Same refs and same indices at any chunk size; only the call
+    granularity changes.
+    """
+    pars = sorted(pars_dir.glob("*.parquet"))
+    if len(pars) != N_MEMBERS:
+        raise SystemExit(f"expected {N_MEMBERS} pars in {pars_dir}, found {len(pars)}")
+    for i in range(0, len(pars), max(1, per_chunk)):
+        frames = []
+        for p in pars[i:i + per_chunk]:
+            r = parse_par(p)
+            r["number"] = member_number(p)
+            frames.append(r)
+        yield pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+
 def load_date_refs(pars_dir: Path) -> pd.DataFrame:
     pars = sorted(pars_dir.glob("*.parquet"))
     if len(pars) != N_MEMBERS:

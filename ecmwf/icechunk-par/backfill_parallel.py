@@ -228,26 +228,39 @@ def write_date(fork, grp: str, era_name: str, date: str, loc: dict, staging: str
     step_idx = {h: i for i, h in enumerate(steps)}
     pars_dir = stage_pars(date, loc, staging)     # fetch where the compute is
     t_stage = _time.time() - t0
+    # Stream in member chunks -- the grain stage 1 already produces. Concatenating
+    # all 51 at once peaked at 1,328 MB for a 101 MB result; 8 at a time holds
+    # ~18 MB without paying the per-call overhead that one-at-a-time costs.
+    # See B.stream_date_refs for the measured curve.
     t0 = _time.time()
-    refs = B.load_date_refs(Path(pars_dir))
-    t_parse = _time.time() - t0
-    dsteps = sorted(refs.step_h.unique())
-    if dsteps != list(steps):
-        raise RuntimeError(f"step mismatch: date has {len(dsteps)}, "
-                           f"group has {len(steps)}")
-    bad = set(refs.loc[refs.levtype == "pl", "level"].dropna()) - set(lev_idx)
-    if bad:
-        raise RuntimeError(f"levels {bad} outside the {era_name} superset")
-    sfc_vars, pl_vars = B.split_levtypes(refs)
-    t1 = _time.time()
+    t_parse = 0.0
     n = 0
-    for var, is_pl in [(v, False) for v in sfc_vars] + [(v, True) for v in pl_vars]:
-        zname = B.channel_name(var, is_pl, pl_vars)
-        specs = B.ref_specs(refs, var, is_pl, ti, step_idx, lev_idx)
-        rejected = fork.store.set_virtual_refs(f"{grp}/{zname}", specs)
-        if rejected:
-            raise RuntimeError(f"{grp}/{zname}: rejected refs {rejected}")
-        n += len(specs)
+    pl_vars = None          # fixed from member 1; the _sfc suffix depends on it
+    for mi, refs in enumerate(B.stream_date_refs(Path(pars_dir))):  # chunked
+        t_parse += _time.time() - t0
+        sfc_m, pl_m = B.split_levtypes(refs)
+        if mi == 0:
+            # validate once -- every member of a date carries the same steps,
+            # levels and variables, and doing it here keeps a bad date from
+            # writing any refs at all rather than half of them
+            dsteps = sorted(refs.step_h.unique())
+            if dsteps != list(steps):
+                raise RuntimeError(f"step mismatch: date has {len(dsteps)}, "
+                                   f"group has {len(steps)}")
+            bad = set(refs.loc[refs.levtype == "pl", "level"].dropna()) - set(lev_idx)
+            if bad:
+                raise RuntimeError(f"levels {bad} outside the {era_name} superset")
+            pl_vars = pl_m
+            t1 = _time.time()
+        for var, is_pl in [(v, False) for v in sfc_m] + [(v, True) for v in pl_m]:
+            zname = B.channel_name(var, is_pl, pl_vars)
+            specs = B.ref_specs(refs, var, is_pl, ti, step_idx, lev_idx)
+            rejected = fork.store.set_virtual_refs(f"{grp}/{zname}", specs)
+            if rejected:
+                raise RuntimeError(f"{grp}/{zname}: rejected refs {rejected}")
+            n += len(specs)
+        del refs
+        t0 = _time.time()
     if loc["source"] != "local" and not loc.get("keep_pars"):
         for f in Path(pars_dir).glob("*.parquet"):
             f.unlink()
@@ -563,6 +576,17 @@ def main():
                 wt.append((tst, tp, ts))
             except Exception as e:
                 failed.append((d, f"write: {str(e).splitlines()[0][:80]}"))
+            finally:
+                # Release the future the moment its result is in hand. A future
+                # holds its result -- here a whole changeset, ~39-78 MB -- and
+                # frisky only drops it on GC otherwise, so the batch's worth
+                # accumulates. This leaked per batch: 0p4 survived 67 batches at
+                # 7.9 GB, but 49r1/00z needs 402 and was OOM-killed partway.
+                rel = getattr(f, "release", None)
+                if rel is not None:
+                    try: rel()
+                    except Exception: pass
+        futs.clear()
         t_write = _time.time() - t_fan
 
         if not forks:
@@ -584,6 +608,10 @@ def main():
             merge_and_commit, session, forks,
             f"{grp}: {len(wrote)} dates {min(wrote)}..{max(wrote)}, "
             f"{nrefs} refs, 51 members")
+        # the committer owns them now; keeping our own refs would pin a third
+        # copy of the changeset for the length of the next batch's fanout
+        forks = []
+        session = None
         done += len(wrote); total_refs += nrefs
 
     drain()
