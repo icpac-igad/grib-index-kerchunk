@@ -147,35 +147,111 @@ gives frequent, free boundaries.
 
 ## 6. How to run it
 
+Working dir is `~/ecmwf-rebuild` (logs, date lists, `run_rebuild.sh`). The code
+lives in `grib-index-kerchunk/ecmwf/icechunk-par`.
+
+### Step 0 — cluster, code, credentials (once, and after any VM reboot)
+
 ```bash
-# 0. once: workers, code, credentials  (needs `distributed` — use an isolated venv,
-#    NOT /opt/mamba/envs/dask, which is shared)
+# deploy_workers.py imports `distributed`, which the gateway does not have.
+# Install it in a THROWAWAY venv, never into /opt/mamba/envs/dask -- the frisky
+# .venv is a symlink to that shared conda env.
+python3 -m venv /tmp/dw-venv && /tmp/dw-venv/bin/pip install -q distributed
+
+# --start clears any running workers first, so it IS the restart. It leaves the
+# scheduler alone. 6GB, not 10: two workers per 15.6 GB VM must not oversubscribe.
 /tmp/dw-venv/bin/python deploy_workers.py --start --scheduler 192.168.1.74:8796 \
     --workers-per-vm 2 --nthreads 4 --memory-limit 6GB
-python push_worker_key.py          # GCS key -> /tmp/frisky-ea/gcs-key.json (0600)
-python push_worker_code.py         # modules -> /tmp/frisky-ea/gik, verifies per-PID SHA
 
-# 1. date lists straight from the bucket (catalog.parquet is 00z-only)
-uv run make_run_date_lists.py --out dates/
-
-# 2. freeze each group's axis
-uv run build_ecmwf_icechunk.py --era 49r1 --run 06 --create-schema \
-    --dates-file dates/dates-49r1-06z.txt --store gs://.../ecmwf-ens-v4
-
-# 3. convert
-uv run backfill_parallel.py --era 49r1 --run 06 --store gs://.../ecmwf-ens-v4 \
-    --par-source gcs --executor frisky --scheduler 192.168.1.74:8796 \
-    --worker-sa-key /tmp/frisky-ea/gcs-key.json --batch 4 --limit 200
-
-# or all twelve, resumable, with coordinator recycling:
-cd ~/ecmwf-rebuild && LIMIT=200 ./run_rebuild.sh
+python push_worker_key.py     # GCS key -> /tmp/frisky-ea/gcs-key.json, 0600
+python push_worker_code.py    # modules -> /tmp/frisky-ea/gik
 ```
 
-Everything under `/tmp/frisky-ea` on the VMs is lost on reboot: the key, the
-shipped modules, the staging dir. Re-push all three after one.
+`push_worker_code.py` prints a **SHA per worker PID** and exits non-zero if any
+is stale. Read that output. Both worker processes on a VM must appear, both `OK`
+— an earlier version reported "unchanged" and left half the cluster on old code.
 
-`--par-source gcs`, never `hf`: **HuggingFace still holds the defective pars** for
-20260319 / 20260322-27 / 20260329-31 (collapsed pl levels).
+The coordinator needs the key at the **same path the workers use**, because a
+`ForkSession` carries the coordinator's `service_account_file` path:
+
+```bash
+install -m 600 icechunk-par/coiled-data.json /tmp/frisky-ea/gcs-key.json
+mkdir -p /tmp/frisky-ea/staging          # --staging is used ON THE WORKER too
+```
+
+### Step 1 — date lists, from the bucket
+
+```bash
+uv run make_run_date_lists.py --out ~/ecmwf-rebuild/dates/
+```
+
+Not from `catalog.parquet` — it lists 00z only. Era is assigned per (date, run),
+because every era transition happens at 06z.
+
+### Step 2 + 3 — schema then convert, all twelve groups
+
+```bash
+cd ~/ecmwf-rebuild
+LIMIT=200 RETRIES=3 setsid nohup ./run_rebuild.sh > logs/rebuild.log 2>&1 < /dev/null &
+```
+
+`setsid` is not optional. A plain `nohup ... &` from a short-lived shell here gets
+reaped when the parent exits — two launches died that way before this was found.
+
+The script loops **run-outer**: all of 00z across 50r1/0p4/49r1, then 06z, and so
+on, so the run everyone consumes finishes first. It recycles the coordinator every
+`LIMIT` dates, retries a group `RETRIES` times on a transient frisky channel drop,
+and aborts the sequence on a persistent failure.
+
+To do one group by hand:
+
+```bash
+uv run build_ecmwf_icechunk.py --era 49r1 --run 06 --create-schema \
+    --dates-file dates/dates-49r1-06z.txt --store gs://.../ecmwf-ens-v4 \
+    --sa-key /tmp/frisky-ea/gcs-key.json
+
+uv run backfill_parallel.py --era 49r1 --run 06 --store gs://.../ecmwf-ens-v4 \
+    --par-source gcs --sa-key /tmp/frisky-ea/gcs-key.json \
+    --executor frisky --scheduler 192.168.1.74:8796 \
+    --worker-sa-key /tmp/frisky-ea/gcs-key.json \
+    --staging /tmp/frisky-ea/staging --batch 4 --limit 200
+```
+
+### Step 4 — check on it
+
+```bash
+kill -0 $(cat ~/ecmwf-rebuild/rebuild.pid) && echo alive     # NOT pgrep
+grep -E "^=== |^    rc=|ABORT|retry|^done\." logs/rebuild.log
+awk '/VmRSS/{print int($2/1024)" MB"}' /proc/$(pgrep -f "backfill_parallel.py --era"|head -1)/status
+```
+
+**Use the pidfile.** `pgrep -f run_rebuild.sh` matches its own shell wrapper and
+will report a long-dead run as alive — that cost 25 hours of believing a stopped
+job was progressing. Logs are unbuffered (`python -u`), so a killed process leaves
+its error behind; without that, buffered output dies with the process and the log
+stops mid-batch with no explanation.
+
+### Knobs
+
+| var | default | raise/lower when |
+|---|---|---|
+| `LIMIT` | 200 | lower to 100 if the pre-recycle peak nears 8 GB; costs one resume probe (~0.25 s/date) |
+| `BATCH_0P4` | 6 | 0p4 dates are ~355k refs |
+| `BATCH_BIG` | 4 | 49r1/50r1 are ~654-712k refs; batch bounds COORDINATOR memory, not worker |
+| `RETRIES` | 3 | transient channel drops |
+| `ERAS` / `RUNS` | `$1` / `$2` | `./run_rebuild.sh "49r1" "00 06"` for a subset |
+
+### Rules learned the hard way
+
+- **Never touch the cluster while a conversion runs.** Pushing code, sampling
+  pars, or running experiments against the same scheduler killed three healthy
+  runs. Deploy at a recycle boundary or against a stopped run.
+- **Never edit a `.py` a live coordinator is executing.** Python reads source at
+  traceback time, so the traceback will quote lines that were never run.
+- Everything under `/tmp/frisky-ea` on the VMs is lost on reboot — key, modules,
+  staging. Re-push all three.
+- `--par-source gcs`, never `hf`: **HuggingFace still holds the defective pars**
+  for 20260319 / 20260322-27 / 20260329-31 (collapsed pl levels).
 
 ---
 
