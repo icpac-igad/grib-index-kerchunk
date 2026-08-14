@@ -202,7 +202,50 @@ Next, in order of leverage:
 4. **Twelve stores, one per group** — the only way past the serial commit, at the
    cost of twelve URLs instead of one.
 
-Still open from the other handover: **5,114 member-pars (2.0%) are missing at
-least one step**, spread across 1,894 of 5,023 (date, run) pairs. They will be
-baked in as NaN. Nothing detects this today — the step axis is a union across
-members, so the build succeeds silently.
+### Retracted: the "5,114 short member-pars" figure
+
+An earlier version of this document claimed **5,114 member-pars (2.0%) are
+missing at least one step, across 78% of dates**. **That was an artifact of the
+screening method. Do not act on it.**
+
+The screen compared each par's file size against the median of its (date, run)
+group. Par size varies for two benign reasons that swamp the signal:
+
+- **Control is always the smallest par.** A par stores `[url, offset, length]`
+  as text, and control is the first message block in each GRIB, so its byte
+  offsets are the smallest numbers in the file. Shorter strings, smaller
+  parquet. That is why control was 155 of 233 flagged pars at 00z where uniform
+  would predict 4.6, and why the ranking tracked member number.
+- **Par size tracks the pl-level regime.** Normalising each member against
+  itself across dates instead flags every 9-level date inside the 49r1 era at
+  ~0.55x a 13-level median — 37.9% of the corpus.
+
+Direct measurement of step counts, which is what the claim was about:
+
+| test | result |
+|---|---|
+| 8 pars from the top of the flagged 00z list | **all 85/85 steps, complete** |
+| 48 random (date, run, member) pars corpus-wide | **0 short** |
+| 95% CI on the true short-par rate | **0.0% – 0.0%** |
+
+The compounding error: the "8 of 8 sampled were genuinely short" check that gave
+the figure its confidence sampled the *most extreme* flagged ratios — the tail,
+not the population. It confirmed the screen's worst cases and said nothing about
+the base rate.
+
+**What is actually confirmed**, by reading step counts rather than sizes:
+`20240229 18z control` is missing step 0, and that data IS present in the source
+`.index` as a `type=cf` record — so it is a par-generation gap, not an ECMWF gap.
+A handful of 06z/18z members at 44–48 steps were seen while validating the
+screen. Real, but few, and **there is no defensible estimate of how many more
+exist.**
+
+**The right way to answer this** is the store's own manifest, not par sizes:
+`Session.chunk_coordinates(array_path)` enumerates exactly which chunks exist, so
+one pass over a surface variable per group yields every missing
+`(time, number, step)` directly — no sampling, no proxy. That check is not built
+yet and is the outstanding work here.
+
+The general lesson, and it is the same one as the longitude bug: a proxy
+measurement that correlates with the thing you care about is not the thing you
+care about. Verify against the quantity itself before quoting a number.
