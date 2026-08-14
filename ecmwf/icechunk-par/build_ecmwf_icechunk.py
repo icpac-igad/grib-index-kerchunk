@@ -414,17 +414,30 @@ def date_written(session, grp: str, g, ti: int) -> bool:
     chunk of one data array is enough, since a date is committed atomically.
     Returns False for a group with no data arrays yet.
     """
-    for name in sorted(g.array_keys()):
-        if name in COORD_NAMES:
-            continue
+    names = [n for n in sorted(g.array_keys()) if n not in COORD_NAMES]
+    if not names:
+        return False
+    # Probe SEVERAL arrays, not just the first. Schema drift is real across an
+    # era, so a date can legitimately lack a given variable -- and the first name
+    # alphabetically in 49r1 is `100u`, a surface field that 19 of 804 dates do
+    # not carry. Trusting it alone declared those dates unwritten forever: the
+    # recycle loop rewrote them, exited, re-probed, and looped 44 times without
+    # ever reaching "nothing to do".
+    #
+    # Sample evenly across the sorted list rather than taking the first N, so the
+    # probes span surface AND pressure-level variables (t/u/v/q sort mid-to-late,
+    # and are the ones present on every date). ANY written chunk proves the date
+    # landed, so the common resume case costs one probe.
+    step = max(1, len(names) // 8)
+    for name in names[::step][:8]:
         idx = [ti] + [0] * (len(g[name].shape) - 1)
         try:
             # chunk_type wants an absolute path; anything other than
             # "uninitialized" (virtual/inline/native) means it was written.
-            t = str(session.chunk_type(f"/{grp}/{name}", idx))
+            if str(session.chunk_type(f"/{grp}/{name}", idx)) != "ChunkType.uninitialized":
+                return True
         except Exception:
             return False        # older icechunk without chunk_type -> don't block
-        return t != "ChunkType.uninitialized"
     return False
 
 
