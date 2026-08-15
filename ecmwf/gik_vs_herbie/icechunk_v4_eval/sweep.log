@@ -1,0 +1,278 @@
+############ 0p4 20230318 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  0p4/00z
+date=20230318 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=9.18e-05 max|diff|=0.000183
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t500_20230318_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=0.00018 max|diff|=0.000458
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t850_20230318_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t_20230318_T0h.json
+RESULT: PASS
+    rc=0
+############ 0p4 20231112 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  0p4/00z
+date=20231112 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=9.56e-05 max|diff|=0.000214
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t500_20231112_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=0.000182 max|diff|=0.000519
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t850_20231112_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t_20231112_T0h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20240327 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20240327 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=8.87e-05 max|diff|=0.000214
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t500_20240327_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=0.000186 max|diff|=0.000732
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t850_20240327_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t_20240327_T0h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20251125 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20251125 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=9.31e-05 max|diff|=0.000183
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t500_20251125_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=9.59e-05 max|diff|=0.000641
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t850_20251125_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t_20251125_T0h.json
+RESULT: PASS
+    rc=0
+############ 50r1 20260621 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  50r1/00z
+date=20260621 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999853 RMSE=0.00281 max|diff|=0.0203
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t500_20260621_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999983 RMSE=0.00317 max|diff|=0.0343
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t850_20260621_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t_20260621_T0h.json
+RESULT: PASS
+    rc=0
+############ 50r1 20260701 00z  T+0h  t 500,850 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  50r1/00z
+date=20260701 step=T+0h var=t levels=[500, 850]
+==============================================================================
+
+[t@500hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999885 RMSE=0.00276 max|diff|=0.0203
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t500_20260701_T0h.png
+
+[t@850hPa T+0h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999980 RMSE=0.00343 max|diff|=0.0467
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t850_20260701_T0h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t_20260701_T0h.json
+RESULT: PASS
+    rc=0
+############ 0p4 20231112 00z  T+48h  u 700 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  0p4/00z
+date=20231112 step=T+48h var=u levels=[700]
+==============================================================================
+
+[u@700hPa T+48h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99998994 RMSE=0.0163 max|diff|=0.0954
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_u700_20231112_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_u_20231112_T48h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20251125 00z  T+48h  u 700 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20251125 step=T+48h var=u levels=[700]
+==============================================================================
+
+[u@700hPa T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999809 RMSE=0.0113 max|diff|=0.0958
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_u700_20251125_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_u_20251125_T48h.json
+RESULT: PASS
+    rc=0
+############ 50r1 20260701 00z  T+48h  u 700 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  50r1/00z
+date=20260701 step=T+48h var=u levels=[700]
+==============================================================================
+
+[u@700hPa T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999718 RMSE=0.0132 max|diff|=0.078
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_u700_20260701_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_u_20260701_T48h.json
+RESULT: PASS
+    rc=0
+############ 0p4 20231112 00z  T+48h  t2m sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  0p4/00z
+date=20231112 step=T+48h var=t2m (surface)
+==============================================================================
+
+[t2m T+48h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999745 RMSE=0.00906 max|diff|=0.0631
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t2m_20231112_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_t2m_sfc_20231112_T48h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20251125 00z  T+48h  t2m sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20251125 step=T+48h var=t2m (surface)
+==============================================================================
+
+[t2m T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999904 RMSE=0.00655 max|diff|=0.0612
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t2m_20251125_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t2m_sfc_20251125_T48h.json
+RESULT: PASS
+    rc=0
+############ 50r1 20260701 00z  T+48h  t2m sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  50r1/00z
+date=20260701 step=T+48h var=t2m (surface)
+==============================================================================
+
+[t2m T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999897 RMSE=0.00702 max|diff|=0.0732
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t2m_20260701_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_t2m_sfc_20260701_T48h.json
+RESULT: PASS
+    rc=0
+############ 0p4 20231112 00z  T+48h  tp sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  0p4/00z
+date=20231112 step=T+48h var=tp (surface)
+==============================================================================
+
+[tp T+48h]
+  store  : 51 members, grid 98x90, lat 24.80..-14.00, lon 19.20..54.80
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99996700 RMSE=7.29e-05 max|diff|=0.000834
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_tp_20231112_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_0p4_tp_sfc_20231112_T48h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20251125 00z  T+48h  tp sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20251125 step=T+48h var=tp (surface)
+==============================================================================
+
+[tp T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99995378 RMSE=2.6e-05 max|diff|=0.00046
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_tp_20251125_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_tp_sfc_20251125_T48h.json
+RESULT: PASS
+    rc=0
+############ 50r1 20260701 00z  T+48h  tp sfc ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  50r1/00z
+date=20260701 step=T+48h var=tp (surface)
+==============================================================================
+
+[tp T+48h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99995176 RMSE=3.98e-05 max|diff|=0.00211
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_tp_20260701_T48h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_50r1_tp_sfc_20260701_T48h.json
+RESULT: PASS
+    rc=0
+############ 49r1 20240327 00z  T+36h  t 500 ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20240327 step=T+36h var=t levels=[500]
+==============================================================================
+
+[t@500hPa T+36h]
+  store  : 51 members, grid 157x145, lat 25.00..-14.00, lon 19.00..55.00
+  store  : 1 all-NaN members [24]
+  per-member: 49 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> FAIL
+  ensemble  : 51m vs 50m | mean r=0.99999134 RMSE=0.00918 max|diff|=0.0437
+  plot -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t500_20240327_T36h.png
+
+stats -> gik_vs_herbie/icechunk_v4_eval/icechunk_v4_49r1_t_20240327_T36h.json
+RESULT: FAIL
+    rc=1
+############ ALL DONE ############

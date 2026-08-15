@@ -238,10 +238,21 @@ def herbie_ensemble(date_str, run, var, level, step):
     da = ds[vn]
     if "number" not in da.dims:
         da = da.expand_dims("number")
-    # reindex onto the exact GIK ICPAC grid for a clean diff
-    da = da.sel(latitude=slice(LAT_MAX, LAT_MIN), longitude=slice(LON_MIN, LON_MAX))
-    da = da.reindex(latitude=ICPAC_LATS, longitude=ICPAC_LONS, method="nearest")
+    # Select the GIK ICPAC labels directly, with a tolerance far below half a
+    # cell (0.125 deg on the coarsest grid). Do NOT slice-then-reindex: eccodes
+    # reports the 0.4 deg axis edge as -14.000000000000057, so
+    # slice(LAT_MAX, LAT_MIN) drops that row -- 97 of 98 -- and a bare
+    # method="nearest" reindex then back-fills it from -13.6. That duplicated
+    # edge row is what produced the 0.57 K "difference" this file once reported
+    # for every 0p4 date; with the tolerance it is 9e-05, and per-member the
+    # fields are bit-identical. 0p25 was never affected -- its edges land on
+    # exactly representable floats. See gik_vs_herbie/icechunk_v4_eval/README.md.
+    da = da.sel(latitude=ICPAC_LATS, longitude=ICPAC_LONS,
+                method="nearest", tolerance=0.01)
     vals = da.values  # (number, lat, lon)
+    if vals.shape[-2:] != (len(ICPAC_LATS), len(ICPAC_LONS)):
+        raise RuntimeError(f"herbie grid {vals.shape[-2:]} != GIK "
+                           f"{(len(ICPAC_LATS), len(ICPAC_LONS))}")
     mean = np.nanmean(vals, axis=0)
     std = np.nanstd(vals, axis=0)
     return mean, std, vals.shape[0]
