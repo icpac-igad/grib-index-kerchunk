@@ -9,22 +9,30 @@ full ECMWF run (2026-07-06/07, observed results at the bottom).
 
 | | ECMWF | GEFS |
 |---|---|---|
-| store | `gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens` (groups `0p4/00z`, `49r1/00z`, `50r1/00z`) | `gs://gik-gefs-aws-tf/icechunk/gefs-ens` (group `0p25/00z`) |
-| pars source | HF `E4DRR/gik-ecmwf-par-v2` (catalog.parquet) | `gs://gik-gefs-aws-tf/run_par_gefs` (GCS tree is authoritative) |
-| driver | `ecmwf/icechunk-par/backfill_all_eras.py` | `gefs/backfill_gefs_icechunk.py` |
-| log | `ecmwf/icechunk-par/backfill.log` (stdout redirect) | `gefs/backfill_gefs.log` (written by the script) |
-| corpus | 1,256 dates | 2,031 dates |
-| measured | ~25–120 s/date (grows with era refs) — 20.6 h total | ~10–17 s/date — ~7–8 h total |
+| store | `gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4` (12 groups: `{0p4,49r1,50r1}/{00,06,12,18}z`) | `gs://gik-gefs-aws-tf/icechunk/gefs-ens` (group `0p25/00z`) |
+| pars source | `gs://gik-ecmwf-aws-tf/v20260623_run_par_ecmwf` (**GCS, not HF** — HF still holds the defective March-2026 pars) | `gs://gik-gefs-aws-tf/run_par_gefs` (GCS tree is authoritative) |
+| driver | `backfill_all_eras.py` (sequential) or `backfill_parallel.py` (frisky/local fan-out) | `gefs/backfill_gefs_icechunk.py` |
+| log | whatever you redirect to; `~/ecmwf-rebuild/logs/` by convention | `gefs/backfill_gefs.log` (written by the script) |
+| corpus | 5,023 (date, run) pairs — 1,257 dates × 4 runs, minus gaps | 2,031 dates |
+| measured | sequential 34–60 s/date; parallel 15–29 s/date | ~10–17 s/date — ~7–8 h total |
+
+Which ECMWF driver: `backfill_parallel.py` is ~2–4× faster but needs the frisky
+cluster (6 EWC VMs), a pushed key and pushed code, and it is the one that has to
+be babysat — see `HANDOVER_PAR_TO_ICECHUNK_SCALING.md` §5. `backfill_all_eras.py`
+needs nothing but this host: one date per subprocess, one commit per date, flat
+coordinator memory, so no recycle loop and nothing to keep alive.
 
 ## 1. Launch (upload)
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
+export GOOGLE_APPLICATION_CREDENTIALS=/tmp/frisky-ea/gcs-key.json
 
-# ECMWF
+# ECMWF, sequential -- run-outer, smallest era first, resumable
 cd grib-index-kerchunk/ecmwf/icechunk-par
-nohup uv run backfill_all_eras.py \
-    --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens > backfill.log 2>&1 &
+setsid nohup uv run backfill_all_eras.py \
+    --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4 \
+    --sa-key /tmp/frisky-ea/gcs-key.json \
+    --era 50r1,0p4,49r1 --run 12,18 > ~/ecmwf-rebuild/logs/serial.log 2>&1 &
 
 # GEFS (logs itself to backfill_gefs.log)
 cd grib-index-kerchunk/gefs
@@ -32,22 +40,34 @@ nohup uv run backfill_gefs_icechunk.py \
     --store gs://gik-gefs-aws-tf/icechunk/gefs-ens > /dev/null 2>&1 &
 ```
 
-Both drivers are **safe to kill at any point**: one commit per date, and on
-restart they re-read the store's per-group time axes and skip everything
-already committed. Disk use is one date of pars (~25 MB), deleted after each
-commit. First-time note: the store must be built in chronological order, so
-never hand-commit ad-hoc test dates into a group before its backfill.
+Every ECMWF group must already exist with a **preallocated** time axis; that is
+what gives each date a fixed index. Create it once per (era, run):
+
+```bash
+uv run build_ecmwf_icechunk.py --era 49r1 --run 12 --create-schema \
+    --dates-file ~/ecmwf-rebuild/dates/dates-49r1-12z.txt --store gs://...-v4
+```
+
+All drivers are **safe to kill at any point**: one commit per date, and on
+restart they skip what is already there. Disk use is one date of pars (~25 MB),
+deleted after each commit. `setsid` is not optional — a plain `nohup ... &` from
+a short-lived shell gets reaped when the parent exits.
 
 ## 2. Monitor
 
 ```bash
-tail -f backfill.log            # per-date lines: "[N/M] era DATE: ok in Ns (ETA H h)"
-grep -c "ok in" backfill.log    # dates completed
-grep "FAILED" backfill.log      # failures so far (driver continues past them)
+tail -f serial.log              # per-date: "[N/M] era/RUNz DATE (t=i): ok in Ns (ETA H h)"
+grep -c "ok in" serial.log      # dates completed
+grep "FAILED" serial.log        # failures so far (driver continues past them)
+kill -0 $(cat ~/ecmwf-rebuild/serial.pid) && echo alive   # pidfile, NOT pgrep
+
+# per-group holes, straight from the manifest (the ground truth):
+uv run verify_store_completeness.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4 \
+    --era 49r1 --run 12 --sa-key /tmp/frisky-ea/gcs-key.json
 
 # full store health (read-only, safe beside the live writer):
-uv run check_store_health.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens \
-    --expected-dates 1256 --decode --log backfill.log
+uv run check_store_health.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4 \
+    --expected-dates 1256 --decode --log serial.log
 # GEFS: --store gs://gik-gefs-aws-tf/icechunk/gefs-ens \
 #       --container s3://noaa-gefs-pds/ --expected-dates 2031
 ```
@@ -64,22 +84,31 @@ failed dates (re-run to retry): ['20231206', '20231207', '20260319', ...]
 
 ## 3. Retry the missing dates
 
-**The retry is the same command as the launch.** Resume logic finds the gaps
-(catalog/GCS dates not in the store's time axes) and rebuilds only those:
+**The retry is the same command as the launch.** For each group the driver reads
+the preallocated time axis, probes the manifest at every index
+(`build_ecmwf_icechunk.date_written`), and rebuilds only the slots with no refs:
 
 ```bash
-uv run backfill_all_eras.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens
+uv run backfill_all_eras.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4 \
+    --sa-key /tmp/frisky-ea/gcs-key.json --era 49r1 --run 06
 # GEFS identical: uv run backfill_gefs_icechunk.py --store gs://gik-gefs-aws-tf/icechunk/gefs-ens
 ```
 
-Because the group tip has moved past the missing dates, the builder appends
-them **out of order as gap fills** (it prints a loud NOTE). Consequences:
+A missed date is refilled **at its own index**, so nothing goes out of order —
+the sorted-axis defect that the legacy append-mode store had is impossible here.
+The scan costs ~0.1 s/date (115 s for an 804-date group), and it is the only
+thing that runs before work starts.
 
-- the group's time axis is no longer sorted — consumers do `ds.sortby("time")`
-  (exact `.sel(time="YYYY-MM-DD")` lookups work regardless; only slices need
-  sorting);
-- `check_store_health.py` reports the unsorted axis as a **WARN**, not a
-  failure, and keeps checking uniqueness/shapes as usual.
+Two traps that cost days on the parallel driver, both still live here:
+
+- **A running coordinator holds its code in memory.** Fixing `date_written` on
+  disk changed nothing for the process already running: it kept re-declaring the
+  same 18 dates unwritten, rebuilt them, exited, re-probed, and looped — 44 times
+  on 49r1/00z, and again on 49r1/06z until it was stopped on 2026-08-15. After
+  any code change, **stop and relaunch**; do not assume a live run picked it up.
+- **A spinning run looks healthy.** Each loop logs a fresh batch of the same
+  dates. Read the `N to build / M already written` line across restarts — if the
+  same N keeps reappearing, it is looping, not progressing.
 
 ## 4. Triage: not every failure is retryable
 
@@ -107,3 +136,21 @@ distinguishable straight from the log.
 - Mid-run schema drift (49r1 vars appearing/disappearing across 2024→2026)
   was absorbed automatically: the builders resize every array on each append,
   so groups stay openable throughout.
+
+## 6. The v4 rebuild (2026-08-14 →)
+
+`icechunk/ecmwf-ens-v4` is the post-longitude-fix store, 12 preallocated groups,
+built from GCS pars. State on 2026-08-15:
+
+| run | 50r1 (52) | 0p4 (~400) | 49r1 (804) |
+|---|---|---|---|
+| 00z | done | done | done |
+| 06z | done | done | done — last 18 dates finished by the sequential driver |
+| 12z | done | in progress | queued |
+| 18z | done | queued | queued |
+
+The 12z/18z remainder (2,406 dates) is running under `backfill_all_eras.py`
+rather than the frisky driver, after 49r1/06z spun on a stale-code coordinator.
+Measured on the same store, same pars: **37 s/date** for 49r1/06z (49 steps),
+34 s/date for 0p4/12z (85 steps) — about 28 h for what is left, against roughly
+10 h for the parallel path with the cluster kept healthy.
