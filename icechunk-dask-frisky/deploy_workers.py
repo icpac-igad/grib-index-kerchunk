@@ -48,7 +48,14 @@ DASK_SCHEDULER = "tcp://127.0.0.1:8786"
 # Quoted individually when written into the install script -- an unquoted
 # `frisky>=0.3.0` is a shell redirect, not a version specifier.
 PACKAGES = ["frisky>=0.3.0", "icechunk==2.1.1", "zarr==3.2.1",
-            "xarray==2026.7.0", "gribberish==1.6.0", "numpy==2.5.1"]
+            "xarray==2026.7.0", "gribberish==1.6.0", "numpy==2.5.1",
+            # stage 2 (par -> icechunk) parses parquet and reads pars from GCS on
+            # the worker. pandas arrives as an xarray dep, but WITHOUT pyarrow --
+            # and installing pyarrow into a worker that has already imported
+            # pandas leaves arrow's extension-type registry inconsistent
+            # ("pandas.period already defined"). Both must be present at install
+            # time, before the worker starts.
+            "pandas==3.0.5", "pyarrow==25.0.1", "google-cloud-storage"]
 
 
 # ── remote functions.  Each returns fast; nothing blocks the Dask worker's
