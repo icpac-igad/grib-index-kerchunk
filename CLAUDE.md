@@ -50,7 +50,11 @@ byte-range reads.
 - **Index files**: `.index` (JSON-lines format, each line is a JSON object with `_offset`, `_length`, `param`, `number`, `step`, etc.)
 - **Members**: 51 (1 control + 50 ensemble, encoded as `number` field in `.index`)
 - **Resolution**: 0.25 deg global
-- **Forecast range**: 0-144h at 3h, 150-360h at 6h (85 timesteps)
+- **Forecast range**: run-dependent, and it is *not* era-dependent —
+  **00z/12z** run 0-144h at 3h then 150-360h at 6h (**85 steps**);
+  **06z/18z** are short-range, 0-144h at 3h throughout (**49 steps**).
+  The short axis is an exact **prefix** of the long one, not an interleave, so
+  a short run can share a long group's step coordinate with no index remapping.
 - **File size**: ~3-4 GB per timestep (all 51 members packed into one file)
 - **Public access**: Anonymous (`anon=True`)
 
@@ -59,6 +63,10 @@ byte-range reads.
 > regimes that differ in pl-level count and control stream layout) — see
 > "ECMWF spans FOUR template eras" under Pre-Built Templates below. The
 > path, resolution, member count, and pl-level set are all era-dependent.
+> The **step axis is not**: the 85/49 split above was verified by listing
+> `s3://ecmwf-forecasts` for 13 dates across all three eras and both 50r1
+> streams (`enfo` and `oper/fc`) — every one of them 85/49/85/49
+> (2026-08-17). All twelve groups of `icechunk/ecmwf-ens-v4` match it exactly.
 
 ### Key Structural Difference
 
