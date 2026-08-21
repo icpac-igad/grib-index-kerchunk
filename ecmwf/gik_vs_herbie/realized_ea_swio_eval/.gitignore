@@ -1,0 +1,2 @@
+# plots are regenerable from the store + the compare script; keep only stats + notes
+*.png

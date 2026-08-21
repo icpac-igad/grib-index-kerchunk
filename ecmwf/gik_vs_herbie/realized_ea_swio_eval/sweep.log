@@ -1,0 +1,185 @@
+############ 49r1-mam2024  20240327  T+48h  t850 ############
+
+[49r1-mam2024 20240327 T+48h t850]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999860 RMSE=0.00888 max|diff|=0.0722
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_t850_20240327_T48h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_t850_20240327_T48h.json
+RESULT: PASS
+############ 49r1-mam2024  20240315  T+120h  tp ############
+
+[49r1-mam2024 20240315 T+120h tp]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99998053 RMSE=0.000101 max|diff|=0.00162
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_tp_20240315_T120h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_tp_20240315_T120h.json
+RESULT: PASS
+############ 49r1-mam2024  20240501  T+0h  u700 ############
+
+[49r1-mam2024 20240501 T+0h u700]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 0 matched | min r=nan | max|diff|=nan (nan of range)  -> FAIL
+Traceback (most recent call last):
+  File "/var/lib/private/nishadhka/grib-index-kerchunk/ecmwf/compare_realized_herbie.py", line 237, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/var/lib/private/nishadhka/grib-index-kerchunk/ecmwf/compare_realized_herbie.py", line 222, in main
+    print(f"  ensemble  : {s_v.shape[0]}m vs {h_v.shape[0]}m | mean r={m['corr']:.8f} "
+                                                                       ~^^^^^^^^
+KeyError: 'corr'
+############ 49r1-mam2024  20240520  T+24h  t2m ############
+
+[49r1-mam2024 20240520 T+24h t2m]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 0 matched | min r=nan | max|diff|=nan (nan of range)  -> FAIL
+Traceback (most recent call last):
+  File "/var/lib/private/nishadhka/grib-index-kerchunk/ecmwf/compare_realized_herbie.py", line 237, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/var/lib/private/nishadhka/grib-index-kerchunk/ecmwf/compare_realized_herbie.py", line 222, in main
+    print(f"  ensemble  : {s_v.shape[0]}m vs {h_v.shape[0]}m | mean r={m['corr']:.8f} "
+                                                                       ~^^^^^^^^
+KeyError: 'corr'
+############ 49r1-mam2025  20250315  T+48h  gh500 ############
+
+[49r1-mam2025 20250315 T+48h gh500]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999975 RMSE=0.0424 max|diff|=0.491
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_gh500_20250315_T48h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_gh500_20250315_T48h.json
+RESULT: PASS
+############ 49r1-mam2025  20250420  T+240h  tp ############
+
+[49r1-mam2025 20250420 T+240h tp]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99996078 RMSE=0.000214 max|diff|=0.00327
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_tp_20250420_T240h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_tp_20250420_T240h.json
+RESULT: PASS
+############ 49r1-mam2025  20250510  T+72h  q925 ############
+
+[49r1-mam2025 20250510 T+72h q925]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999625 RMSE=1.31e-05 max|diff|=0.000181
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_q925_20250510_T72h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_q925_20250510_T72h.json
+RESULT: PASS
+############ 49r1-mam2025  20250501  T+0h  msl ############
+
+[49r1-mam2025 20250501 T+0h msl]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=0.0243 max|diff|=0.18
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_msl_20250501_T0h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2025_msl_20250501_T0h.json
+RESULT: PASS
+############ 49r1-mam2026  20260310  T+48h  t850 ############
+
+[49r1-mam2026 20260310 T+48h t850]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999932 RMSE=0.0068 max|diff|=0.0526
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_t850_20260310_T48h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_t850_20260310_T48h.json
+RESULT: PASS
+############ 49r1-mam2026  20260401  T+96h  tcwv ############
+
+[49r1-mam2026 20260401 T+96h tcwv]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999340 RMSE=0.0498 max|diff|=0.387
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_tcwv_20260401_T96h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_tcwv_20260401_T96h.json
+RESULT: PASS
+############ 49r1-mam2024  20240320  T+0h  u700 ############
+
+[49r1-mam2024 20240320 T+0h u700]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=1.00000000 RMSE=0.00018 max|diff|=0.000656
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_u700_20240320_T0h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_u700_20240320_T0h.json
+RESULT: PASS
+############ 49r1-mam2024  20240402  T+24h  t2m ############
+
+[49r1-mam2024 20240402 T+24h t2m]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999915 RMSE=0.00895 max|diff|=0.0951
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_t2m_20240402_T24h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2024_t2m_20240402_T24h.json
+RESULT: PASS
+############ 49r1-mam2026  20260415  T+24h  v850 ############
+
+[49r1-mam2026 20260415 T+24h v850]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999414 RMSE=0.0133 max|diff|=0.148
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_v850_20260415_T24h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_v850_20260415_T24h.json
+RESULT: PASS
+############ 49r1-mam2026  20260512  T+0h  u10 ############
+
+[49r1-mam2026 20260512 T+0h u10]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999999 RMSE=0.00081 max|diff|=0.0103
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_u10_20260512_T0h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_49r1-mam2026_u10_20260512_T0h.json
+RESULT: PASS
+############ 50r1-mam2026-tail  20260515  T+48h  t850 ############
+
+[50r1-mam2026-tail 20260515 T+48h t850]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999921 RMSE=0.0079 max|diff|=0.081
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_t850_20260515_T48h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_t850_20260515_T48h.json
+RESULT: PASS
+############ 50r1-mam2026-tail  20260520  T+120h  tp ############
+
+[50r1-mam2026-tail 20260520 T+120h tp]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99998110 RMSE=0.000102 max|diff|=0.00211
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_tp_20260520_T120h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_tp_20260520_T120h.json
+RESULT: PASS
+############ 50r1-mam2026-tail  20260525  T+72h  vo850 ############
+
+[50r1-mam2026-tail 20260525 T+72h vo850]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99984748 RMSE=6.9e-07 max|diff|=1.38e-05
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_vo850_20260525_T72h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_vo850_20260525_T72h.json
+RESULT: PASS
+############ 50r1-mam2026-tail  20260531  T+0h  skt ############
+
+[50r1-mam2026-tail 20260531 T+0h skt]
+  store : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999992 RMSE=0.00284 max|diff|=0.0533
+  plot -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_skt_20260531_T0h.png
+  stats -> gik_vs_herbie/realized_ea_swio_eval/realized_50r1-mam2026-tail_skt_20260531_T0h.json
+RESULT: PASS
+############ COMPENSATE (virtual v4)  20240520  T+24h  t2m ############
+==============================================================================
+Icechunk v4 vs Herbie — gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4  49r1/00z
+date=20240520 step=T+24h var=t2m (surface)
+==============================================================================
+
+[t2m T+24h]
+  store  : 51 members, grid 321x261, lat 40.00..-40.00, lon 15.00..80.00
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+  ensemble  : 51m vs 50m | mean r=0.99999890 RMSE=0.00957 max|diff|=0.131
+  plot -> gik_vs_herbie/realized_ea_swio_eval/icechunk_v4_49r1_t2m_20240520_T24h_easwio.png
+
+stats -> gik_vs_herbie/realized_ea_swio_eval/icechunk_v4_49r1_t2m_sfc_20240520_T24h_easwio.json
+RESULT: PASS
+############ REST DONE ############

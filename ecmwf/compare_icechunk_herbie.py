@@ -241,7 +241,8 @@ def _map(ax, data, lons, lats, title, cmap, vmin, vmax):
 
 
 def plot_compare(date, era, var, level, step, lats, lons,
-                 s_mean, s_std, h_mean, h_std, n_s, n_h, out_dir):
+                 s_mean, s_std, h_mean, h_std, n_s, n_h, out_dir,
+                 name_suffix=""):
     units = VAR_UNITS.get(var, "")
     label = VAR_LABELS.get(var, var)
     fig = plt.figure(figsize=(22, 9))
@@ -267,11 +268,12 @@ def plot_compare(date, era, var, level, step, lats, lons,
         cb.set_label(units, fontsize=9)
     lev = f" @ {level} hPa" if level is not None else ""
     fig.suptitle(f"Icechunk v4 vs Herbie — {label}{lev} — {era} "
-                 f"{date[:4]}-{date[4:6]}-{date[6:]} 00Z  T+{step}h  (East Africa)",
+                 f"{date[:4]}-{date[4:6]}-{date[6:]} 00Z  T+{step}h  "
+                 f"({LON_MIN:g}–{LON_MAX:g}°E, {abs(LAT_MIN):g}°S–{LAT_MAX:g}°N)",
                  fontsize=13, fontweight="bold", y=0.99)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{var}{level}" if level is not None else var
-    out = out_dir / f"icechunk_v4_{era}_{tag}_{date}_T{step}h.png"
+    out = out_dir / f"icechunk_v4_{era}_{tag}_{date}_T{step}h{name_suffix}.png"
     plt.savefig(out, dpi=140, bbox_inches="tight", facecolor="white")
     plt.close()
     return out
@@ -280,6 +282,7 @@ def plot_compare(date, era, var, level, step, lats, lons,
 # -- main --------------------------------------------------------------------
 
 def main() -> int:
+    global LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--store", required=True)
@@ -293,7 +296,18 @@ def main() -> int:
     ap.add_argument("--sa-key", default=None)
     ap.add_argument("--output-dir", default="gik_vs_herbie/icechunk_v4_eval")
     ap.add_argument("--no-plot", action="store_true")
+    # Domain. Defaults to ICPAC; pass the EA-SWIO box (15 80 -40 40) to compare
+    # a date the realized EA-SWIO store never wrote against the virtual store,
+    # which carries every date -- see compare_realized_herbie.py.
+    ap.add_argument("--lon-min", type=float, default=LON_MIN)
+    ap.add_argument("--lon-max", type=float, default=LON_MAX)
+    ap.add_argument("--lat-min", type=float, default=LAT_MIN)
+    ap.add_argument("--lat-max", type=float, default=LAT_MAX)
+    ap.add_argument("--tag", default="", help="suffix for output filenames")
     a = ap.parse_args()
+
+    LAT_MIN, LAT_MAX = a.lat_min, a.lat_max
+    LON_MIN, LON_MAX = a.lon_min, a.lon_max
 
     ds = open_store(a.store, a.era, a.run, a.sa_key)
     if a.var not in ds:
@@ -357,13 +371,13 @@ def main() -> int:
         if not a.no_plot:
             p = plot_compare(a.date, a.era, a.var, lev, a.step, lats, lons,
                              s_mean, s_std, h_mean, h_std,
-                             s_v.shape[0], h_v.shape[0], out_dir)
+                             s_v.shape[0], h_v.shape[0], out_dir, a.tag)
             print(f"  plot -> {p}")
         results.append(rec)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = a.var if is_pl else f"{a.var}_sfc"
-    sf = out_dir / f"icechunk_v4_{a.era}_{tag}_{a.date}_T{a.step}h.json"
+    sf = out_dir / f"icechunk_v4_{a.era}_{tag}_{a.date}_T{a.step}h{a.tag}.json"
     # numpy scalars leak in from coordinate values; float() them at the boundary
     sf.write_text(json.dumps(results, indent=2, default=float))
     print(f"\nstats -> {sf}")
