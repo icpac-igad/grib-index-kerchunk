@@ -119,12 +119,73 @@ would be grossly wrong if the `(var, level) -> name` flattening mis-assigned a
 level. `t500` vs `t850` differ by ~30 K and would also show, but vorticity
 differs by orders of magnitude.
 
+### Which script does what
+
+| script | role |
+|---|---|
+| `ecmwf/compare_realized_herbie.py` | the comparison — one (sub-store, date, step, channel) per run |
+| `ecmwf/run_realized_ea_swio_herbie_eval.sh` | driver for the whole published set: 16 realized cases + 2 compensation |
+| `ecmwf/compare_icechunk_herbie.py` | supplies `herbie_field`, `field_stats`, `per_member_stats`; also runs the compensation cases against the virtual store |
+| `ecmwf/check_realized_coverage.py` | which dates the store actually holds — run this first (§4) |
+
+The Herbie fetch is defined **once**, in `compare_icechunk_herbie.py`, and
+`compare_realized_herbie.py` imports it rather than re-deriving it. A
+domain-dependent constant copied into a second file is exactly how the longitude
+bug happened.
+
+### The exact commands
+
+`uv` is not installed on the EWC gateway, and `herbie` is not in the shared
+conda env (`/opt/mamba/envs/dask` — **do not install into it**, the frisky
+workers' `.venv` is a symlink to it). Everything in
+`../gik_vs_herbie/realized_ea_swio_eval/` was produced with a throwaway venv
+that inherits that env:
+
 ```bash
-uv run ecmwf/compare_realized_herbie.py --list          # what dates exist
-uv run ecmwf/compare_realized_herbie.py \
-    --sub 49r1-mam2025 --date 20250420 --step 240 --var tp
-uv run ecmwf/run_realized_ea_swio_herbie_eval.sh        # the whole published set
+python3 -m venv --system-site-packages /tmp/gik-herbie-venv
+/tmp/gik-herbie-venv/bin/pip install herbie-data
+export PY=/tmp/gik-herbie-venv/bin/python     # or PY="uv run" where uv exists
 ```
+
+Then, verbatim, from the `ecmwf/` directory:
+
+```bash
+# 1. coverage first -- exit 1 means the sub-store is short (§4)
+$PY check_realized_coverage.py --verify-data \
+    --json gik_vs_herbie/realized_ea_swio_eval/coverage.json
+
+# 2. what dates each sub-store holds
+$PY compare_realized_herbie.py --list
+
+# 3. one case
+$PY compare_realized_herbie.py --sub 49r1-mam2025 --date 20250420 \
+    --step 240 --var tp --output-dir gik_vs_herbie/realized_ea_swio_eval
+
+# 4. the whole published set (16 realized + 2 compensation)
+PY=$PY ./run_realized_ea_swio_herbie_eval.sh
+
+# 5. a date the realized store never wrote, from the virtual store (§4)
+$PY compare_icechunk_herbie.py \
+    --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens-v4 \
+    --era 49r1 --run 00 --date 20240501 --step 0 --var u --levels 700 \
+    --lon-min 15 --lon-max 80 --lat-min -40 --lat-max 40 --tag _easwio \
+    --sa-key /tmp/frisky-ea/gcs-key.json \
+    --output-dir gik_vs_herbie/realized_ea_swio_eval
+```
+
+Step 4 takes a couple of hours — one Herbie download of 50 GRIB messages per
+case. Run it detached and follow the log:
+
+```bash
+PY=/tmp/gik-herbie-venv/bin/python setsid nohup ./run_realized_ea_swio_herbie_eval.sh \
+    > gik_vs_herbie/realized_ea_swio_eval/sweep.log 2>&1 < /dev/null &
+```
+
+`setsid` is not optional — a plain `nohup ... &` from a short-lived shell gets
+reaped when the parent exits. To check whether it is still alive use the log's
+mtime, **not** `pgrep -f`: the pattern matches the checking command's own
+command line and will report a long-dead run as running. That misreads a
+finished sweep as in-progress, and it happened here.
 
 Herbie is given the GRIB name, which for a pl channel is base + level:
 `t850 -> ":t:850:pl:"`, and for surface the renamed ones map back
