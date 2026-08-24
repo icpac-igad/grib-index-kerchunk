@@ -13,13 +13,18 @@ Checks, without disturbing the writer (read-only session on the current tip):
   H2 per group: time axis monotonic + duplicate-free, date range, count
   H3 store metadata consistency: every group array opens, shapes agree with
      the time axis (no torn/partial commit visible on the tip)
+  H3b geolocation: each era group's latitude/longitude axes equal the canonical
+     ones in grib-index-kerchunk/ecmwf/grids.py. Shapes agreeing with the time
+     axis says nothing about WHERE the field is; a store written before the
+     longitude fix carries 0..359.75 and every reader silently gets the wrong
+     hemisphere. See grids.py and HANDOVER_LONGITUDE_FIX.md
   H4 (--decode) spot-read one chunk of the LATEST date through the
      gribberish codec -> proves refs written by the newest commit resolve
   H5 (--log FILE) scan the backfill log for FAILED dates; report process
 
 Exit code: 0 = all PASS, 1 = any FAIL (WARNs don't fail).
 
-Usage (ECMWF store, from ecmwf/icechunk-par):
+Usage (ECMWF store, from the directory holding this file):
   export GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json
   uv run check_store_health.py --store gs://gik-ecmwf-aws-tf/icechunk/ecmwf-ens \
       --expected-dates 1256 --decode --log backfill.log
@@ -31,8 +36,10 @@ Run regularly:  watch -n 600 ...  or a cron/loop.
 import argparse
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,6 +49,71 @@ import gribberish.zarr  # noqa: F401 -- registers the "gribberish" Zarr v3 codec
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 FAILURES, WARNINGS = [], []
+
+
+# --- the canonical grid, for H3b. Same resolution as build_ecmwf_icechunk.py.
+# Deliberately copied rather than imported from it: that module pulls in the
+# whole builder to answer a question about sys.path. What must never be copied
+# is the grid itself, and that comes from grids.py either way. ---
+def _locate_grids() -> Path | None:
+    """Find grids.py, or None.
+
+    Unlike the builder this does NOT exit when the module is missing: this
+    script also checks non-ECMWF stores (GEFS), which have no era groups to
+    check against it. H3b turns a None into a FAIL only for an ECMWF store,
+    where the check is not optional.
+
+    Disagreement between reachable copies IS fatal here too -- checking a store
+    against a grids.py you cannot identify proves nothing.
+    """
+    env = os.environ.get("GIK_ECMWF_DIR")
+    here = Path(__file__).resolve()
+    cands = ([Path(env)] if env else []) + [here.parent, here.parent.parent]
+    for anc in here.parents:
+        cands += [anc / "grib-index-kerchunk" / "ecmwf", anc / "ecmwf"]
+    seen, found = set(), []
+    for c in cands:
+        f = c / "grids.py"
+        if f.is_file() and f.resolve() not in seen:
+            seen.add(f.resolve())
+            found.append(c)
+    if len(found) > 1:
+        body = (found[0] / "grids.py").read_bytes()
+        bad = [d for d in found[1:] if (d / "grids.py").read_bytes() != body]
+        if bad:
+            raise SystemExit(
+                "FATAL: two reachable grids.py disagree:\n"
+                + "\n".join(f"    {d / 'grids.py'}" for d in [found[0]] + bad)
+                + "\n  The vendored copy and the grib-index-kerchunk original must\n"
+                  "  stay byte-identical. Re-copy from the original, or set\n"
+                  "  GIK_ECMWF_DIR to the one you mean.")
+    return found[0] if found else None
+
+
+GRIDS_DIR = _locate_grids()
+if GRIDS_DIR is not None:
+    sys.path.insert(0, str(GRIDS_DIR))
+    from grids import ERAS, latitudes, longitudes  # noqa: E402
+else:
+    ERAS = {}
+
+
+def coord_problems(g, era: str) -> list[str]:
+    """Ways this group's spatial axes disagree with grids.py. Empty == correct."""
+    bad = []
+    for name, want in (("latitude", latitudes(era)),
+                       ("longitude", longitudes(era))):
+        if name not in g:
+            bad.append(f"{name} missing")
+            continue
+        have = np.asarray(g[name][:])
+        if have.shape != want.shape:
+            bad.append(f"{name} {have.shape[0]} pts, expected {want.shape[0]}")
+        elif not np.allclose(have, want, atol=1e-9):
+            bad.append(f"{name} {have[0]:+.4f}..{have[-1]:+.4f}, expected "
+                       f"{want[0]:+.4f}..{want[-1]:+.4f} "
+                       f"(offset {float(have[0] - want[0]):+.2f} deg)")
+    return bad
 
 
 def check(name, ok, detail="", warn=False):
@@ -91,6 +163,8 @@ def main():
         dt = None
 
     print("== H2/H3 groups (zarr-level, robust to torn groups) ==")
+    # An ECMWF store must have checkable axes; a GEFS one has no era groups.
+    is_ecmwf = args.container.startswith("s3://ecmwf-forecasts")
     ro = repo.readonly_session("main").store
     root = zarr.open_group(store=ro, mode="r", zarr_format=3)
     coord_names = {"time", "number", "step", "isobaricInhPa",
@@ -120,6 +194,28 @@ def main():
         check(f"{grp} all {len(data_arrays)} arrays sized to time={n}",
               not bad_shape,
               f"lagging (self-heals on next append): {bad_shape}" if bad_shape else "")
+
+        # H3b -- where the field actually is. This is a FAIL, not a WARN: a
+        # mislabelled axis is not a lag that self-heals, it is every date in the
+        # group pointing at the wrong part of the world, and it cannot be
+        # repaired in place (see check_coords in build_ecmwf_icechunk.py).
+        era = grp.split("/")[0]
+        if GRIDS_DIR is None:
+            if is_ecmwf:   # silent for a GEFS store: nothing to check it against
+                check(f"{grp} lat/lon axes match grids.py", False,
+                      "cannot find grib-index-kerchunk/ecmwf/grids.py -- set "
+                      "GIK_ECMWF_DIR; an unverifiable store is not a healthy one")
+        elif era in ERAS:
+            bad_axes = coord_problems(g, era)
+            lon = longitudes(era)
+            check(f"{grp} lat/lon axes match grids.py", not bad_axes,
+                  "; ".join(bad_axes) if bad_axes else
+                  f"lon {lon[0]:+.2f}..{lon[-1]:+.2f}, {len(lon)} pts")
+        elif is_ecmwf:
+            check(f"{grp} era known to grids.py", False,
+                  f"{era!r} is not in ERAS ({', '.join(sorted(ERAS))}) -- axes "
+                  f"unchecked", warn=True)
+
         if n and (latest is None or hours[-1] > latest[2]):
             latest = (grp, g, int(hours[-1]))
     pct = 100 * total_dates / args.expected_dates

@@ -59,21 +59,64 @@ from gribberish.zarr.codec import GribberishCodec
 import sys as _sys
 
 
-def _locate_grids() -> Path:
-    """Find the canonical ecmwf/grids.py. Fails loudly rather than guessing."""
+def _grids_search_path() -> list[Path]:
+    """Directories that may hold grids.py, best candidate first."""
     env = os.environ.get("GIK_ECMWF_DIR")
     here = Path(__file__).resolve()
     cands = ([Path(env)] if env else []) + [here.parent, here.parent.parent]
     for anc in here.parents:  # works from either repo, no absolute paths baked in
         cands += [anc / "grib-index-kerchunk" / "ecmwf", anc / "ecmwf"]
+    return cands
+
+
+def _grids_found(cands: list[Path]) -> list[Path]:
+    """Those that do, deduplicated by the file they actually resolve to."""
+    seen, out = set(), []
     for c in cands:
-        if (c / "grids.py").is_file():
-            return c
+        f = c / "grids.py"
+        if f.is_file() and f.resolve() not in seen:
+            seen.add(f.resolve())
+            out.append(c)
+    return out
+
+
+def _grids_drift(found: list[Path]) -> str | None:
+    """Complaint if the reachable copies disagree, else None.
+
+    `crma` vendors a copy of grids.py so this stage runs without
+    grib-index-kerchunk on disk, and the vendored copy is searched BEFORE the
+    original. A stale one silently shadowing the canonical file is the 180 deg
+    bug over again, one directory closer -- so when both are reachable they must
+    be byte-identical, and disagreement is fatal rather than resolved by order.
+    """
+    if len(found) < 2:
+        return None
+    body = (found[0] / "grids.py").read_bytes()
+    bad = [d for d in found[1:] if (d / "grids.py").read_bytes() != body]
+    if not bad:
+        return None
+    return ("two reachable grids.py disagree:\n"
+            + "\n".join(f"    {d / 'grids.py'}" for d in [found[0]] + bad)
+            + "\n  The vendored copy and the grib-index-kerchunk original must stay\n"
+              "  byte-identical. Re-copy from the original, or set GIK_ECMWF_DIR to\n"
+              "  the one you mean. Picking one by search order is how the 180 deg\n"
+              "  bug shipped in the first place.")
+
+
+def _locate_grids() -> Path:
+    """Find the canonical ecmwf/grids.py. Fails loudly rather than guessing."""
+    cands = _grids_search_path()
+    found = _grids_found(cands)
+    drift = _grids_drift(found)
+    if drift:
+        raise SystemExit(f"FATAL: {drift}")
+    if found:
+        return found[0]
     raise SystemExit(
         "FATAL: cannot find the canonical ecmwf/grids.py.\n"
         "  It holds the ECMWF grid origin (-180 deg) that this builder must not\n"
         "  re-derive -- see HANDOVER_LONGITUDE_FIX.md.\n"
-        "  Fix: set GIK_ECMWF_DIR=/path/to/grib-index-kerchunk/ecmwf, or symlink\n"
+        "  Fix: set GIK_ECMWF_DIR=/path/to/grib-index-kerchunk/ecmwf, or copy\n"
         f"  grids.py next to {Path(__file__).name}.\n"
         f"  Searched: {', '.join(str(c) for c in cands[:6])} ...")
 
