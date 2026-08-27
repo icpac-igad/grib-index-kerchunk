@@ -43,7 +43,19 @@ import xarray as xr
 
 BUCKET = "us-west-2.opendata.source.coop"
 BASE = "e4drr-project/forecasts/ecmwf-ifs-ea-swio-realized-v3"
-SUBS = ["49r1-mam2024", "49r1-mam2025", "49r1-mam2026", "50r1-mam2026-tail"]
+SUBS = ["49r1-mam2024", "49r1-mam2025", "49r1-mam2026", "50r1-mam2026-tail",
+        "49r1-jja2024", "49r1-jja2025", "50r1-jja2026",
+        "50r1-jja2026-tail"]
+# 50r1-jja2026 holds 33 dates, not 92: the virtual source store ends
+# 2026-07-03, so June 1 - July 3 is all there is to realize. The store is
+# sized to that, deliberately -- an axis longer than the data reads back as
+# NaN rather than as absent, which is the very thing this script exists to
+# catch. A "33/33 COMPLETE" here means complete for what the source holds.
+#
+# 50r1-jja2026-tail continues it: the source was extended to 2026-08-23 on
+# 2026-08-26, so 2026-07-04..08-23 (51 dates) is a second store. Read the
+# season with xr.concat([jja2026, jja2026-tail], dim="time") -- same grid,
+# steps and channels. 2026-08-24..08-31 is still not upstream.
 PROBE = "t850"          # any channel present on every date
 
 
