@@ -2,7 +2,10 @@
 
 **https://source.coop/e4drr-project/forecasts/ecmwf-ifs-ea-swio-realized-v3**
 
-Written 2026-08-22. The sibling of `v20260819-icechunk-store-source-coop.md`,
+Written 2026-08-22, **updated 2026-09-18**: the published set has grown from
+four sub-stores to **sixteen**, the `49r1-mam2024` gap of §4 has been filled,
+and the 0.25° stores now carry 38 channels rather than 36. The sibling of
+`v20260819-icechunk-store-source-coop.md`,
 which documents the **virtual** ENS store. This one is **realized**: the values
 were decoded once, cut to the EA-SWIO box and written as real chunks, so a read
 needs nothing from `s3://ecmwf-forecasts` and no GRIB decoder at all.
@@ -13,25 +16,55 @@ Read it with **no credentials**.
 
 ## 1. What is in it
 
-Four independent Icechunk repos under one prefix, one per season:
+**Sixteen** independent Icechunk repos under one prefix, one per season,
+covering 2023-03-01 → 2026-08-23. Written/on-axis counts below are from
+`check_realized_coverage.py` run against the published store on **2026-09-18**:
+**1,264 of 1,271** date slots carry data.
 
-| sub-store | dates on axis | written | window |
-|---|---|---|---|
-| `49r1-mam2024` | 92 | **33** | 2024-03-01 … **2024-04-02** — see §4 |
-| `49r1-mam2025` | 92 | 92 | 2025-03-01 … 2025-05-31 |
-| `49r1-mam2026` | 73 | 73 | 2026-03-01 … 2026-05-12 |
-| `50r1-mam2026-tail` | 19 | 19 | 2026-05-13 … 2026-05-31 |
+| sub-store | written / on axis | window |
+|---|---|---|
+| `0p4-mam2023` | **85 / 92** | 2023-03-01 … 2023-05-31 — **short, see §4** |
+| `0p4-jja2023` | 92 / 92 | 2023-06-01 … 2023-08-31 |
+| `0p4-sond2023` | 122 / 122 | 2023-09-01 … 2023-12-31 |
+| `0p4-jf2024` | 59 / 59 | 2024-01-01 … 2024-02-28 |
+| `49r1-mam2024` | 92 / 92 | 2024-03-01 … 2024-05-31 |
+| `49r1-jja2024` | 92 / 92 | 2024-06-01 … 2024-08-31 |
+| `49r1-sond2024` | 122 / 122 | 2024-09-01 … 2024-12-31 |
+| `49r1-jf2025` | 59 / 59 | 2025-01-01 … 2025-02-28 |
+| `49r1-mam2025` | 92 / 92 | 2025-03-01 … 2025-05-31 |
+| `49r1-jja2025` | 92 / 92 | 2025-06-01 … 2025-08-31 |
+| `49r1-sond2025` | 122 / 122 | 2025-09-01 … 2025-12-31 |
+| `49r1-jf2026` | 59 / 59 | 2026-01-01 … 2026-02-28 |
+| `49r1-mam2026` | 73 / 73 | 2026-03-01 … 2026-05-12 |
+| `50r1-mam2026-tail` | 19 / 19 | 2026-05-13 … 2026-05-31 |
+| `50r1-jja2026` | 33 / 33 | 2026-06-01 … 2026-07-03 — the virtual source ends there |
+| `50r1-jja2026-tail` | 51 / 51 | 2026-07-04 … 2026-08-23 |
 
 Each carries, per date:
 
-- **36 channels**, flattened — `t500 t700 t850`, `u200 u500 u700 u850 u925`,
-  `v*`, `q500 q700 q850 q925`, `r700 r850`, `d200 d700 d850`,
-  `vo500 vo700 vo850`, `gh500`, and surface `t2m u10 v10 msl sp skt tp ro tcwv lsm`.
+- **38 channels** on the 0.25° stores, flattened — `t500 t700 t850`,
+  `u200 u500 u700 u850 u925`, `v*`, `q500 q700 q850 q925`, `r700 r850`,
+  `d200 d700 d850`, `vo500 vo700 vo850`, `gh500`, `w700`, and surface
+  `t2m u10 v10 msl sp skt tp ro tcwv lsm cape`.
   There is **no level dimension**: the level is part of the name.
 - **51 members** (`number` 0–50, 0 = control), **65 steps** (0–240 h at 3 h).
 - Domain **15–80°E, 40°S–40°N** — 321 × 261 at 0.25°. This is the *extended*
   EA-SWIO box, wider than the ICPAC box (19–55°E, 14°S–25°N) used elsewhere in
   this repo.
+
+### The four `0p4-*` stores are a separate dataset
+
+They share the prefix, the seasons and the dimension layout, and nothing else.
+**Do not concatenate them with the 0.25° stores** — the shapes and the channel
+set differ:
+
+| | `49r1-*` / `50r1-*` | `0p4-*` |
+|---|---|---|
+| channels | **38** | **36** — no `cape`, no `w700` (neither exists in the 0.4° source) |
+| grid | 321 × 261 at 0.25° | **201 × 164** at 0.4° |
+| western edge | 15.0°E | **14.8°E** — 15.0 is not a 0.4° grid point |
+
+Latitude spans 40 → −40 on both, and both are 51 members × 65 steps.
 
 Three things differ from the virtual store and will bite if you assume otherwise:
 
@@ -196,8 +229,11 @@ was never written (§4).
 
 ### What the answer should look like
 
-18 comparisons across all four sub-stores, both eras, pressure-level / surface /
-accumulated channels, T+0h to T+240h — per-member `max|diff| = 0` on every one.
+18 comparisons, both eras, pressure-level / surface / accumulated channels,
+T+0h to T+240h — per-member `max|diff| = 0` on every one. That sweep ran in
+August 2026 against the four sub-stores published then; the twelve added since
+were built by the same code path from the same source and have not been
+re-swept.
 Plots and per-member statistics:
 `ecmwf/gik_vs_herbie/realized_ea_swio_eval/`, published at
 [huggingface.co/datasets/E4DRR/gik-ecmwf-par](https://huggingface.co/datasets/E4DRR/gik-ecmwf-par/tree/main/herbie-vs-realized-ea-swio-v3).
@@ -216,10 +252,15 @@ Plots and per-member statistics:
 
 ---
 
-## 4. The `49r1-mam2024` coverage gap
+## 4. Coverage: one sub-store is still short
 
-**`49r1-mam2024` holds 33 of its 92 dates: 2024-03-01 to 2024-04-02. The other
-59 dates, 2024-04-03 to 2024-05-31, were never written.**
+**`0p4-mam2023` holds 85 of its 92 dates. The seven dates 2023-04-27 to
+2023-05-06 are on the axis and were never written.**
+
+The `49r1-mam2024` gap this section was originally written about (33 of 92
+dates, 2024-04-03 … 2024-05-31 missing) **has since been filled** — it now reads
+92/92. The hazard below is unchanged and is why the check still runs before
+every sweep: the sub-store it names is simply a different one now.
 
 ### Why it is dangerous rather than merely incomplete
 
@@ -231,16 +272,18 @@ therefore **not absent**:
 - `.sel(time="2024-05-01")` finds it and raises nothing;
 - it reads back as **all-NaN**.
 
-A consumer asking for 2024-05-01 gets a field of NaN with no indication that it
-means *not published* rather than *no rain*. Verified both ways:
+A consumer asking for such a date gets a field of NaN with no indication that it
+means *not published* rather than *no rain*. Verified both ways on the original
+`49r1-mam2024` gap, before it was filled:
 
 | | 2024-03-01 (written) | 2024-04-03 (missing) |
 |---|---|---|
 | manifest | chunks present | no chunks |
 | data read | `finite = 1.000`, 263.2–302.0 K | `finite = 0.000`, all NaN |
 
-All **36 channels agree** on exactly the same 59 dates, so this is whole dates
-missing from the materialization, not individual fields lost.
+All channels agreed on exactly the same 59 dates, so this is whole dates
+missing from the materialization, not individual fields lost. The same holds
+for the seven `0p4-mam2023` dates.
 
 This is the same hazard as the union step axis in
 `verify_store_completeness.py` and as the longitude bug: **preallocation makes
@@ -256,8 +299,8 @@ NaN — that moves terabytes. The manifest knows which chunks exist and
 `Session.chunk_coordinates` enumerates them without fetching any:
 
 ```bash
-uv run ecmwf/check_realized_coverage.py                       # all four
-uv run ecmwf/check_realized_coverage.py --sub 49r1-mam2024 \
+uv run ecmwf/check_realized_coverage.py                       # all sixteen
+uv run ecmwf/check_realized_coverage.py --sub 0p4-mam2023 \
     --all-channels --verify-data                              # prove it two ways
 uv run ecmwf/check_realized_coverage.py --json coverage.json  # per-date map
 ```
@@ -268,20 +311,28 @@ publish. The current per-date map is
 
 Tip snapshots at the time of writing:
 
-| sub-store | snapshot |
-|---|---|
-| 49r1-mam2024 | `JDNA5PW5Z9EGN08W4PF0` |
-| 49r1-mam2025 | `WVG5M4VQVXQ6NJABY5W0` |
-| 49r1-mam2026 | `0HVA7ZZJ55YBPF63Z9ZG` |
-| 50r1-mam2026-tail | `ZJK2N4HNC5QGM12P6FHG` |
+| sub-store | snapshot | | sub-store | snapshot |
+|---|---|---|---|---|
+| 0p4-mam2023 | `NXGDS98TBMWWET6VJGF0` | | 49r1-jja2025 | `212QY6MDW3RZ7PWD7A2G` |
+| 0p4-jja2023 | `XHHKD69G0V6G24W9XC6G` | | 49r1-sond2025 | `98NAV9R9SWDSN4TQE3QG` |
+| 0p4-sond2023 | `R1P20QVT19746C7C92NG` | | 49r1-jf2026 | `2X2C7660S9ZKDF9BK1P0` |
+| 0p4-jf2024 | `Q5CWWRX6PFXHDBZNTK4G` | | 49r1-mam2026 | `4QBREPA14W6D6VGAAC4G` |
+| 49r1-mam2024 | `7MB4YH8J09DSKSE2XKTG` | | 50r1-mam2026-tail | `9X2Z1WP5KH33S92KG2DG` |
+| 49r1-jja2024 | `FCJG895GGA3Q8MPQ7CPG` | | 50r1-jja2026 | `DV53Z76EZXPY9MJM18WG` |
+| 49r1-sond2024 | `YSS24Z2BGPJTZ0R204Z0` | | 50r1-jja2026-tail | `20A19ZJE28FWR9AG9DF0` |
+| 49r1-jf2025 | `42MHJH7CD6Q56516833G` | | 49r1-mam2025 | `9VVSNV9KKSPS9VJTQ1W0` |
+
+(2026-09-18. A sub-store is re-mirrored whenever its season is extended or
+repaired, so re-read these rather than pinning them.)
 
 ### Working around it
 
 Two options, and the first is better if you can afford it.
 
-1. **Finish the materialization** for 2024-04-03 … 2024-05-31, or trim the axis
-   to what is written. Right now the store advertises a full MAM 2024 season it
-   does not have.
+1. **Finish the materialization** for 2023-04-27 … 2023-05-06, or trim the axis
+   to what is written. Right now that store advertises a full MAM 2023 season it
+   does not have. This is the route taken for `49r1-mam2024`, which is why that
+   one now reads 92/92.
 2. **Fall back to the virtual store**, which carries every date of every era.
    Subset it to the same box and you get the identical 321 × 261 grid:
 
@@ -300,3 +351,38 @@ Note the virtual store is a different kind of object — its chunks are byte-ran
 references into `s3://ecmwf-forecasts`, so reading it needs `gribberish`, the
 anonymous virtual-chunk container credentials, and a live ECMWF archive. See
 `v20260819-icechunk-store-source-coop.md`.
+
+---
+
+## 5. Provenance, and what is not in here
+
+**Why `v3`.** Three generations of this corpus exist; only the third is
+published. `v1` (built 2026-08-09/10) came from a virtual store carrying the
+**180° longitude displacement** — it held the eastern Pacific, and its four
+sub-stores, 3,364 GB, were deleted. `v2` (2026-08-16) was built while the
+corrected virtual store was still being converted and covers only MAM 2026 plus
+the 50r1 tail. **`v3` begins 2026-08-18, the day the corrected
+`icechunk/ecmwf-ens-v4` conversion finished**, and everything published under
+this prefix belongs to it. All three share the same shape, so the version is a
+statement about *provenance*, not about schema — see `HANDOVER_LONGITUDE_FIX.md`
+and `v20260819-icechunk-store-source-coop.md`.
+
+**source.coop is the keeper, not a copy.** Each sub-store is built on EWC Ceph
+(`s3://must-icechunk/ea-swio/v3-*`), mirrored here, then deleted from Ceph to
+free space for the next season. If a sub-store is wrong here, it is wrong
+everywhere.
+
+**The operational pipeline is not in this repo.** It runs from
+`crma/medium-range-forecast/` — `1-pars-lithops` (stage ①),
+`2-icechunk-virtual` (stage ②, which runs this repo's `backfill_all_eras.py`),
+`3-realize-frisky` (stage ③, `build_corpus.py` + `frisky_daily_dag.py`). Those
+copies are ahead of the ones here: the stage-② builder there carries
+`--extend-schema`, which a tail run needs and this repo's copy does not have.
+Read this repo for what the store *is* and how it was validated; run the
+pipeline from there.
+
+**`d2m` is built but not published.** The 2 m dew-point channel was realized on
+Ceph as separate `ea-swio/v3-*-d2m` sub-stores on 2026-09-09, and an anonymous
+listing of this prefix on 2026-09-18 shows no `-d2m` sub-store. Either the
+mirror has not run for them or they went elsewhere; since Ceph is purged after
+mirroring, that is worth settling before the space is reclaimed.

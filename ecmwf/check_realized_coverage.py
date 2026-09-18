@@ -45,7 +45,14 @@ BUCKET = "us-west-2.opendata.source.coop"
 BASE = "e4drr-project/forecasts/ecmwf-ifs-ea-swio-realized-v3"
 SUBS = ["49r1-mam2024", "49r1-mam2025", "49r1-mam2026", "50r1-mam2026-tail",
         "49r1-jja2024", "49r1-jja2025", "50r1-jja2026",
-        "50r1-jja2026-tail"]
+        "50r1-jja2026-tail",
+        "49r1-sond2024", "49r1-sond2025",
+        "49r1-jf2025", "49r1-jf2026",
+        # 0p4 era: a SEPARATE dataset -- 36 channels on a 0.4 deg 201x164 grid,
+        # no `w700`/`cape` (absent from the 0p4 source) and a western edge at
+        # 14.8E because 15.0E is not a 0p4 grid point. Do not concat with the
+        # 0.25 deg stores; the shapes and channel sets differ.
+        "0p4-jja2023", "0p4-sond2023", "0p4-mam2023", "0p4-jf2024"]
 # 50r1-jja2026 holds 33 dates, not 92: the virtual source store ends
 # 2026-07-03, so June 1 - July 3 is all there is to realize. The store is
 # sized to that, deliberately -- an axis longer than the data reads back as
