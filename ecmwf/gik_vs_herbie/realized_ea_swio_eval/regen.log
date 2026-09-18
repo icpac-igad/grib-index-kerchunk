@@ -1,0 +1,46 @@
+#### 49r1-mam2024 20240327 T+48h t850
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2024 20240315 T+120h tp
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2024 20240320 T+0h u700
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2024 20240402 T+24h t2m
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2025 20250315 T+48h gh500
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2025 20250420 T+240h tp
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2025 20250510 T+72h q925
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2025 20250501 T+0h msl
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2026 20260310 T+48h t850
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2026 20260401 T+96h tcwv
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2026 20260415 T+24h v850
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 49r1-mam2026 20260512 T+0h u10
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 50r1-mam2026-tail 20260515 T+48h t850
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 50r1-mam2026-tail 20260525 T+72h vo850
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### 50r1-mam2026-tail 20260531 T+0h skt
+  per-member: 50 matched | min r=1.00000000 | max|diff|=0 (0.00e+00 of range)  -> PASS
+RESULT: PASS
+#### REGEN DONE

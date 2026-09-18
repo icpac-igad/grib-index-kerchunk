@@ -1,0 +1,2 @@
+# plots are regenerable from the par + the compare script; keep only stats + notes
+*.png
