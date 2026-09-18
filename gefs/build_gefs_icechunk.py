@@ -53,12 +53,26 @@ import icechunk
 import gribberish.zarr  # noqa: F401 -- registers the "gribberish" Zarr v3 codec
 from gribberish.zarr.codec import GribberishCodec
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from grids import (STEPS, era_for, field_shape, latitudes,  # noqa: E402
+                       longitudes)
+except ImportError as _e:                                       # pragma: no cover
+    raise SystemExit(
+        f"cannot import grids.py ({_e}).\n"
+        "grids.py is the single source of truth for the GEFS coordinate axes "
+        "and must sit next to this script (gefs/grids.py). Do NOT paste a local "
+        "copy of the axes back in -- that duplication is exactly what put a "
+        "180 deg longitude error into the ECMWF stores. See gefs/grids.py.")
+
 CONTAINER_PREFIX = "s3://noaa-gefs-pds/"
 GCS_PARS = "gik-gefs-aws-tf/run_par_gefs"
 GROUP = "0p25/00z"
-NY, NX = 721, 1440
+ERA = "v12"               # one GEFS era so far; see grids.ERA_BOUNDS
+NY, NX = field_shape(ERA)                     # from grids.py, never retyped
 N_MEMBERS = 30            # gep01..gep30 -> number coord 1..30
-STEPS = np.arange(0, 241, 3, dtype="int32")   # shared 81-step axis
+# STEPS (81 steps, 0..240h by 3h) also comes from grids.py.
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 MANIFEST_SPLIT_TIME = 1
 
@@ -144,8 +158,8 @@ def ensure_group(store) -> bool:
         ("number", np.arange(1, N_MEMBERS + 1, dtype="int16"),
          {"long_name": "ensemble member (gep01..gep30, no control in pgrb2sp25)"}),
         ("step", STEPS, {"units": "hours"}),
-        ("latitude", np.linspace(90.0, -90.0, NY), {"units": "degrees_north"}),
-        ("longitude", np.arange(NX) * 0.25, {"units": "degrees_east"}),
+        ("latitude", latitudes(ERA), {"units": "degrees_north"}),
+        ("longitude", longitudes(ERA), {"units": "degrees_east"}),
     ]
     for name, data, attrs in coords:
         shape = data.shape if data.size else (0,)
@@ -156,6 +170,37 @@ def ensure_group(store) -> bool:
         if data.size:
             arr[:] = data
     return True
+
+
+def check_coords(store) -> None:
+    """Refuse to append into a group whose axes disagree with grids.py.
+
+    `ensure_group` writes the coordinate arrays only when it CREATES the group,
+    so changing an axis in grids.py alone would leave every pre-existing group
+    on the old axis while appending correctly-referenced dates into it -- two
+    conventions in one array, which is worse than a uniform error and far harder
+    to spot. That is precisely how the ECMWF longitude defect stayed invisible.
+
+    Deliberately no in-place repair: relabelling is only ever valid for a store
+    of whole global fields, never for a realized subset that read the wrong
+    bytes, and an escape hatch here invites exactly that mistake. If this fires,
+    decide consciously whether the store must be rebuilt.
+    """
+    g = zarr.open_group(store=store, path=GROUP, mode="r", zarr_format=3)
+    for name, want in (("latitude", latitudes(ERA)),
+                       ("longitude", longitudes(ERA)),
+                       ("step", STEPS)):
+        if name not in g:
+            raise SystemExit(f"{GROUP}/{name} missing -- store is not the "
+                             f"schema this builder writes")
+        got = g[name][:]
+        if got.shape != want.shape or not np.allclose(got, want):
+            raise SystemExit(
+                f"{GROUP}/{name} in the store disagrees with grids.py:\n"
+                f"  store    n={got.shape[0]}  {got[:3]} .. {got[-2:]}\n"
+                f"  grids.py n={want.shape[0]}  {want[:3]} .. {want[-2:]}\n"
+                f"Appending would mix two conventions in one array. Rebuild the "
+                f"store, or reconcile grids.py -- do not 'fix' this in place.")
 
 
 def main():
@@ -201,6 +246,7 @@ def main():
     session = repo.writable_session("main")
     store = session.store
     ensure_group(store)
+    check_coords(store)   # every append, not just creation -- see check_coords
     g = zarr.open_group(store=store, path=GROUP, mode="r+", zarr_format=3)
 
     tarr = g["time"]
