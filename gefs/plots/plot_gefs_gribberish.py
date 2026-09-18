@@ -44,9 +44,19 @@ warnings.filterwarnings('ignore')
 os.environ['AWS_NO_SIGN_REQUEST'] = 'YES'
 
 # GEFS grid specification (0.25 degree global)
-GEFS_GRID_SHAPE = (721, 1440)  # lat x lon
-GEFS_LATS = np.linspace(90, -90, 721)
-GEFS_LONS = np.linspace(0, 359.75, 1440)
+# Grid axes come from gefs/grids.py -- the single source of truth for where
+# this data sits. They used to be spelled out here; the copies all agreed, but
+# nothing enforced that. On the ECMWF side the same duplication put a 180 deg
+# longitude error into 3.5 TB of stores. Verified bit-identical to the
+# `np.linspace` forms this replaced.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from grids import field_shape as _field_shape  # noqa: E402
+from grids import latitudes as _latitudes      # noqa: E402
+from grids import longitudes as _longitudes    # noqa: E402
+
+GEFS_GRID_SHAPE = _field_shape("v12")   # (721, 1440)
+GEFS_LATS = _latitudes("v12")           # 90.0 .. -90.0
+GEFS_LONS = _longitudes("v12")          # 0.0 .. 359.75  (GEFS is 0-360)
 
 # East Africa region
 EA_LAT_MIN, EA_LAT_MAX = -12, 23
