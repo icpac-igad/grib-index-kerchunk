@@ -38,6 +38,9 @@ coiled-data.json
 /ecmwf/dev-test/2026-06-02-gik-three-era-scan-grib-template-creation-ready.txt
 /cfs/2026-06-28-cfs-plan-steps.txt
 /gefs/2026-09-04-gik-gefs-relaization-grids-correction.txt
+# any dated conversation export, wherever it lands -- keeps future /export
+# files out without a blanket *.txt (gfs/requirements.txt is a real file)
+20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
 cfs/cfs_template/
 cfs/cfs_validation/*.parquet
 cfs/cfs_ensemble_202602/
