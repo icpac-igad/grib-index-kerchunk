@@ -1,0 +1,20 @@
+8.2 at 48 readers -- 2026-09-23, EWC box 192.168.1.129 (ECMWF network, 8-core EPYC)
+date 20260915 00z | steps [6,12,24,48,72,96] | channels [t850,t700,2t,u700]
+index: 6 files, 12.0 MB, 924 ms parallel
+
+CONCURRENCY SWEEP (path B eccodes-direct, 480 messages per point)
+ readers     wall     msg/s     MB/s  retries  per-reader
+       6    24.1s     19.9    12.6        0       3.32
+      12    12.2s     39.3    24.9        0       3.27
+      24    11.4s     42.0    26.6        0       1.75
+      48     5.9s     81.3    51.5        0       1.69
+      96     6.0s     80.1    50.8        0       0.83
+
+HEAD-TO-HEAD AT 48 READERS (600 messages)
+path                                   wall     msg/s     MB/s  retries
+A store-like (gribberish)             17.6s     34.0    21.6        0
+B design C (eccodes-direct)            8.3s     72.4    51.7        0
+C herbie-like (tempfile+cfgrib)       32.6s     18.4    12.0        0
+
+reference: realization measured 161 msg/s at 48 readers across 6 VMs
+           = 26.8 msg/s per VM = 8 readers x 3.35 msg/s
