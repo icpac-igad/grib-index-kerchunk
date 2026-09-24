@@ -1,0 +1,22 @@
+==============================================================================
+C5  bytes on the wire for ONE message, via Herbie
+==============================================================================
+  full step file (S3 Content-Length) :  6,660,995,555 B  (6.20 GiB)
+  the message, per .index `_length`  :        601,379 B
+  what Herbie wrote to disk          :        601,380 B
+  ratio written / full file          :         0.0090 %
+
+  §4.2 claims ~3 GB fetched and '~1% useful bytes'.
+  measured: Herbie fetched 601,380 B for a 601,379 B message
+  -> useful bytes = 100.0 %, NOT 1%.  The download is a byte-range GET.
+
+  index sidecar also fetched, once per file: 2,004,349 B
+
+==============================================================================
+C5b  index traffic at corpus scale -- the thing the store buys once
+==============================================================================
+  one enfo `.index`                  :      2,004,349 B
+  x 87 files/date                     :    174,378,363 B/date
+  x 887 dates (one full pass)      : 154,673,607,981 B  (144.1 GiB)
+  re-paid on EVERY pass.  The published virtual store is 76 GB
+  covering 1,308 dates x 12 groups, fetched once and shared.

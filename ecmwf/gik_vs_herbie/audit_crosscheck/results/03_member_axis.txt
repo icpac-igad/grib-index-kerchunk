@@ -1,0 +1,41 @@
+==============================================================================
+C1  member axis: what an `enfo` request actually returns, per era
+==============================================================================
+
+0p4-beta   20230601  enfo      4233 index lines
+                             members = 50  range 1..50   unnumbered fields: yes
+                             control NOT in enfo -> oper/fc has 83 lines, number field [-1]
+                             => 51st member requires a SECOND stream + a splice
+
+49r1-9lv   20240529  enfo      5559 index lines
+                             members = 50  range 1..50   unnumbered fields: yes
+                             control NOT in enfo -> oper/fc has 145 lines, number field [-1]
+                             => 51st member requires a SECOND stream + a splice
+
+49r1-13lv  20250515  enfo      8007 index lines
+                             members = 50  range 1..50   unnumbered fields: yes
+                             control NOT in enfo -> oper/fc has 157 lines, number field [-1]
+                             => 51st member requires a SECOND stream + a splice
+
+50r1       20260901  enfo      8500 index lines
+                             members = 50  range 1..50   unnumbered fields: no
+                             control NOT in enfo -> oper/fc has 184 lines, number field [-1]
+                             => 51st member requires a SECOND stream + a splice
+
+==============================================================================
+C1b  the same request through Herbie itself
+==============================================================================
+✅ Found ┊ model=ifs ┊ [3mproduct=enfo[0m ┊ [38;2;41;130;13m2023-Jun-01 00:00 UTC[92m F24[0m ┊ [38;2;255;153;0m[3mGRIB2 @ aws[0m ┊ [38;2;255;153;0m[3mIDX @ local[0m
+0p4-beta   20230601  herbie enfo -> 50 members (1..50)
+✅ Found ┊ model=ifs ┊ [3mproduct=enfo[0m ┊ [38;2;41;130;13m2024-May-29 00:00 UTC[92m F24[0m ┊ [38;2;255;153;0m[3mGRIB2 @ google[0m ┊ [38;2;255;153;0m[3mIDX @ local[0m
+49r1-9lv   20240529  herbie enfo -> 50 members (1..50)
+✅ Found ┊ model=ifs ┊ [3mproduct=enfo[0m ┊ [38;2;41;130;13m2025-May-15 00:00 UTC[92m F24[0m ┊ [38;2;255;153;0m[3mGRIB2 @ google[0m ┊ [38;2;255;153;0m[3mIDX @ local[0m
+49r1-13lv  20250515  herbie enfo -> 50 members (1..50)
+✅ Found ┊ model=ifs ┊ [3mproduct=enfo[0m ┊ [38;2;41;130;13m2026-Sep-01 00:00 UTC[92m F24[0m ┊ [38;2;255;153;0m[3mGRIB2 @ google[0m ┊ [38;2;255;153;0m[3mIDX @ local[0m
+50r1       20260901  herbie enfo -> 50 members (1..50)
+
+==============================================================================
+C1c  does Herbie's `ifs` template implement the 50r1 control split?
+==============================================================================
+  occurrences inside `class ifs`: {'get_control': 0, 'control': 0, "'cf'": 0, '"cf"': 0}
+  verdict: NOT IMPLEMENTED -- an enfo request post-2026-05-12 silently omits the control

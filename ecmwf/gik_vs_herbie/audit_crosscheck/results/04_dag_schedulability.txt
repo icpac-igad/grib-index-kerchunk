@@ -1,0 +1,30 @@
+==============================================================================
+C2  cost of the Herbie object itself
+==============================================================================
+  Herbie(...) construction      : median    172.2 ms   (min 163, max 181)
+    -> __init__ probes SOURCES over the network to find the file;
+       it is not a cheap value object.
+  first .index_as_dataframe     :   1808.8 ms   (8500 rows)
+  cached .index_as_dataframe    :      0.0 ms   (cached_property)
+
+==============================================================================
+C2b  can it ride in a task graph?
+==============================================================================
+  Herbie, index cold  :     5,185 B   dumps    0.1 ms  loads    0.1 ms
+  Herbie, index warm  : 1,783,025 B   dumps    1.5 ms  loads    1.0 ms
+  frisky task args    :        46 B   (six scalars; the function is pickled by reference)
+
+==============================================================================
+C2c  is there an in-memory single-message read?
+==============================================================================
+  Herbie.download   -> <class 'pathlib.Path'>
+  Herbie.xarray     -> writes a local file? YES; cfgrib.open_datasets? YES
+  public methods hinting at an in-memory read: NONE
+
+==============================================================================
+C2d  what one date of the realization would cost in Herbie objects
+==============================================================================
+  messages per date                     : 125,970
+  Herbie objects if one per (step,stream): 130   ->   22.4 s of construction
+  Herbie objects if one per TASK         : 125,970   ->    6.0 h of construction ALONE, per date
+  frisky: objects created per task       : 0 (module-level fn + cached store handle)

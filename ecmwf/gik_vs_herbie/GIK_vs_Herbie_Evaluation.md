@@ -1,5 +1,25 @@
 # GIK vs Herbie: ECMWF Ensemble Data Access Comparison
 
+> **⚠ Audited 2026-09-22; parts of this document are wrong. Read
+> [`AUDIT_REBUTTAL.md`](AUDIT_REBUTTAL.md) first.**
+>
+> An external audit (`dismantle-jh/GIK_VS_HERBIE_AUDIT.md`) found three claims
+> in §4 and §6 below to be incorrect. They were re-measured against upstream
+> Herbie `e6238f5` and the audit is right on all three:
+>
+> | section | claim | measured |
+> |---|---|---|
+> | §4.2, §6 | Herbie downloads the full 2–4 GB step file, "~1% useful bytes" | **601,380 B for a 601,379 B message — 100.0% useful**, 0.009% of the 6.20 GiB file. It is a byte-range GET, the same mechanism as GIK. |
+> | §4.1, §6 | Herbie has "no cloud parallelism" | `FastHerbie` uses `ThreadPoolExecutor(max_threads=50)` |
+> | §1 | Herbie's `enfo` returns 50 of 51 members, worth ~0.6–0.9% | true but understated: `enfo` exposes `number` 1..50 in **all four eras**; the control is `type=cf` with no `number` (0p4/49r1) or **absent from the file** (50r1) |
+>
+> **Egress is identical between the two methods.** Any claim here that one
+> moves less data than the other is wrong unless it fetches fewer messages.
+>
+> §1–§3 (numerical agreement, maps, per-date timing) are unaffected and stand.
+> Everything is reproducible: [`audit_crosscheck/`](audit_crosscheck/) —
+> `HERBIE_SRC=<clone>/src ./audit_crosscheck/run_all.sh`.
+
 ## Overview
 
 This evaluation compares two methods for accessing ECMWF IFS ensemble

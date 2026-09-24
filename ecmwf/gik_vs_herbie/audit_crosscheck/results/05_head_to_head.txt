@@ -1,0 +1,43 @@
+
+==============================================================================
+path A -- GIK virtual icechunk store
+==============================================================================
+  store open (once per worker process, then cached):  10.44 s
+  t    lvl=850  n= 1 f024      944 ms   shape=(321, 261)
+  t    lvl=850  n= 7 f024      177 ms   shape=(321, 261)
+  t    lvl=850  n= 1 f048      159 ms   shape=(321, 261)
+  q    lvl=850  n= 7 f024      571 ms   shape=(321, 261)
+  t2m  lvl=None n= 1 f024      813 ms   shape=(321, 261)
+  t2m  lvl=None n= 7 f048      140 ms   shape=(321, 261)
+  msl  lvl=None n= 3 f024      445 ms   shape=(321, 261)
+  u10  lvl=None n= 3 f024      726 ms   shape=(321, 261)
+  t    lvl=850  n= 0 f024      135 ms   shape=(321, 261)
+  ---- median 445 ms/message, total 4.1 s for 9 messages
+
+==============================================================================
+path B -- Herbie
+==============================================================================
+  t    lvl=850  n= 1 f024     3793 ms   shape=(321, 261)  search=:t:850:pl:1:
+  t    lvl=850  n= 7 f024      577 ms   shape=(321, 261)  search=:t:850:pl:7:
+  t    lvl=850  n= 1 f048     3240 ms   shape=(321, 261)  search=:t:850:pl:1:
+  q    lvl=850  n= 7 f024     1173 ms   shape=(321, 261)  search=:q:850:pl:7:
+  t2m  lvl=sfc  n= 1 f024      913 ms   shape=(321, 261)  search=:2t:sfc:1:
+  t2m  lvl=sfc  n= 7 f048      830 ms   shape=(321, 261)  search=:2t:sfc:7:
+  msl  lvl=sfc  n= 3 f024      768 ms   shape=(321, 261)  search=:msl:sfc:3:
+  u10  lvl=sfc  n= 3 f024      831 ms   shape=(321, 261)  search=:10u:sfc:3:
+  t    lvl=850  n= 0 f024     1241 ms   shape=(321, 261)  search=:t:850:pl:
+  ---- median 913 ms/message, total 13.4 s for 9 messages
+  phase medians: ctor 231 ms | index 2034 ms | download 789 ms | decode+subset 43 ms
+
+==============================================================================
+C3b -- do the two paths agree?  (independent check of the store)
+==============================================================================
+  ('t', 850, 1, 24)             max|diff| = 0.000000e+00  OK
+  ('t', 850, 7, 24)             max|diff| = 0.000000e+00  OK
+  ('t', 850, 1, 48)             max|diff| = 0.000000e+00  OK
+  ('q', 850, 7, 24)             max|diff| = 0.000000e+00  OK
+  ('t2m', None, 1, 24)          max|diff| = 0.000000e+00  OK
+  ('t2m', None, 7, 48)          max|diff| = 0.000000e+00  OK
+  ('msl', None, 3, 24)          max|diff| = 0.000000e+00  OK
+  ('u10', None, 3, 24)          max|diff| = 0.000000e+00  OK
+  ('t', 850, 0, 24)             max|diff| = 0.000000e+00  OK

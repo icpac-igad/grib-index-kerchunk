@@ -1,0 +1,17 @@
+/opt/mamba/envs/dask/lib/python3.12/site-packages/xarray/backends/plugins.py:109: RuntimeWarning: Engine 'gribberish' loading failed:
+No module named 'obstore'
+  external_backend_entrypoints = backends_dict_from_pkg(entrypoints_unique)
+index lines: 8500
+picked: [('t850', 1937718789, 602887), ('t2m', 544932015, 656638)]
+
+=== t850  msg=589 KiB ===
+eccodes  direct-from-buffer :    16.0 ms  (min 15.6)  n=1038240
+cfgrib   tempfile + xarray  :    42.4 ms  (min 40.3)  shape=(721, 1440)
+gribberish direct           :    22.2 ms  (min 21.6)  n=1038240
+   agreement eccodes vs gribberish: max|diff| = 0.000e+00
+
+=== t2m  msg=641 KiB ===
+eccodes  direct-from-buffer :    15.6 ms  (min 15.5)  n=1038240
+cfgrib   tempfile + xarray  :    40.4 ms  (min 39.8)  shape=(721, 1440)
+gribberish direct           :    22.3 ms  (min 21.9)  n=1038240
+   agreement eccodes vs gribberish: max|diff| = 0.000e+00

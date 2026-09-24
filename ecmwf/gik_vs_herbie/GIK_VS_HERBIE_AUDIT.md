@@ -28,13 +28,24 @@ what stands up, §7 for the correction queue.
 > (gribberish flat 43.0 → 39.8 msg/s; eccodes 63.9 → 152.0), §5.6 both claims
 > — and §4.2's byte-range finding is now measured, not inferred: Herbie moved
 > **601,380 B for a 601,379 B message**, 0.009% of the 6.20 GiB step file.
-> §5.1, §5.2, §5.3 and §10 stand as written and the project accepts them.
+> §5.1, §5.3 and §10 stand as written and the project accepts them. §5.2's
+> *finding* stands (gribberish does not thread); its inference that the
+> realization was therefore decode-throttled is withdrawn in §12.7.
 >
-> **Corrected by the harness:** §5.4 — see §11 below, appended by the
-> respondent. The index arithmetic is ~15x low, and the substitution it
-> proposes was not costed as a task graph.
+> **Corrected by the harness:** §5.4 — see §11, appended by the respondent,
+> and then §12, the auditor's re-check of §11.
 >
-> This banner and §11 are additive. Nothing in §1–§10 has been altered.
+> **Read §12 before acting on §11.** The re-check found §11.2's headline
+> numbers wrong in the respondent's favour and the respondent accepts it:
+> per-index cost is **~510 ms**, not 2,718 ms (that was Herbie's
+> `index_as_dataframe`, not index acquisition), so §5.4 was **~2–3x low, not
+> 15x**; and the graph payload is an offset table at **~50 MB/date**, not
+> 310 MB/date of warm Herbie objects. §12.2 nevertheless **withdraws §5.4's
+> framing**, and §12.7 withdraws §5.2's throughput claim. §8.2 was run at
+> reduced scale (§12.11) and at 48 readers from EWC (§12.12).
+>
+> This banner, §11, §12 and §13 are additive. Nothing in §1–§10 has been
+> altered.
 
 ---
 
@@ -564,8 +575,9 @@ like-for-like and should be re-normalised or annotated.
   messages on one 8-core box is not 48 readers against a source that
   `REALIZATION_COST.md` §2 measures as the binding constraint. The scale run,
   and the Europe/Nairobi split, remain undone.
-- **§8.1** (the GIL test) is untouched and, given `02`, likely to show the
-  realization was decode-throttled.
+- **§8.1** (the GIL test) is untouched. *(Superseded: §12.7 resolves it from
+  existing logs — 12 processes x ~40 msg/s gave ~3x headroom over the 161
+  msg/s achieved, so the GIL flaw cost this run nothing.)*
 - **§8.3** (re-run on an EWC VM) is untouched. All numbers here are one EPYC.
 
 ---

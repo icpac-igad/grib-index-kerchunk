@@ -1,0 +1,51 @@
+==============================================================================
+C4  §5.4 recomputed
+==============================================================================
+  corpus: 887 dates x 125,970 messages = 111,735,390
+  build as measured: 192.4 h wall-clock at 48 readers
+
+  -- index acquisition ------------------------------------------------
+    audit §5.4 assumed : 77,169 fetches, 4.0 h (=> 187 ms each)
+    measured per index : 510 ms  (fetch + json parse, 8,500 rows)
+    enfo only          : 77,169 fetches ->    10.9 h serial   (  5.7% of the build)     13.7 min at 48 readers
+    enfo + oper/fc     : 154,338 fetches ->    21.9 h serial   ( 11.4% of the build)     27.3 min at 48 readers
+    => §5.4's 4 h is low by ~2.7x on the enfo-only count alone -- NOT the ~15x this script
+       previously reported, which used Herbie's DataFrame build (2718 ms) in place of
+       index acquisition.  It remains SMALL against 111.7M message
+       fetches (0.07% more requests), so §5.4's conclusion survives.
+
+  -- object construction: the part §5.4 never priced --------------------
+    one Herbie object PER TASK   : 125,970 x 174 ms =    6.1 h/date ->     224 days for the corpus
+      (Herbie.__init__ probes SOURCES over the network; it is not a value object)
+    one Herbie object PER FILE   : 174 x 174 ms =   30.2 s/date  -- fine, BUT:
+      a WARM HERBIE OBJECT is 1.78 MB cloudpickled (310 MB/date) -- but
+      nobody would ship that.  The right object is an offset table:
+      0.29 MB/file, 50 MB/date -- about the size of stage (1)'s own output.
+      Costing the Herbie object here was the same error §5.4 made. The
+      payload is NOT a blocker; object CONSTRUCTION is.
+    frisky                        : 0 objects/task, 46 B of task args.
+
+  -- per-message read --------------------------------------------------
+    path A (store)    240 ms ->   155.2 h at 48 readers   [measured build: 192.4 h]
+    path B (Herbie)   838 ms ->   541.9 h at 48 readers
+    ratio 3.5x  -- but REALIZATION_COST §2 measures the SOURCE as the
+    bound, not the client, so the real gap at 48 readers is smaller
+    than this ratio and cannot be settled without running both at scale.
+
+==============================================================================
+  verdict
+==============================================================================
+  §5.4's index arithmetic is off by ~3x but its conclusion holds:
+  index fetching is NOT what makes stage (1)/(2) load-bearing.
+
+  What §5.4 never priced, and what actually blocks the substitution:
+    1. Herbie's unit is a FILE object costing 173 ms to construct (a network
+       probe in __init__) plus 1.8-2.7 s to build its DataFrame.  The
+       realization's unit is a MESSAGE.  Per-task construction is 6.1 h/date,
+       or 224 days for the corpus.  That is the blocker --
+       not the payload, which an offset table reduces to ~50 MB/date.
+    2. `download()` returns a Path.  There is no in-memory single-message
+       read, so message-level work means bypassing Herbie's own fetch.
+    3. The control member is not addressable as `number=0` in ANY era, and
+       on 50r1 it is not in `enfo` at all -- see 03_member_axis.py.
+  None of that is overhead.  It is the coordinate space the store provides.

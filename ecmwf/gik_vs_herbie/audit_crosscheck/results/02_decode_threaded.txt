@@ -1,0 +1,12 @@
+/opt/mamba/envs/dask/lib/python3.12/site-packages/xarray/backends/plugins.py:109: RuntimeWarning: Engine 'gribberish' loading failed:
+No module named 'obstore'
+  external_backend_entrypoints = backends_dict_from_pkg(entrypoints_unique)
+A) where did 2000 ms come from? cfgrib variants (median of 10)
+   cfgrib indexpath='' (disabled) :    41.7 ms
+   cfgrib default index sidecar   :    41.6 ms
+
+B) threaded scaling -- decode the SAME message N times concurrently
+   threads=1: eccodes   63.9 msg/s  gribberish   43.0 msg/s
+   threads=2: eccodes  124.5 msg/s  gribberish   39.7 msg/s
+   threads=4: eccodes  152.0 msg/s  gribberish   40.2 msg/s
+   threads=8: eccodes  131.5 msg/s  gribberish   39.8 msg/s

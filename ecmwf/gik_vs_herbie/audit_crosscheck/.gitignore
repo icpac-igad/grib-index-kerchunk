@@ -1,0 +1,3 @@
+# results/*.txt ARE the evidence for AUDIT_REBUTTAL.md -- keep them.
+__pycache__/
+*.pyc
