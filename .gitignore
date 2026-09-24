@@ -30,26 +30,16 @@ __pycache__/
 coiled-data.json
 **/coiled-data.json
 
-# session transcripts / conversation exports (keep local, do not commit)
-/2026-06-01-gik-template-creation-realign-different-layers.txt
-/2026-06-02-gik-ecmwf-scan-202301.txt
-/2026-06-03-ecmwf-gik-3era-coiled-docker-kerchunk-break-version-pin-resolved.txt
-/2026-06-03-ecmwf-gik-three-era-function-complete.txt
-/ecmwf/dev-test/2026-06-02-gik-three-era-scan-grib-template-creation-ready.txt
-/cfs/2026-06-28-cfs-plan-steps.txt
-/gefs/2026-09-04-gik-gefs-relaization-grids-correction.txt
-# any dated conversation export, wherever it lands -- keeps future /export
-# files out without a blanket *.txt (gfs/requirements.txt is a real file)
-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
-cfs/cfs_template/
-cfs/cfs_validation/*.parquet
-cfs/cfs_ensemble_202602/
-
-# Session transcripts and scratch notes -- working material, never committed.
-# Date-prefixed .txt anywhere in the tree (2026-09-23-whatever.txt, /export
-# output, nohup captures). Benchmark output under */results/ is NOT matched
-# and stays tracked, because it is the evidence behind the docs.
+# Session transcripts and conversation exports -- working notes, never
+# committed. The pattern below covers every file the seven per-file entries
+# here used to list, plus /export output and nohup captures, wherever they
+# land. Deliberately NOT a blanket *.txt: gfs/requirements.txt is a real file,
+# and so is the benchmark output under */results/ that the docs cite by name.
+# Verify any change to this with `git check-ignore -v` against one of those.
 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.txt
 untitled*.txt
 Untitled*.txt
 docs/
+cfs/cfs_template/
+cfs/cfs_validation/*.parquet
+cfs/cfs_ensemble_202602/
