@@ -273,6 +273,14 @@ uv run gefs/build_gefs_icechunk.py \
 See [`ecmwf/icechunk-par/README.md`](ecmwf/icechunk-par/README.md) and
 [`gefs/README.md`](gefs/README.md) for detailed workflows.
 
+### Realizing a region on the ECMWF Weather Cloud
+
+[`ecmwf/ewc-realization/`](ecmwf/ewc-realization/) turns the virtual ECMWF
+store into decoded arrays for East Africa and the SW Indian Ocean (51 raw
+members, 0–240 h), using a frisky DAG on six EWC VMs. It covers both the
+long-term corpus (1,260 dates, ~17.9 TB) and the daily operational run, with
+setup, runbooks, measured throughput and bottlenecks.
+
 ---
 
 ## Validation

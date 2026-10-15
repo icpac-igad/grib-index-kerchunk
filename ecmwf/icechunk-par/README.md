@@ -69,7 +69,7 @@ Per the three-era plan: separate stores for 0p4 / 49r1 (13-level superset) /
 | `build_0p4_ensemble_icechunk.py` | 51 members; creates store or **appends** a date along `time`; `--store` accepts a local path or `s3://bucket/prefix` |
 | `test_icechunk_read.py` | test routine T1 structure / T2 decode / T3 bit-exact (local or S3 store; anonymous read when no AWS creds in env) |
 | `test_dask_read.py` | dask-cluster read test: multi-process workers, ensemble mean/std, per-worker peak RSS |
-| `materialize_ea_from_icechunk.py` | dask-cluster **realize** test: virtual store → East Africa subset → plain zarr on another source.coop path |
+| `../ewc-realization/history/dask-era/materialize_ea_from_icechunk.py` | dask-cluster **realize** test: virtual store → East Africa subset → plain zarr on another source.coop path |
 | `publish_to_source_coop.py` | resumable file-sync of a local store to source.coop (survives 1-hour STS expiry) |
 
 See `CONVERSION_ESTIMATE.md` for the full four-era time/size estimate (~5 h
@@ -191,7 +191,7 @@ of writing realized data. Measured on both planes here:
 | metadata (where #884 OOM'd) | builder: 359,805 virtual refs, one date | **468 MB**, flat | streamed `set_virtual_refs`, commit per date — nothing accumulates |
 | data (this test) | dask cluster: read virtual store → EA subset → write realized zarr | coordinator **308 MB**, workers **~280 MB** | workers stream chunk → decode → subset → PUT |
 
-The full run (`materialize_ea_from_icechunk.py`): 2 worker processes read the
+The full run (`materialize_ea_from_icechunk.py`, now in `../ewc-realization/history/dask-era/`; superseded by the frisky realization in [`../ewc-realization/`](../ewc-realization/)): 2 worker processes read the
 **source.coop icechunk virtual store**, decode all 8,670 GRIB messages of `tp`
 (2 dates × 51 members × 85 steps, ~5.2 GB streamed from `ecmwf-forecasts`),
 subset to the ICPAC box (lat 25…-14, lon 19…55 → 98×90), and write a 306 MB
@@ -201,7 +201,7 @@ source.coop path in **470 s (18.4 msgs/s)**. Verified: anonymous public read,
 bit-exact against the virtual store, zero NaNs.
 
 ```bash
-source .env && uv run materialize_ea_from_icechunk.py \
+source .env && uv run ../ewc-realization/history/dask-era/materialize_ea_from_icechunk.py \
     --source s3://us-west-2.opendata.source.coop/e4drr-project/forecasts/ecmwf_ifs_0p4_icechunk_virtualdataset_test \
     --dest   s3://e4drr-project/forecasts/ecmwf_ea_tp_0p4_zarr_test
 ```

@@ -9,12 +9,12 @@ write is a plain region write into an existing array.  Nothing appends and
 nothing mutates the schema, which means dates are independent and a failure
 costs exactly one date.
 
-Per date: 1,590 blocks (30 channels x 53 steps), all sharing ONE forked
+Per date: 1,908 blocks (36 channels x 53 steps), all sharing ONE forked
 session, merged and committed together.
 
     read_message x 51 -> write_block(fork, channel, date_idx, step_idx)
-    ... 1,590 per date ...
-    merge -> commit "2026-06-01: 30 channels ..."
+    ... 1,908 per date ...
+    merge -> commit "2026-03-01: 36 channels ..."
 
 Why one fork per date and not per block: `session.fork()` costs ~0.30 s, so
 forking per block cost 476 s of the 494 s a single date took, and would be
@@ -26,14 +26,18 @@ stores).
 Resume
 ------
 Each date is its own commit, so `--resume` reads the commit log and skips
-dates already done.  A date costs 81,090 messages and ~64 GB of egress; none
+dates already done.  A date costs 97,308 messages and ~77 GB of egress; none
 of that should ever be repeated because a later date failed.
 
 Holes in the source
 -------------------
-The published virtual store is not gap-free -- `49r1/00z` is missing ten March
-2026 dates that ECMWF did publish.  Requested dates absent from the source axis
-are SKIPPED, but their `time` slots are still reserved by the schema.  An
+The published virtual store has been gap-free for `49r1/00z` since the
+2026-08-08 re-mirror (804/804, March 2026 31/31, verified by decode --
+`verify_march2026.py`).  The machinery below stays, because the guarantee is
+structural rather than a bet on the source being complete.
+
+Requested dates absent from the source axis are SKIPPED, but their `time` slots
+are still reserved by the schema.  An
 unwritten slot has no chunks in the manifest, so `check_chunks.py` names it
 precisely instead of `create_schema`'s zero-fill passing it off as data.  When
 Stage 1 catches up, `--resume` writes those slots in place: they are region
@@ -132,13 +136,13 @@ def missing_blocks(repo, channel_names, n_dates, n_steps):
 
 def run_one_date(client, repo, channels, members, steps, era, date, date_idx,
                  rounds=4, pause=45, pending=None):
-    """1,590 blocks for one date, one shared fork, one commit.
+    """1,908 blocks for one date, one shared fork, one commit.
 
     Blocks that fail are RESUBMITTED rather than failing the date.  AWS
     throttles this workload even at 96 concurrent readers: the per-read
     backoff in `read_message` absorbs most of it, but a few blocks exhaust
-    all 8 attempts. Discarding the date for 6 bad blocks out of 1,590 throws
-    away 81,090 messages and ~64 GB of egress to avoid redoing ~300.
+    all 8 attempts. Discarding the date for 6 bad blocks out of 1,908 throws
+    away 97,308 messages and ~77 GB of egress to avoid redoing ~300.
 
     Between rounds we pause: the whole point is to stop asking for a while,
     and immediately resubmitting into a throttling window just burns the
@@ -235,12 +239,16 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--scheduler", default="192.168.1.74:8796")
+    p.add_argument("--scheduler", default="192.168.1.164:8796")
     p.add_argument("--sink", required=True)
     p.add_argument("--start", default="2026-06-01")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--era", default="50r1")
-    p.add_argument("--channels", type=int, default=30)
+    # 38, NOT dag.N_CHANNELS. The table gained `d2m` as channel 39 on
+    # 2026-09-09, and every published 0.25 deg season is 38 channels. Tracking
+    # N_CHANNELS would silently make a bare invocation build a 39-channel store
+    # that no other season matches. Reach the extra channels by name: --vars.
+    p.add_argument("--channels", type=int, default=38)
     p.add_argument("--members", type=int, default=51)
     p.add_argument("--steps", type=int, default=53)
     p.add_argument("--env", default=".env")
@@ -250,10 +258,15 @@ def main():
                         "store, making every committed date unreachable from "
                         "`main`. Without this, an existing store is never "
                         "overwritten")
+    p.add_argument("--vars", nargs="+", default=None,
+                   help="build these channels BY NAME instead of the first "
+                        "--channels of the table, e.g. --vars d2m. Used to "
+                        "build a single-channel companion store that is later "
+                        "merged on read; see select_channels().")
     p.add_argument("--repair", action="store_true",
                    help="fill ONLY the chunks the manifest reports missing, "
                         "instead of redoing whole dates. A date that lost two "
-                        "blocks costs two blocks, not 1,590")
+                        "blocks costs two blocks, not 1,908")
     p.add_argument("--rounds", type=int, default=4,
                    help="resubmit rounds for blocks AWS throttled out")
     p.add_argument("--pause", type=int, default=45,
@@ -265,6 +278,24 @@ def main():
 
     dates = date_range(args.start, args.days)
     channels = dag.select_channels(args)
+
+    # Some channels do not exist for every (era, date). Catch that here, against
+    # the channel table, rather than letting a worker raise KeyError on message
+    # 90,000 of a run that has already burned 40 minutes -- or worse, write an
+    # all-NaN channel silently, which is what an unwritten chunk reads back as.
+    #
+    # Asked of dag, not spelled out here: this test used to read
+    # `c[2] == "w700" or c[0] == dag.CAPE`, so `d2m` -- added as channel 39 --
+    # slipped straight through it. The era/date rules live in NOT_IN_0P4 and
+    # has_dewpoint() so that a new channel needs no edit in this file.
+    absent = dag.channels_absent_from(args.era, channels, date=dates[0])
+    if absent:
+        raise SystemExit(
+            f"channels {absent} are not available for {args.era} at "
+            f"{dates[0]}. Drop them (--channels 36 for a 0p4 season) or pick "
+            f"the rest by name with --vars. 0p4 carries none of w700/cape/d2m; "
+            f"d2m needs 49r1 or 50r1 from {dag.DEWPOINT_FROM}.")
+
     members = list(range(args.members))
     steps = dag.STEPS_ALL_H[:args.steps]
     names = [c[2] for c in channels]
@@ -280,9 +311,20 @@ def main():
           f"~{tb:.2f} TB of AWS egress\n")
 
     ak, sk = sink.load_env(args.env)
-    repo, created = sink.open_sink(args.sink, ak, sk)
+    # --repair / --resume operate on a store that MUST already exist, so never
+    # let open_sink fall through to Repository.create. It catches every
+    # exception from open, so a credential or endpoint fault is indistinguishable
+    # from "absent" -- on 2026-10-02 an expired Ceph key surfaced as
+    # `icechunk::repository::create ... InvalidAccessKeyId`, i.e. a repair run
+    # one valid key away from creating an empty store over a 24-date season.
+    repo, created = sink.open_sink(args.sink, ak, sk,
+                                   create=not (args.repair or args.resume))
     print(f"sink     must-icechunk/{args.sink} "
           f"({'created' if created else 'existing'})")
+    # Provenance, so the log can stand alone as an audit record of WHICH virtual
+    # store this corpus came from. Without it the only evidence is a constant in
+    # frisky_daily_dag.py at the time of the run.
+    print(dag.source_provenance(args.era))
 
     done, partial = (committed_dates(repo) if (args.resume or args.repair)
                      else (set(), set()))
@@ -360,8 +402,24 @@ def main():
         by_date = {}
         for ti, name, si in miss:
             by_date.setdefault(ti, []).append((name, si))
-        print(f"repair   {len(miss):,} missing chunk(s) across "
-              f"{len(by_date)} date(s)  (manifest read {time.time()-t_r:.1f}s)")
+        # The manifest count is NOT the workload.  A preallocated season
+        # (sond2026 runs to 2026-12-31) reports every reserved slot as missing,
+        # so on 2026-10-05 this line read "223,080 missing chunk(s) across 88
+        # date(s)" for ONE buildable date -- an 88x overstatement, and the first
+        # number an operator sees.  Say both.
+        build_ti = [ti for ti in by_date if dates[ti] in present]
+        n_build = sum(len(by_date[ti]) for ti in build_ti)
+        n_skip = len(by_date) - len(build_ti)
+        print(f"repair   {len(miss):,} missing chunk(s) across {len(by_date)} "
+              f"date(s) in the manifest  (read {time.time()-t_r:.1f}s)")
+        print(f"         -> TO BUILD: {n_build:,} chunk(s) across "
+              f"{len(build_ti)} date(s)"
+              + (f"; {n_skip} date(s) are reserved slots absent from the "
+                 f"{args.era} source and will be skipped" if n_skip else ""))
+        if build_ti:
+            print(f"         -> dates: "
+                  + ", ".join(dates[ti] for ti in sorted(build_ti)[:8])
+                  + (" …" if len(build_ti) > 8 else ""))
         by_name = {c[2]: c for c in channels}
         bad = []
         for ti in sorted(by_date):

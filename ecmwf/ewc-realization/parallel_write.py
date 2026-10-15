@@ -13,8 +13,8 @@ The difference from the client-side path in frisky_daily_dag.py:
 Shape, per date:
 
     read_message x 51 members ---> write_block(fork, channel, step) -> ForkSession
-    ... 1,590 of those (30 channels x 53 steps) ...
-    client: session.merge(*1590 forks); session.commit()
+    ... 1,908 of those (36 channels x 53 steps) ...
+    client: session.merge(*1908 forks); session.commit()
 
 Chunk alignment is what makes it legal: the store chunk is
 (1, 1, number, lat, lon), so one (channel, step) block is exactly one chunk.
@@ -24,9 +24,9 @@ the caller.
 Usage
 -----
     P=.venv/bin/python
-    $P parallel_write.py --sink ea-frisky-test/parallel --channels 2 \
+    $P parallel_write.py --sink ea-swio/smoke --channels 2 \
         --members 4 --steps 3                      # smoke test
-    $P parallel_write.py --sink ea-cgan/v2-7day --channels 30 \
+    $P parallel_write.py --sink ea-swio/one-date --channels 36 \
         --members 51 --steps 53                    # a full date
 """
 from __future__ import annotations
@@ -50,16 +50,20 @@ def main():
     p.add_argument("--date", default="2026-07-02")
     p.add_argument("--era", default="50r1")
     p.add_argument("--sink", required=True, help="prefix under must-icechunk")
-    p.add_argument("--channels", type=int, default=30)
+    p.add_argument("--channels", type=int, default=dag.N_CHANNELS)
     p.add_argument("--vars", nargs="+", default=None)
     p.add_argument("--members", type=int, default=51)
     p.add_argument("--steps", type=int, default=53)
     p.add_argument("--env", default=".env")
+    p.add_argument("--recreate", action="store_true",
+                   help="DESTRUCTIVE: write the schema over an existing store, "
+                        "making every committed channel unreachable from "
+                        "`main`. Without this an existing store is refused")
     p.add_argument("--fork-once", action="store_true",
                    help="fork ONE session and pickle it to every task, "
                         "instead of calling session.fork() per block. "
                         "Each unpickled copy records its own changes, so the "
-                        "merge is unchanged -- but 1,590 fork() calls cost "
+                        "merge is unchanged -- but 1,908 fork() calls cost "
                         "476s of the 494s a full date took")
     args = p.parse_args()
 
@@ -80,6 +84,30 @@ def main():
     repo, created = sink.open_sink(args.sink, ak, sk)
     print(f"sink     must-icechunk/{args.sink} "
           f"({'created' if created else 'existing'})")
+
+    # `create_schema` below writes with mode="w".  Against a store that already
+    # holds data that is not a no-op -- it lays a fresh schema over the live
+    # one and makes every committed chunk unreachable from `main` in a single
+    # commit.  That is exactly what cost 30 committed dates on 2026-08-07
+    # (EWC_REALIZE_NOTES.md, Corrections §6); `build_corpus.py` was guarded
+    # afterwards and this script was not.
+    if not created and not args.recreate:
+        already = sink.existing_channels(repo)
+        if already:
+            sys.exit(
+                f"REFUSING: must-icechunk/{args.sink} already holds "
+                f"{len(already)} channel(s) and writing the schema would make "
+                f"them unreachable.\n"
+                f"  pick a new --sink, or pass --recreate if wiping it is "
+                f"genuinely what you want.")
+
+    # The rollback path, printed before anything can write.  Cheap, and the
+    # entire recovery route if a run goes wrong.
+    try:
+        head = list(repo.ancestry(branch="main"))[0].id
+        print(f"rollback repo.reset_branch(\"main\", \"{head}\")")
+    except Exception:
+        pass
 
     client = frisky.Client(args.scheduler)
     print(f"cluster  {args.scheduler}")
@@ -133,7 +161,7 @@ def main():
         f"{len(members)} members, {len(steps)} steps")
     merge_s = time.time() - t2
 
-    total_bytes = n_block * len(members) * 163 * 147 * 4
+    total_bytes = n_block * len(members) * dag.NY * dag.NX * 4
     print(f"\nread+write {read_write:.1f}s  "
           f"({n_leaf / read_write:.1f} messages/s)")
     print(f"merge      {len(forks)} changesets in {merge_s:.1f}s "

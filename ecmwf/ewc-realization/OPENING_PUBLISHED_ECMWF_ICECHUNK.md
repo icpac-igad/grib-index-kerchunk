@@ -1,3 +1,11 @@
+> Lives in `ecmwf/ewc-realization/` (moved from `icechunk-dask-frisky/`, synced with
+> the live copy in crma `medium-range-forecast/3-realize-frisky/`, branch
+> `realize39channel-upto-sep2026`). Where the text below says `1-pars-lithops/`,
+> `2-icechunk-virtual/` or `3-realize-frisky/`, read `../lithops-cr-gik-ecmwf/`,
+> `../icechunk-par/` and this folder. Start at [`README.md`](README.md).
+
+---
+
 # Opening the published ECMWF IFS Icechunk store (source.coop)
 
 The ECMWF IFS ensemble GIK store is published on **source.coop** as a virtual
@@ -114,6 +122,9 @@ t2m = ds["t2m"].isel(time=-1, number=0, step=0).values   # (721, 1440), Kelvin
   | `50r1/t` (14 levels, 51 dates) | 3.10 M | 0.81 GB |
   | `49r1/t2m` (794 dates, 2D) | 3.44 M | 0.80 GB |
   | `49r1/t` (794 dates x 13 levels) | **44.7 M** | **~9.1 GB -> OOM** |
+
+  (Measured at 794 dates; `49r1` is 804 since the 2026-08-08 re-mirror, so both
+  figures are now ~1.3% higher.)
 
   This is *not* caused by turning preload off (preload only controls eager prefetch
   at open, and actually lowers memory). It is purely array size -- `50r1` will hit

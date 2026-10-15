@@ -11,9 +11,9 @@ commit.  We use (a): the workers hand back numpy arrays, and this process holds
 the only Session.  `to_icechunk` with numpy-backed data is a local write, which
 is the case `realize_smoke_test.py` was already judged "within spec" for.
 
-Memory: one channel at a time.  51 members x 53 steps x 163 x 147 float32 is
-259 MB, so the client peak is ~0.5 GB against the 8 GiB cgroup — the reason
-the caller gathers per channel rather than building the whole 7.8 GB Dataset.
+Memory: one channel at a time.  51 members x 53 steps x 262 x 261 float32 is
+739 MB, so the client peak is ~1.5 GB against the 8 GiB cgroup — the reason
+the caller gathers per channel rather than building the whole 26.6 GB Dataset.
 
 Credentials: the source read runs anonymous with `AWS_*` stripped (README §2),
 and this write passes the Ceph key explicitly rather than through `AWS_*`.  The
@@ -28,8 +28,27 @@ DST_REGION = "RegionOne"
 DST_ENDPOINT_DEFAULT = "https://object-store.os-api.cci1.ecmwf.int"
 
 
+#: Which object store the realized output goes to.
+#:   unset / "ceph"  -> EWC Ceph, must-icechunk            (the default; unchanged)
+#:   "gcs"           -> Google Cloud Storage, CRMA_SINK_BUCKET
+#: Set by the caller's environment so no existing invocation changes behaviour.
+#: GCS removes the EWC dependency entirely: no AK/SK, no ECMWF endpoint, no
+#: AWS_CA_BUNDLE trust-store problem (boto3 validates against certifi, which
+#: does not carry the ECMWF CA -- the failure presents as a credentials error
+#: when it is a trust problem).
+SINK_BACKEND = os.environ.get("CRMA_SINK", "ceph").lower()
+GCS_BUCKET = os.environ.get("CRMA_SINK_BUCKET", "")
+
+
 def load_env(path):
-    """AK/SK from the gitignored .env next to the other scripts."""
+    """AK/SK from the gitignored .env next to the other scripts.
+
+    On the GCS backend there is nothing to load -- authentication is the VM's
+    service account or GOOGLE_APPLICATION_CREDENTIALS -- so this returns
+    (None, None) and the caller needs no change.
+    """
+    if SINK_BACKEND == "gcs":
+        return None, None
     creds = {}
     with open(path) as f:
         for line in f:
@@ -46,6 +65,21 @@ def load_env(path):
 def open_sink(prefix, ak, sk, endpoint=None, create=True):
     """Open, or create, the realized repo at must-icechunk/<prefix>."""
     import icechunk as ic
+
+    if SINK_BACKEND == "gcs":
+        if not GCS_BUCKET:
+            raise SystemExit("CRMA_SINK=gcs needs CRMA_SINK_BUCKET set")
+        # from_env=True picks up the VM service account or
+        # GOOGLE_APPLICATION_CREDENTIALS. Keep the bucket in the same region as
+        # the workers: a same-region GCS write is free, cross-region is charged
+        # per GB (devops/crma-gik-spot-vm/README.md).
+        storage = ic.gcs_storage(bucket=GCS_BUCKET, prefix=prefix, from_env=True)
+        try:
+            return ic.Repository.open(storage), False
+        except Exception:
+            if not create:
+                raise
+            return ic.Repository.create(storage), True
 
     storage = ic.s3_storage(
         bucket=DST_BUCKET, prefix=prefix, region=DST_REGION,
@@ -86,7 +120,7 @@ def channel_dataset(name, arr, coords, date):
 
 
 def encoding_for(name, n_number, n_lat, n_lon):
-    """One chunk per (date, step): 51 x 163 x 147 float32 = 4.9 MB.
+    """One chunk per (date, step): 51 x 262 x 261 float32 = 13.9 MB.
 
     Keeps the store chunks a divisor of anything a later dask read would use,
     which is the constraint ICECHUNK_DASK_GUIDANCE.md §1 calls out as the
@@ -127,10 +161,11 @@ def create_schema(repo, channel_names, coords, dates, dtype="float32"):
     only fill regions of arrays that already exist.
 
     `to_zarr(compute=False)` writes the metadata and none of the data, so this
-    costs nothing even though the arrays total 7.8 GB.  It goes through xarray
+    costs nothing even though the arrays total 26.6 GB.  It goes through xarray
     rather than `zarr.create_array` deliberately: the `realized-test` store in
-    this same bucket was written with raw zarr and is unreadable by xarray to
-    this day because its arrays carry no `dimension_names`.
+    this same bucket was written with raw zarr and was never readable by
+    xarray, because its arrays carried no `dimension_names`. (Deleted
+    2026-08-09; the lesson is why this goes through xarray.)
 
     Returns the snapshot id.
     """

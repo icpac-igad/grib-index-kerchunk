@@ -228,7 +228,7 @@ pack at ~630 KB per message against ~330 KB later, so treat 0p4's 181 TB as
 |---|---|
 | conversion driver | `ecmwf/icechunk-par/backfill_all_eras.py` (sequential, one date per subprocess) — commit `9dfebc9` |
 | builder | `ecmwf/icechunk-par/build_ecmwf_icechunk.py` |
-| mirror | `icechunk-dask-frisky/mirror_gcs_to_source_coop.py --live-only [--prune]` — commit `c49f6ca` |
+| mirror | `ecmwf/ewc-realization/mirror_gcs_to_source_coop.py --live-only [--prune]` — commit `c49f6ca` |
 | completeness check | `ecmwf/icechunk-par/verify_store_completeness.py` (manifest-level, per group) |
 | health check | `ecmwf/icechunk-par/check_store_health.py` |
 | logs | `~/ecmwf-rebuild/logs/{serial-12z-18z, verify-sweep, mirror-v4-full, mirror-v4-prune}.log` |

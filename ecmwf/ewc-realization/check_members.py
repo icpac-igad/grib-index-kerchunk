@@ -12,8 +12,10 @@ Shape checks do not see it.  These do:
 
 Usage
 -----
-    .venv/bin/python check_members.py --prefix ea-cgan/v1-7day
-    .venv/bin/python check_members.py --prefix ea-frisky-test/2026-07-02
+    .venv/bin/python check_members.py --prefix ea-swio/v1-49r1-mar-may2026 --var gh500
+
+    NOTE: this only ever inspects time=0. On a corpus it therefore checks the
+    FIRST date and no other -- spot-check later dates separately.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ EP_DEFAULT = "https://object-store.os-api.cci1.ecmwf.int"
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--prefix", default="ea-cgan/v1-7day")
+    p.add_argument("--prefix", default="ea-swio/v1-49r1-mar-may2026")
     p.add_argument("--env", default=".env")
     p.add_argument("--var", default=None, help="which channel to inspect")
     p.add_argument("--endpoint", default=EP_DEFAULT)

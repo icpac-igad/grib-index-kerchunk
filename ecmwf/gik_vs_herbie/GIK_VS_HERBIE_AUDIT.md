@@ -782,7 +782,7 @@ chunks"*. The xarray-native path — `xr.open_zarr(store, chunks={})` — built 
 nine-million-task graph before any selection and hung. The realization was
 completed with a hand-written futures DAG, not with the store's own ergonomics.
 
-**frisky is also not GIK's.** `icechunk-dask-frisky/deploy_workers.py:50` lists
+**frisky is also not GIK's.** `ecmwf/ewc-realization/deploy_workers.py:50` (then `icechunk-dask-frisky/`) lists
 `frisky>=0.3.0` as an external package; `frisky_daily_dag.py` is bespoke
 integration code. The executor works on offsets, whatever produces them.
 

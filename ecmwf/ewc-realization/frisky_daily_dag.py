@@ -1,4 +1,4 @@
-"""Daily ECMWF IFS ensemble -> East Africa mean/sd, as a Frisky futures DAG.
+"""Daily ECMWF IFS ensemble -> raw members over EA/SW-IO, as a Frisky futures DAG.
 
 This is the Option-A-shaped design from NEXT_SESSION.md §5, but built on Frisky
 futures instead of a Dask collection graph. The three rules it is built to obey:
@@ -8,19 +8,25 @@ futures instead of a Dask collection graph. The three rules it is built to obey:
         so no zarr `sync()` event loop is ever nested inside a worker thread
   §4.4  every read is wrapped in 503/SlowDown backoff
 
-DAG shape, per date.  Every leaf is independent; the only fan-in is the
-reduction over `number`, which is exactly what the science asks for:
+DAG shape, per date.  Every leaf is independent; the only fan-in is over
+`number`, and it is a STACK, not a reduction -- the store keeps every raw
+ensemble member, control included (`number=0`), because the downstream model
+trains on the spread itself:
 
-    read(m=0, step=s) ---.
-    read(m=1, step=s) ----+--> reduce_members(step=s) --.
-    ...                  /                               +--> stack_steps(channel)
-    read(m=50, step=s) -'                               /          |
-    ... one such fan-in per step ----------------------'           v
-                                                              mean/sd arrays
+    read(m=0,  step=s) ---.        m=0 is the CONTROL
+    read(m=1,  step=s) ----+--> stack_members(step=s) --> write_block -> chunk
+    ...                   /                                 (number, y, x)
+    read(m=50, step=s) --'
+    ... one such fan-in per (channel, step) ...
 
-Counts for the production shape (30 channels x 51 members x 53 steps):
-81,090 leaves + 1,590 reductions + 30 stacks per date.  Dask pays ~1 ms of
-scheduler overhead per task on that (~80 s/date of pure bookkeeping); Frisky
+`reduce_members` (mean/sd) still exists but is a probe-only fold, reachable
+only via `--reduce-members`, and refused with `--sink`.  Neither writer
+(`build_corpus.py`, `parallel_write.py`) can reach it at all: both submit
+`write_block` directly, which stacks.
+
+Counts for the production shape (36 channels x 51 members x 53 steps):
+97,308 leaves + 1,908 reductions + 36 stacks per date.  Dask pays ~1 ms of
+scheduler overhead per task on that (~97 s/date of pure bookkeeping); Frisky
 pays ~3 us (~0.25 s).  That is not the main reason to use it here -- see the
 memory note in the header of `run()` -- but it is not nothing.
 
@@ -74,35 +80,227 @@ SRC_BUCKET = "e4drr-project"
 SRC_PREFIX = "forecasts/ecmwf_ifs_ens_aws_s3_icechunk_vd"
 CONTAINER = "s3://ecmwf-forecasts/"
 
-LAT_MAX, LAT_MIN = 25.25, -15.25       # store latitude DESCENDS
-LON_MIN, LON_MAX = 18.5, 55.0
+# ---------------------------------------------------------------------------
+# Domain.  `ea-sw-io` -- East Africa plus the south-west Indian Ocean, the
+# basin the systems that flood East Africa actually come from.  Widened to
+# 40N on 2026-08-16 so the northern part of the region is assessed too:
+#
+#   ea          lat  25.25 -> -15.25, lon 18.5 -> 55.0   163 x 147 =  23,961
+#   ea-sw-io    lat  25.25 -> -40.0,  lon 15.0 -> 80.0   262 x 261 =  68,382
+#   ea-sw-io40  lat  40.0  -> -40.0,  lon 15.0 -> 80.0   321 x 261 =  83,781
+#
+# Every edge lands exactly on the 0.25 deg grid, so no interpolation is
+# implied (90 - 40 = 50, and 50 / 0.25 = 200 exactly).
+#
+# Widening costs nothing to READ.  A GRIB message is global, so the number of
+# messages -- channels x members x steps -- is independent of the box; the box
+# only decides what is kept after the fetch.  It costs on the WRITE side only:
+# the chunk grows 13.95 -> 17.09 MB and a date 12.0 -> 14.8 GB stored.
+#
+# Changing these constants changes what every worker cuts out of a message, and
+# the workers hold their own copy of this module -- redeploy with
+# `deploy_workers.py --start` after any edit here, or they keep the old box
+# and `write_block` fails on a shape mismatch (loudly, which is the point).
+# ---------------------------------------------------------------------------
+LAT_MAX, LAT_MIN = 40.0, -40.0         # store latitude DESCENDS
+LON_MAX = 80.0
+
+# The grid is a property of the ERA, not a constant.
+#
+#   49r1 / 50r1   0.25 deg, 721x1440 global   -> 321 x 261 over the box
+#   0p4           0.4  deg, 451x900  global   -> 201 x 164 over the box
+#
+# The western edge differs and that is not cosmetic. 15.0E is NOT a 0p4 grid
+# point: the grid runs -180 + 0.4k, and 15.0 needs k = 487.5. Asking for
+# slice(15.0, 80.0) on a 0.4 deg axis silently returns the 15.2 edge and a
+# 163-wide box, which then fails the write on a shape mismatch -- or worse,
+# succeeds against a schema built the same wrong way. 14.8 IS on the grid, and
+# 40.0, -40.0 and 80.0 are on both grids exactly.
+#
+# Every era therefore gets its own (deg, lon_min); nothing here is derived from
+# another era's numbers. Changing these changes what each worker cuts out of a
+# message, and workers hold their own copy of this module -- redeploy with
+# `deploy_workers.py --start` after any edit, or they keep the old box.
+_GRID = {
+    "0p4":  (0.4,  14.8),
+    "49r1": (0.25, 15.0),
+    "50r1": (0.25, 15.0),
+}
+
+
+def grid_for(era):
+    """-> (deg, lon_min, ny, nx) for one era. The single source of box truth."""
+    try:
+        deg, lon_min = _GRID[era]
+    except KeyError:
+        raise SystemExit(f"no grid defined for era {era!r}; known: {sorted(_GRID)}")
+    ny = int(round((LAT_MAX - LAT_MIN) / deg)) + 1
+    nx = int(round((LON_MAX - lon_min) / deg)) + 1
+    return deg, lon_min, ny, nx
+
+
+# Module-level defaults are the 0.25 deg eras, so anything that predates
+# grid_for() keeps its old behaviour bit-for-bit.
+GRID_DEG, LON_MIN, NY, NX = (lambda g: (g[0], g[1], g[2], g[3]))(grid_for("49r1"))
 
 # (store_var, level|None, out_name) -- ordered heaviest-manifest-last so a small
 # --channels N still exercises a mix of surface and pressure-level reads.
+#
+# 36 of the 39 draw on base variables common to `0p4`, `49r1` and `50r1`
+# (ECMWF_VARIABLES_REFERENCE.md §2), and that portable 36 is the set to build a
+# 0p4 season from -- unlike the previous 30-channel table, which used `ssr`,
+# `ttr`, `tcw`, `mucape` and `w`, none of which exist in 0p4. The other three --
+# w700, cape, d2m -- are 0.25-degree only; see NOT_IN_0P4 and has_dewpoint().
+# Levels used are 200/500/700/850/925, all in the 9 levels common to the three.
+# ECMWF renamed the CAPE field. Before 2024-11-13 it is `cape`; from that date
+# it is `mucape` (most-unstable parcel). They are the same channel to the model
+# and are stored under the single output name `cape`, so a season that straddles
+# the rename still yields one continuous variable. Resolved per date at read
+# time by _resolve_var(), because a channel table has no date in it.
+#
+# The date was 2025-01-01 here until 2026-08-27 and that was WRONG by seven
+# weeks. Measured against the source: `cape` decodes on 2024-11-12 and returns
+# all-NaN on 2024-11-13, `mucape` the reverse. 2024-11-13 is also the date
+# `mn2t6`/`mx2t6` first appear, so ECMWF changed the published field set that
+# day. Nothing built before 2026-08-27 was affected -- MAM 2024 and JJA 2024
+# both end before 2024-11-13, and every later season starts after it, so no
+# built season straddled the boundary. SOND 2024 is the first that does: under
+# the old constant its last 49 dates would have resolved to `cape` and written
+# an all-NaN channel, silently, because an unwritten chunk reads as NaN rather
+# than raising.
+CAPE = "@cape"                          # sentinel, never a real GRIB shortName
+CAPE_RENAMED = "2024-11-13"
+
+
+def _resolve_var(var, date):
+    """Map a channel's source name for one date. Only CAPE is date-dependent."""
+    if var != CAPE:
+        return var
+    return "cape" if str(date)[:10] < CAPE_RENAMED else "mucape"
+
+
+# Source variables the 0.4-degree archive does not publish. Verified against the
+# published store on 2026-09-18: 0p4/00z carries 19 variables and these are not
+# among them, so a 0p4 season is a 36-channel store against 49r1/50r1's 39.
+#
+# Declared once, as data, because the guard in build_corpus.py used to encode it
+# as `c[2] == "w700" or c[0] == CAPE`. Adding `2d` as channel 39 escaped that
+# test silently, and a 0p4 season would then have raised KeyError inside a worker
+# on message ~90,000 of a run 40 minutes in. A new channel needs no edit here
+# unless it draws on a variable 0p4 also lacks.
+NOT_IN_0P4 = {"w", "2d", CAPE}
+
+
+def is_convective_era(era):
+    """Whether `era` carries the NOT_IN_0P4 variables -- i.e. is not 0p4."""
+    return era in ("49r1", "50r1")
+
+
+def channels_absent_from(era, channels, date=None):
+    """out_names in `channels` that (era, date) cannot supply.
+
+    Empty means buildable. Pass the season's FIRST date: `2d` is limited by date
+    as well as by era (has_dewpoint), and a 49r1 season starting before
+    2024-03-06 would otherwise write an all-NaN d2m channel silently -- the same
+    failure the CAPE constant caused, since an unwritten chunk reads as NaN
+    rather than raising.
+    """
+    absent = [] if is_convective_era(era) else \
+        [out for src, _lvl, out in channels if src in NOT_IN_0P4]
+    if date is not None and not has_dewpoint(era, date):
+        absent += [out for src, _lvl, out in channels
+                   if src == "2d" and out not in absent]
+    return absent
+
+
 CHANNELS = [
-    ("t2m", None, "t2m"), ("tp", None, "tp"), ("msl", None, "msl"),
-    ("tcwv", None, "pw"), ("sp", None, "sp"), ("skt", None, "skt"),
-    ("ssr", None, "ssr"), ("ttr", None, "ttr"), ("tcw", None, "tcw"),
-    ("mucape", None, "mucape"),
-    ("u", 925, "u925"), ("v", 925, "v925"), ("u", 850, "u850"),
-    ("v", 850, "v850"), ("u", 700, "u700"), ("v", 700, "v700"),
-    ("u", 500, "u500"), ("v", 500, "v500"), ("u", 200, "u200"),
-    ("v", 200, "v200"), ("gh", 500, "gh500"),
-    ("w", 925, "w925"), ("w", 850, "w850"), ("w", 700, "w700"),
-    ("w", 500, "w500"),
+    # -- surface: direct hazard / moisture / circulation ------------------
+    ("tp", None, "tp"),                # precipitation
+    ("tcwv", None, "tcwv"),            # column water vapour
+    ("msl", None, "msl"),              # synoptic pressure systems
+    ("sp", None, "sp"),                # surface pressure
+    ("ro", None, "ro"),                # runoff
+    ("t2m", None, "t2m"),              # near-surface temperature
+    ("skt", None, "skt"),              # surface thermal state
+    ("u10", None, "u10"),
+    ("v10", None, "v10"),
+    ("lsm", None, "lsm"),              # land-sea mask (constant in time)
+
+    # -- low/mid/upper-level circulation ----------------------------------
+    ("u", 925, "u925"), ("v", 925, "v925"),
+    ("u", 850, "u850"), ("v", 850, "v850"),
+    ("u", 700, "u700"), ("v", 700, "v700"),
+    ("u", 500, "u500"), ("v", 500, "v500"),
+    ("u", 200, "u200"), ("v", 200, "v200"),
+
+    # -- specific humidity -------------------------------------------------
+    ("q", 925, "q925"), ("q", 850, "q850"),
+    ("q", 700, "q700"), ("q", 500, "q500"),
+
+    # -- relative humidity -------------------------------------------------
     ("r", 850, "r850"), ("r", 700, "r700"),
+
+    # -- thermodynamic profile ---------------------------------------------
     ("t", 850, "t850"), ("t", 700, "t700"), ("t", 500, "t500"),
+
+    # -- mid-tropospheric circulation --------------------------------------
+    ("gh", 500, "gh500"),
+
+    # -- native relative vorticity -----------------------------------------
+    ("vo", 850, "vo850"), ("vo", 700, "vo700"), ("vo", 500, "vo500"),
+
+    # -- native divergence --------------------------------------------------
+    ("d", 850, "d850"), ("d", 700, "d700"), ("d", 200, "d200"),
+
+    # -- convection: the two cGAN channels ---------------------------------
+    # Added 2026-08-22, so a season is built at 38 in one pass instead of 36
+    # plus an append_channels.py run.  Both are absent from `0p4`, which is
+    # why a 0p4 season is a 36-channel store -- see is_convective_era().
+    ("w", 700, "w700"),                # vertical velocity: the updraught
+    (CAPE, None, "cape"),              # convective available potential energy
+
+    # ---- beyond the default 38 -------------------------------------------
+    # Channel 39. Deliberately AFTER the 38, so `--channels 38` still selects
+    # exactly the set every published 0.25 deg season was built with. Reach it
+    # by name: `--vars d2m`. Availability is narrower than the rest, so check
+    # has_dewpoint() before building -- see the note there.
+    ("2d", None, "d2m"),               # 2 m dew point temperature
 ]
+
+DEWPOINT_FROM = "2024-03-06"
+
+
+def has_dewpoint(era, date):
+    """`2d` is not available everywhere the other channels are.
+
+    Measured by decode, not read off the era's variable union:
+
+        era    date          2d
+        0p4    any           absent   (not among its 19 variables)
+        49r1   2024-03-05    all-NaN
+        49r1   2024-03-06    ok       <- the 83 -> 102 field change
+        50r1   any           ok
+
+    2024-03-06 is the same boundary that limits `w700`/`cape` to 87/92 in
+    MAM 2024, so the gap is identical and already precedented.
+    """
+    if era == "0p4":
+        return False
+    return str(date)[:10] >= DEWPOINT_FROM
+
+
+N_CHANNELS = len(CHANNELS)             # 39 -- 0p4 can supply only 36
 
 STEPS_ALL_H = list(range(0, 145, 3)) + list(range(150, 361, 6))
 
 
 # ===========================================================================
 # Worker-side.  Module-level functions only -- Frisky pickles them by
-# reference, so nothing large rides along with each of the 81,090 tasks.
+# reference, so nothing large rides along with each of the 97,308 tasks.
 # ===========================================================================
 
 _DS_CACHE: dict = {}          # per worker PROCESS, not per task
+_SRC_SNAPSHOT: dict = {}      # era -> snapshot id of the source store as opened
 
 
 def _open_era(era: str):
@@ -134,22 +332,44 @@ def _open_era(era: str):
     repo = icechunk.Repository.open(storage, config=cfg,
                                     authorize_virtual_chunk_access=auth)
     sess = repo.readonly_session("main")
+    _SRC_SNAPSHOT[era] = sess.snapshot_id
     ds = xr.open_zarr(sess.store, group=f"{era}/00z", consolidated=False,
                       zarr_format=3, decode_timedelta=True, chunks=None)
     _DS_CACHE[era] = ds
     return ds
 
 
+def source_provenance(era: str) -> str:
+    """One line naming the GIK virtual store this build read, and its SNAPSHOT.
+
+    A run log recorded the sink, the shape and the cost, but nothing tying the
+    output to its input: provenance had to be inferred from a source-code
+    constant that could since have changed. The snapshot id is the part that
+    matters -- it pins the exact version of the virtual store, which the date
+    axis only gestures at, and it is what distinguishes a realization built from
+    the GIK manifests from one built any other way.
+
+    Call it on the CLIENT. Cheap: the client already opens the source for
+    subset_coords()/available_dates(), so this reuses that cached session.
+    """
+    _open_era(era)            # populates _SRC_SNAPSHOT; no-op if already open
+    return (f"source   {SRC_ENDPOINT}/{SRC_BUCKET}/{SRC_PREFIX}\n"
+            f"         group {era}/00z  snapshot {_SRC_SNAPSHOT.get(era, 'unknown')}\n"
+            f"         virtual chunks -> {CONTAINER} (anonymous), decoded by gribberish")
+
+
 def read_message(era, var, level, date, member, step_h, synthetic=False):
     """ONE GRIB message -> the East Africa box as float32.  The unit of work.
 
     Measured at 0.23-0.25 s warm on a single machine (NEXT_SESSION.md §2).
-    Holds one global message (~4 MB) transiently and returns ~0.1 MB.
+    Holds one global message (~4 MB) transiently and returns ~0.33 MB.
     """
+    _, _lon_min, _ny, _nx = grid_for(era)
     if synthetic:
         rng = np.random.default_rng(abs(hash((var, member, step_h))) % 2**32)
         time.sleep(0.02)
-        return rng.standard_normal((163, 147), dtype=np.float32)
+        _, _, _ny, _nx = grid_for(era)
+        return rng.standard_normal((_ny, _nx), dtype=np.float32)
 
     import numpy as _np
     import random as _random
@@ -168,7 +388,7 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
                 raise
             time.sleep(delay + _random.random() * delay)
             delay = min(delay * 2, 30)
-    da = ds[var]
+    da = ds[_resolve_var(var, date)]
     # Level FIRST, while this is still lazily-indexed xarray -- DAG_METHOD.md
     # §5. There is no dask graph here to blow up, but the composed lazy index
     # is narrower for it and the rule costs nothing to follow.
@@ -179,7 +399,7 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
         number=member,
         step=_np.timedelta64(step_h, "h"),
         latitude=slice(LAT_MAX, LAT_MIN),
-        longitude=slice(LON_MIN, LON_MAX),
+        longitude=slice(_lon_min, LON_MAX),
     )
 
     # §4.4 -- icechunk surfaces AWS throttling as `unhandled error (SlowDown)`
@@ -211,7 +431,13 @@ def read_message(era, var, level, date, member, step_h, synthetic=False):
 
 
 def reduce_members(*fields):
-    """Fan-in over `number`.  The only reduction in the whole job.
+    """PROBE ONLY -- mean/sd fan-in over `number`.  Not the production path.
+
+    Nothing that writes a store calls this.  It survives because the `--out`
+    npz path and the throughput probes use it to keep client memory trivial
+    while measuring read rate.  Collapsing 51 members to two moments would
+    destroy exactly the signal the realized store exists to carry, so `--sink`
+    refuses it and `build_and_submit` defaults to `stack_members`.
 
     Takes ~51 x 0.1 MB and returns 2 x 0.1 MB, so the peak a worker holds for
     one reduction is ~5 MB.  Memory is bounded by construction, which matters
@@ -223,10 +449,11 @@ def reduce_members(*fields):
 
 
 def stack_members(*fields):
-    """Keep every member: (number, y, x) for one (channel, step).
+    """THE production fan-in: keep every member, (number, y, x) per step.
 
-    The alternative fan-in to `reduce_members`, used when the store is to hold
-    individual members.  ~5 MB out instead of ~0.2 MB, still bounded.
+    `fields` arrives in the order the members were submitted -- 0..50 -- so
+    axis 0 of the result is the `number` coordinate as written, with the
+    control at index 0.  ~17.1 MB out instead of ~0.5 MB, still bounded.
     """
     return np.stack(fields, axis=0)
 
@@ -268,14 +495,15 @@ def stack_steps(*per_step):
 # ===========================================================================
 
 def build_and_submit(client, date, channels, members, steps, era, synthetic,
-                     keep_members=False):
-    """One submission per date.
+                     keep_members=True):
+    """One submission per date.  Members are KEPT unless explicitly told not to.
 
-    Returns {out_name: Future[(mean, sd)]}, or with keep_members
-    {out_name: [Future[(number, y, x)] per step]} -- a LIST, deliberately.
+    Returns {out_name: [Future[(number, y, x)] per step]} -- a LIST,
+    deliberately.  With keep_members=False (probe only) it collapses to
+    {out_name: Future[(mean, sd)]}.
 
     The list matters for memory.  A whole channel with members kept is
-    51 x 53 x 163 x 147 float32 = 259 MB, and 30 of those is 7.8 GB against an
+    51 x 53 x 321 x 261 float32 = 906 MB, and 36 of those is 32.6 GB against an
     8 GiB client cgroup.  Returning per-step futures lets the caller gather one
     channel, write it, and drop it before touching the next.
 
@@ -306,17 +534,18 @@ def subset_coords(era, date, members, steps, synthetic=False):
     Metadata only -- `.sel()` on lazily-indexed xarray fetches no chunks, so
     this costs one store open (~5 s) and no data.
     """
+    _, _lon_min, _ny, _nx = grid_for(era)
     import numpy as _np
 
     if synthetic:
         return {"step": _np.array([_np.timedelta64(h, "h") for h in steps]),
                 "number": _np.array(members),
-                "latitude": _np.linspace(LAT_MAX, LAT_MIN, 163),
-                "longitude": _np.linspace(LON_MIN, LON_MAX, 147)}
+                "latitude": _np.linspace(LAT_MAX, LAT_MIN, _ny),
+                "longitude": _np.linspace(_lon_min, LON_MAX, _nx)}
 
     ds = _open_era(era)
     box = ds["t2m"].sel(latitude=slice(LAT_MAX, LAT_MIN),
-                        longitude=slice(LON_MIN, LON_MAX))
+                        longitude=slice(_lon_min, LON_MAX))
     return {
         "step": _np.array([_np.timedelta64(h, "h") for h in steps]),
         "number": _np.array(members),
@@ -328,13 +557,19 @@ def subset_coords(era, date, members, steps, synthetic=False):
 def available_dates(era, dates):
     """Which of `dates` are actually on the source era's `time` axis.
 
-    The published virtual store is not gap-free.  `49r1/00z` carries 794 of the
-    804 calendar days it spans, and all ten holes fall in March 2026
-    (03-19, 03-22..27, 03-29..31) -- ECMWF published those dates, our Stage 1
-    scan simply never picked them up.  Without this check `build_corpus.py`
-    submits 1,590 blocks for a date that cannot resolve, waits out four retry
+    `49r1/00z` carries all 804 calendar days it spans as of the 2026-08-08
+    re-mirror; the ten March 2026 holes (03-19, 03-22..27, 03-29..31) are
+    closed.  This check stays because `0p4` still has six upstream holes
+    (2023-04-27..05-02) and nothing guarantees a future era is dense.
+
+    NOTE: a worker started before a re-mirror keeps serving the OLD snapshot --
+    `_open_era` caches per process -- so it will report the recovered dates as
+    absent.  Restart the workers after any source change.
+
+    Without this check `build_corpus.py`
+    submits 1,908 blocks for a date that cannot resolve, waits out four retry
     rounds at 45 s each, and only then calls it FAILED: ~3 minutes of pure
-    waiting per absent date, plus 81,090 doomed reads.
+    waiting per absent date, plus 97,308 doomed reads.
 
     Membership is tested against the raw values, NOT a slice.  The 49r1 and
     0p4 axes are non-monotonic -- one date was appended after a later batch, so
@@ -469,8 +704,13 @@ def run(args):
         print(f"cluster  {args.workers}x{args.threads} local, "
               f"dashboard {cluster.dashboard_link}")
 
-    keep = args.store_members
+    keep = not args.reduce_members
     repo = coords = None
+    # Set here, not only under `if args.sink`: `first = not already` below runs
+    # on every path, so a no-sink run (--synthetic, --out, the smoke tests in
+    # this module's docstring) raised UnboundLocalError. Nothing caught it
+    # because every production writer passes --sink.
+    already = set()
     if args.sink:
         import sink_icechunk as sink
         here = os.path.dirname(os.path.abspath(__file__))
@@ -552,11 +792,24 @@ def run(args):
         if cluster is not None:
             cluster.close()
 
-    for name, (mean, sd) in results.items():
-        finite = float(np.isfinite(mean).mean())
-        print(f"  {name:7s} mean{mean.shape}  finite {finite:.3f}  "
-              f"min/mean/max {np.nanmin(mean):9.2f} {np.nanmean(mean):9.2f} "
-              f"{np.nanmax(mean):9.2f}   sd_mean {np.nanmean(sd):8.3f}")
+    # `results` holds whatever the fan-in produced: a (mean, sd) pair under
+    # --reduce-members, otherwise the stacked members. Reporting assumed the
+    # pair unconditionally, so a no-sink run without --reduce-members -- the
+    # default, and what the docstring's smoke tests use -- died with
+    # "too many values to unpack". Same cause as `already`: the no-sink path
+    # is not exercised by any production writer, since all of them pass --sink.
+    for name, res in results.items():
+        if isinstance(res, tuple):
+            mean, sd = res
+            finite = float(np.isfinite(mean).mean())
+            print(f"  {name:7s} mean{mean.shape}  finite {finite:.3f}  "
+                  f"min/mean/max {np.nanmin(mean):9.2f} {np.nanmean(mean):9.2f} "
+                  f"{np.nanmax(mean):9.2f}   sd_mean {np.nanmean(sd):8.3f}")
+        else:
+            finite = float(np.isfinite(res).mean())
+            print(f"  {name:7s} stack{res.shape}  finite {finite:.3f}  "
+                  f"min/mean/max {np.nanmin(res):9.2f} {np.nanmean(res):9.2f} "
+                  f"{np.nanmax(res):9.2f}")
     for name, err in failed:
         print(f"  {name:7s} FAILED  {err}")
 
@@ -587,7 +840,8 @@ def main():
     p.add_argument("--date", default="2026-07-02")
     p.add_argument("--era", default="50r1", choices=["0p4", "49r1", "50r1"])
     p.add_argument("--channels", type=int, default=1,
-                   help="how many of the 30 channels (start at 1 -- §4.5)")
+                   help=f"how many of the {N_CHANNELS} channels "
+                        "(start at 1 -- §4.5)")
     p.add_argument("--vars", nargs="+", default=None,
                    help="pick channels by out_name (u925 v850 ...) instead of "
                         "taking the first --channels")
@@ -603,10 +857,13 @@ def main():
     p.add_argument("--out", default=None, help="directory for .npz output")
     p.add_argument("--sink", default=None,
                    help="prefix under must-icechunk to write, e.g. "
-                        "ea-cgan/v1-7day.  Requires --store-members")
-    p.add_argument("--store-members", action="store_true",
-                   help="keep every member instead of reducing to mean/sd.  "
-                        "51x53x163x147 f32 = 259 MB per channel, 7.8 GB/date")
+                        "ea-swio/one-date.  Always writes raw members")
+    p.add_argument("--reduce-members", action="store_true",
+                   help="PROBE ONLY: collapse the 51 members to mean/sd "
+                        "instead of keeping them.  Refused with --sink.  "
+                        "Members are kept by default: "
+                        f"51x53x{NY}x{NX} f32 = 906 MB per channel, "
+                        "32.6 GB/date")
     p.add_argument("--resume", action="store_true",
                    help="skip channels already committed to --sink.  Each is "
                         "its own commit, so a killed run loses nothing")
@@ -618,14 +875,16 @@ def main():
     p.add_argument("--synthetic", action="store_true",
                    help="no network: prove the DAG shape only")
     p.add_argument("--ramp", action="store_true",
-                   help="run at 1, 2, 4, 8, 16, 30 channels and stop at the break")
+                   help=f"run at 1, 2, 4, 8, 16, {N_CHANNELS} channels and "
+                        "stop at the break")
     p.add_argument("--count", action="store_true",
                    help="print the DAG size and exit; opens nothing, submits "
                         "nothing")
     args = p.parse_args()
 
-    if args.sink and not args.store_members:
-        p.error("--sink writes the member dimension; pass --store-members")
+    if args.sink and args.reduce_members:
+        p.error("--sink writes the raw member dimension; drop "
+                "--reduce-members")
 
     if args.count:
         sys.exit(0 if count_only(args) else 1)
@@ -633,7 +892,7 @@ def main():
     if not args.ramp:
         sys.exit(0 if run(args) else 1)
 
-    for n in (1, 2, 4, 8, 16, 30):
+    for n in (1, 2, 4, 8, 16, N_CHANNELS):
         if n > len(CHANNELS):
             break
         print(f"\n{'=' * 72}\n  RAMP: {n} channel(s)\n{'=' * 72}")
@@ -641,7 +900,7 @@ def main():
         if not run(args):
             print(f"\nbroke at {n} channels.  That number localises it.")
             sys.exit(1)
-    print("\nramp clean to 30 channels.")
+    print(f"\nramp clean to {N_CHANNELS} channels.")
 
 
 if __name__ == "__main__":

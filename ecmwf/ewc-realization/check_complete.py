@@ -15,7 +15,10 @@ produced exactly the same three zero blocks.
 
 Usage
 -----
-    .venv/bin/python check_complete.py --prefix ea-cgan/v2-7day
+    .venv/bin/python check_complete.py --prefix ea-swio/<a-single-date-store>
+
+    Single-date stores only -- this reads EVERY block. The 73-date corpus is
+    898 GB; use check_chunks.py (manifest) on anything that size.
 """
 from __future__ import annotations
 

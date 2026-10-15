@@ -1,3 +1,11 @@
+> Lives in `ecmwf/ewc-realization/` (moved from `icechunk-dask-frisky/`, synced with
+> the live copy in crma `medium-range-forecast/3-realize-frisky/`, branch
+> `realize39channel-upto-sep2026`). Where the text below says `1-pars-lithops/`,
+> `2-icechunk-virtual/` or `3-realize-frisky/`, read `../lithops-cr-gik-ecmwf/`,
+> `../icechunk-par/` and this folder. Start at [`README.md`](README.md).
+
+---
+
 # What actually limits this read, measured
 
 Every number here was measured on the EWC cluster against the published ECMWF

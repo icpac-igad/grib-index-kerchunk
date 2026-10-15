@@ -182,7 +182,7 @@ egress per date if every message is read.
 Variable lists, straight from a group's schema:
 
 ```python
-import frisky_daily_dag as dag            # icechunk-dask-frisky/
+import frisky_daily_dag as dag            # ecmwf/ewc-realization/
 ds = dag._open_era("49r1")                # "0p4" | "49r1" | "50r1"
 pl  = sorted(v for v in ds.data_vars if "isobaricInhPa" in ds[v].dims)
 sfc = sorted(v for v in ds.data_vars if "isobaricInhPa" not in ds[v].dims)
@@ -206,7 +206,7 @@ for s in repo.ancestry(branch="main"):
 > `time`** axes (three backfill commits on 2026-07-07 landed out of order), so
 > `.sel(time=slice(...))` raises `KeyError`. Use `ds.sortby("time")` first, or
 > exact-label `.sel(time=np.datetime64(d))`, which is unaffected.
-> See `icechunk-dask-frisky/README.md` "Known defects in the published store".
+> See `ewc-realization/history/README_icechunk-dask-frisky_2026-08.md` "Known defects in the published store".
 
 ---
 
@@ -217,4 +217,4 @@ for s in repo.ancestry(branch="main"):
 | `lithops-cr-gik-ecmwf/era_check.py` | era windows, cycle reach, the two era switches, GCS layout |
 | `lithops-cr-gik-ecmwf/README.md` | how the per-era runtime image selects the template |
 | `icechunk-par/build_ecmwf_icechunk.py` | `ERAS` table: grid + canonical level superset per era |
-| `icechunk-dask-frisky/README.md` | known defects in the published store; date coverage audit |
+| `ewc-realization/history/README_icechunk-dask-frisky_2026-08.md` | known defects in the published store; date coverage audit |

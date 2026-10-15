@@ -6,3 +6,5 @@ __pycache__/
 out/
 *.txt
 .ipynb_checkpoints/
+.env.*
+**/.env.*

@@ -48,7 +48,7 @@ DASK_SCHEDULER = "tcp://127.0.0.1:8786"
 # Quoted individually when written into the install script -- an unquoted
 # `frisky>=0.3.0` is a shell redirect, not a version specifier.
 PACKAGES = ["frisky>=0.3.0", "icechunk==2.1.1", "zarr==3.2.1",
-            "xarray==2026.7.0", "gribberish==1.6.0", "numpy==2.5.1",
+            "xarray==2026.7.0", "gribberish==1.6.0", "numpy==2.5.1", "boto3",
             # stage 2 (par -> icechunk) parses parquet and reads pars from GCS on
             # the worker. pandas arrives as an xarray dep, but WITHOUT pyarrow --
             # and installing pyarrow into a worker that has already imported
@@ -314,7 +314,7 @@ def main():
     p.add_argument("--tracing-capacity", type=int, default=20000,
                    help="scheduler span buffer; the default 200k is what "
                         "grew unbounded across runs")
-    p.add_argument("--scheduler", default="192.168.1.129:8796",
+    p.add_argument("--scheduler", default="192.168.1.164:8796",
                    help="the FRISKY scheduler the workers should dial")
     p.add_argument("--nthreads", type=int, default=4)
     p.add_argument("--workers-per-vm", type=int, default=1,
