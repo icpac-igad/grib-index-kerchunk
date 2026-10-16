@@ -26,6 +26,7 @@ source.coop.
 | 3 | [`03_DAILY_OPERATIONS.md`](03_DAILY_OPERATIONS.md) | the daily routine, one forecast from pars to source.coop: commands, gates, rules, what to do when it stops |
 | 4 | [`04_VERIFY_AND_PUBLISH.md`](04_VERIFY_AND_PUBLISH.md) | manifest/physics checks, the two mirrors, anonymous verification, deleting from Ceph |
 | 5 | [`05_BOTTLENECKS_AND_ISSUES.md`](05_BOTTLENECKS_AND_ISSUES.md) | what limits throughput (with the measured numbers), why the daily run uses 24 readers, every worker issue and fix, open items |
+| 6 | [`06_ALTERNATIVES_GCP_SPOT_AND_COLAB.md`](06_ALTERNATIVES_GCP_SPOT_AND_COLAB.md) | running the daily job without EWC: GCP Spot layouts, Google Colab (CLI + compute units) as the daily routine, failure and restart, costs |
 | — | [`stats/DAILY_RUNS_2026-10-01_to_10-15.md`](stats/DAILY_RUNS_2026-10-01_to_10-15.md) | per-date timings, retries and failures for the first 15 operational days ([CSV](stats/daily_runs_2026-10.csv)) |
 
 ## Numbers at a glance
