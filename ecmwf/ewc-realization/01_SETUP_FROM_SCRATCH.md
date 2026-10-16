@@ -2,8 +2,10 @@
 
 Everything that has to exist before [`02_LONG_TERM_REALIZATION.md`](02_LONG_TERM_REALIZATION.md)
 or [`03_DAILY_OPERATIONS.md`](03_DAILY_OPERATIONS.md) can run. Sections 1–2
-describe the setup as it stands. Wherever a provisioning step was never
-written down, this page says so; nobody has rebuilt the cluster from zero yet.
+describe the setup as it stands and how it was built. The full build record
+(JupyterHub gateways, TLS, users) is in the private repository
+`cno-e4drr`, `devops/ecmwf-weather-cloud-jh/RUNBOOK.md`. §2 below keeps the
+part this pipeline depends on: VMs, network, scheduler, workers.
 
 ## 1. What runs where
 
@@ -37,19 +39,73 @@ management channel.
 
 ## 2. Provisioning the tenancy (EWC / OpenStack)
 
-**Gap: this was done by hand and never recorded.** What is known:
+Built 2026-07-27/28 with the OpenStack CLI and cloud-init only: no
+Kubernetes, no images to build, no orchestration layer. The source is
+`cno-e4drr/devops/ecmwf-weather-cloud-jh` (RUNBOOK §2, §4, §9; worker
+cloud-init in `cloud-init-dask-worker.yaml`).
 
-- Six instances of flavour `4cpu-16gbmem-40gbdisk` on the tenancy's private
-  network `192.168.1.0/24`, behind a router with NAT, with no floating IPs on
-  the workers.
-- `/opt/mamba/envs/dask` on every worker, built from the same spec as the
-  gateway (§4). Dask workers dialled to `tcp://192.168.1.129:8786`, spilling to
-  `/scratch/dask`.
-- A Ceph S3 bucket `must-icechunk`, with EC2-style access keys created from an
-  **OpenStack application credential** (§3).
+**a. CLI access.**
+- EWC logs in through federated SSO, so create one **application credential**
+  in Horizon (Identity → Application Credentials). Use "Download
+  clouds.yaml", then strip `project_name`, `project_id`, `username` and
+  `user_domain_name` from it.
+- Leave Roles blank so the credential inherits compute, volume and network.
+- Run `export OS_CLOUD=openstack`, then check with `openstack limits show
+  --absolute` (not `token issue`, which prints a live token).
+- Application credentials expire. EC2 (S3) keys minted from them do not.
 
-To fill this gap, record the `openstack server create` / image / network /
-security-group commands the next time a VM is rebuilt.
+**b. Private network for Dask.** `--remote-group` admits only members of the
+same group:
+
+```bash
+openstack security group create dask-internal --description "Dask scheduler/worker (private only)"
+openstack security group rule create --proto tcp --dst-port 8786 --remote-group dask-internal dask-internal
+openstack security group rule create --proto tcp --dst-port 8787 --remote-group dask-internal dask-internal
+openstack security group rule create --proto tcp --dst-port 1024:65535 --remote-group dask-internal dask-internal
+```
+
+- The high-port range is required: workers connect to each other directly.
+  Without it, small jobs pass and large ones hang.
+- The scheduler port has **no authentication**. So only the gateway gets a
+  floating IP, and it exposes only 80/443.
+
+**c. Scheduler: one systemd unit on the gateway.**
+
+```bash
+printf '[Unit]\nDescription=Dask scheduler\nAfter=network-online.target\n\n[Service]\nExecStart=/opt/mamba/envs/dask/bin/dask scheduler --host 0.0.0.0 --port 8786 --dashboard-address :8787\nRestart=always\nRestartSec=10\nLimitNOFILE=65535\n\n[Install]\nWantedBy=multi-user.target\n' \
+  | sudo tee /etc/systemd/system/dask-scheduler.service
+sudo systemctl daemon-reload && sudo systemctl enable --now dask-scheduler
+```
+
+**d. Workers: six VMs from one cloud-init file.**
+
+```bash
+sed 's|${SCHEDULER_IP}|192.168.1.129|g' cloud-init-dask-worker.yaml > /tmp/worker.yaml
+for i in 01 02 03 04 05 06; do
+  openstack server create --image "Ubuntu-22.04" --flavor "4cpu-16gbmem-40gbdisk" \
+    --network <tenancy private network> --security-group dask-internal \
+    --key-name <keypair> --user-data /tmp/worker.yaml dask-worker-$i
+done
+```
+
+- The cloud-init file installs micromamba and the pinned `dask` env (§4). It
+  then starts `dask worker` against the scheduler, sized at boot: ~4 threads
+  per process, total memory minus 2 GB headroom.
+- **Create one worker first** and wait for `bootstrap complete` in its
+  console log, then create the other five. Otherwise a cloud-init bug fails
+  six times over.
+- Workers hold no state; rebuilding one takes ~2 min.
+
+**e. Storage.** The Ceph S3 bucket `must-icechunk` (10 TiB quota), with EC2
+access keys (§3).
+
+**f. Frisky, on top.** Once the Dask workers are up, `deploy_workers.py`
+(§5) uses them only as a remote-exec channel. It builds each VM's frisky venv
+and starts the frisky scheduler (on a worker VM) and the frisky workers. The
+realization itself never goes through Dask.
+
+Not yet scripted: Terraform covers only the second JupyterHub gateway. The
+workers and gateway 1 are CLI-built, as above.
 
 **The original allocation request (2026-07-31), against what happened:**
 

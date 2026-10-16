@@ -275,11 +275,21 @@ See [`ecmwf/icechunk-par/README.md`](ecmwf/icechunk-par/README.md) and
 
 ### Realizing a region on the ECMWF Weather Cloud
 
-[`ecmwf/ewc-realization/`](ecmwf/ewc-realization/) turns the virtual ECMWF
-store into decoded arrays for East Africa and the SW Indian Ocean (51 raw
-members, 0–240 h), using a frisky DAG on six EWC VMs. It covers both the
-long-term corpus (1,260 dates, ~17.9 TB) and the daily operational run, with
-setup, runbooks, measured throughput and bottlenecks.
+[`ecmwf/ewc-realization/`](ecmwf/ewc-realization/) takes the chain one step
+further. It runs the GIK parquets (stage ①) through the virtual Icechunk store
+(stage ②) into decoded arrays for East Africa and the SW Indian Ocean
+(stage ③: 51 raw members, 0–240 h, 39 channels).
+
+- **The cluster needs no Kubernetes.** A Dask scheduler runs as a systemd
+  unit on one VM, and the workers are plain VMs started from one cloud-init
+  file. A frisky futures DAG runs on top, one task per GRIB message.
+- **The long-term corpus:** 1,260 dates, 243 cluster-hours, ~103 TB read,
+  ~17.9 TB written.
+- **The daily operational run since 2026-10-01**, with the issues it hit:
+  AWS throttling, stale caches, credentials.
+
+Its README walks through the five steps, with setup, runbooks, measured
+throughput and costs.
 
 ---
 
