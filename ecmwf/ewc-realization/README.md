@@ -50,7 +50,6 @@ source.coop.
 | [`SCALING.md`](SCALING.md) · [`EWC_REALIZE_NOTES.md`](EWC_REALIZE_NOTES.md) | per-process connection cap, probes; earlier realize notes |
 | [`CLUSTER_RESTART_ROUTINE.md`](CLUSTER_RESTART_ROUTINE.md) · [`MIRROR_RUN_ARCHITECTURE.md`](MIRROR_RUN_ARCHITECTURE.md) · [`SOURCE_COOP_CREDENTIALS.md`](SOURCE_COOP_CREDENTIALS.md) | operations how-tos |
 | [`OPENING_PUBLISHED_ECMWF_ICECHUNK.md`](OPENING_PUBLISHED_ECMWF_ICECHUNK.md) · [`USING_REALIZED_EA_SWIO_STORE.ipynb`](USING_REALIZED_EA_SWIO_STORE.ipynb) | for users of the published stores |
-| [`history/`](history/) | dated records: the dev-test era, the dask era (`history/dask-era/`), the season drivers, worker-issue and gateway-handover reports |
 
 ## Scripts
 

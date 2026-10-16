@@ -224,13 +224,11 @@ scaling ceiling: `SCALING.md`.
 | `bandwidth_probe.py` / `procs_probe.py` | throughput vs threads / processes |
 | `dashboard_forward.py` | TCP relay for the dashboard behind jupyter-server-proxy |
 | `validate_domain.py` | **pre-flight**: does every channel decode on a given date, and what shape does the box cut. Anonymous, read-only |
-| `history/verify_march2026.py` | are the ten March 2026 dates present **and** level-correct in the published store. Anonymous, read-only |
 
 ### Reference docs
 
 | | |
 |---|---|
-| [`run_20260301.md`](history/run_20260301.md) | **A-to-Z record of one real run**: worker startup, dashboard proxy, pre-flight, build, verify, inspect |
 | `SCALING.md` | what limits read throughput, measured — read before asking for more VMs |
 | `OPENING_PUBLISHED_ECMWF_ICECHUNK.md` | minimal snippet to open the published store anonymously |
 | `EWC_REALIZE_NOTES.md` | full notes: both stores, known defects, corrections |

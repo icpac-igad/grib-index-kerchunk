@@ -59,9 +59,8 @@ with `xr.concat([mar, jun], dim="time").sortby("time")`.
 | document | contents |
 |---|---|
 | this file | both stages, end to end |
-| [`run_20260301.md`](history/run_20260301.md) | A-to-Z record of one real run on the `ea-sw-io` / 36-channel / 10-day shape |
 | [`SCALING.md`](SCALING.md) | what limits read throughput, measured — read before asking for more VMs |
-| [`dev-test/`](history/) | how stage 2 was arrived at: the Dask path that hung, the diagnoses made and withdrawn, and the probes that settled them |
+| [`DAG_VERSIONS.md`](DAG_VERSIONS.md) §0 | how stage 2 was arrived at: the Dask path that hung, the diagnoses made and withdrawn |
 
 ---
 
@@ -502,7 +501,7 @@ It does mean the *useful* output rate is 8.9 MB/s while the *network* rate is
 ### Environment
 
 Deliberately **not** `/opt/mamba/envs/dask`. That env is version-pinned to all
-six Dask workers (`dev-test/README.md` §1) and must not drift.
+six Dask workers ([`01_SETUP_FROM_SCRATCH.md`](01_SETUP_FROM_SCRATCH.md) §4) and must not drift.
 
 ```bash
 cd ~/grib-index-kerchunk/icechunk-dask
@@ -564,7 +563,7 @@ configuration — including those credentials — and is **pickled to the worker
 as a task argument. The worker writes through `fork.store` and returns the
 changeset. Nothing else is distributed.
 
-This matters because of the `AWS_*` trap (`dev-test/README.md` §2): the Dask workers
+This matters because of the `AWS_*` trap ([`01_SETUP_FROM_SCRATCH.md`](01_SETUP_FROM_SCRATCH.md) §3): the Dask workers
 carry `AWS_ENDPOINT_URL` and `AWS_DEFAULT_REGION` for Ceph, and if the
 icechunk **virtual-chunk** client sees those it tries to resolve a hostname
 that does not exist. So:
@@ -735,7 +734,6 @@ Chunks are `(1, 1, number, lat, lon)` — one chunk per (date, step), 4.9 MB.
 | `check_complete.py` | completeness by reading blocks |
 | `check_members.py` | is the ensemble dimension real |
 | `validate_domain.py` | pre-flight: does every channel decode on a given date, what shape the box cuts, and whether member 0 differs from member 1. Anonymous |
-| `history/verify_march2026.py` | are the ten March 2026 dates present **and** level-correct in the published store. Anonymous |
 | `bandwidth_probe.py` | throughput vs thread concurrency |
 | `procs_probe.py` | throughput vs **process** count — the one that found the real ceiling |
 | `dashboard_forward.py` | TCP relay so jupyter-server-proxy can serve the dashboard |

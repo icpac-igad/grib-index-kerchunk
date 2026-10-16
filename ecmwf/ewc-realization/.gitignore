@@ -8,3 +8,6 @@ out/
 .ipynb_checkpoints/
 .env.*
 **/.env.*
+
+# dated records of the realization work; kept locally, not published
+history/

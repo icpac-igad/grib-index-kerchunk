@@ -19,8 +19,21 @@ share **one public egress IP**. That matters for AWS throttling (see
 [`05_BOTTLENECKS_AND_ISSUES.md`](05_BOTTLENECKS_AND_ISSUES.md) §2). There is
 **no SSH key on the gateway, by design**: `deploy_workers.py` reaches the VMs
 through Dask `client.run()`, so the Dask scheduler on the gateway is the only
-management channel. If the gateway is retired, re-point the VMs' Dask workers
-first ([`history/HANDOVER_NEW_GATEWAY.md`](history/HANDOVER_NEW_GATEWAY.md)).
+management channel.
+
+**Retiring or replacing the gateway:**
+
+- First re-point the VMs' Dask workers, which dial `192.168.1.129:8786`, or
+  stand up a Dask scheduler elsewhere and restart them against it. Otherwise
+  the frisky workers can no longer be restarted.
+- From another host, use `deploy_workers.py --dask tcp://192.168.1.129:8786`.
+  The default (127.0.0.1) only works on the gateway itself.
+- `/opt/mamba/envs/dask` sits on the gateway's local disk (`/dev/sda1`), not
+  a shared mount, so a new gateway needs its own copy.
+- Credentials travel as a zip. Extract it with `unzip` (not
+  `python -m zipfile`) so file modes survive, then `chmod 600 .env`.
+- A local smoke test without `--scheduler` proves nothing about the cluster;
+  use §6 step 5.
 
 ## 2. Provisioning the tenancy (EWC / OpenStack)
 
@@ -37,9 +50,20 @@ first ([`history/HANDOVER_NEW_GATEWAY.md`](history/HANDOVER_NEW_GATEWAY.md)).
 
 To fill this gap, record the `openstack server create` / image / network /
 security-group commands the next time a VM is rebuilt.
-`history/EWC_USAGE_AND_RESOURCE_PLAN.md` holds the original allocation request.
-Its ~4.4 TB storage figure predates the long-term run; the real figure is about
-17.9 TB.
+
+**The original allocation request (2026-07-31), against what happened:**
+
+| | requested / planned | actual |
+|---|---|---|
+| VMs | 6 × 4 vCPU × 16.77 GB (Dask memory limit 13.94 GB), "no larger workers" | the same six |
+| `must-icechunk` storage | ~4.5 TB (or 289 GB if only mean+sd were stored) | ~17.9 TB (raw members, 38–39 channels) |
+| corpus | 1,246 dates × 30 ch × 51 members × 53 steps = 91.5 M messages | 1,260 dates × 38–39 ch × 51 × 65 steps |
+| read volume | ~60.6 TB (0.788 MB/msg at 0.25°, 0.307 at 0.4°), from the `.index` sidecars | ~103 TB |
+| written | 7.37 TB raw, ~4.4 TB after zstd | ~17.9 TB |
+| duration | 3.5–60 days, depending on the link | 243 cluster-h (8–10 days of compute) |
+| order | calibrate 1 date → 50r1 → 49r1 (13-level) → 49r1 (9-level) → 0p4 | newest season first (§3 of [`02_LONG_TERM_REALIZATION.md`](02_LONG_TERM_REALIZATION.md)) |
+
+Usage before the request was 3.38 GB, all synthetic.
 
 ## 3. Credentials (three sets, never mixed)
 
@@ -79,11 +103,26 @@ run, and client/worker parity is what keeps pickled tasks working.
 
 | env | where | for | build |
 |---|---|---|---|
-| `dask` (micromamba) | `/opt/mamba/envs/dask`, identical on gateway and workers | Dask workers, `deploy_workers.py` (`D=/opt/mamba/envs/dask/bin/python`) | spec in [`history/README.md`](history/README.md) §1: python 3.12, dask/distributed 2026.7.1, zarr 3.2.1, xarray 2026.7.0, numpy 2.5.1, + pip icechunk 2.1.1, gribberish 1.6.0 |
+| `dask` (micromamba) | `/opt/mamba/envs/dask`, identical on gateway and workers | Dask workers, `deploy_workers.py` (`D=/opt/mamba/envs/dask/bin/python`) | spec below |
 | frisky client `.venv` | this folder (`P=.venv/bin/python`) | `build_corpus.py`, mirrors, checks | see below |
 | frisky worker venv | on each VM, built by `deploy_workers.py --install` | frisky workers | pinned list in `deploy_workers.py` |
 | `uv` + Python 3.12 | gateway, `~/.local/bin` | stages ①–② (Lithops pars, virtual store) | `pip install --user uv` |
 | `geo-venv` | `/home/ubuntu/geo-venv` | CRMA layers only (geopandas/pyproj) | not needed for ECMWF realization |
+
+The `dask` env, built identically on the gateway and every worker:
+
+```bash
+micromamba create -n dask -c conda-forge python=3.12 dask=2026.7.1 distributed=2026.7.1 \
+  zarr=3.2.1 xarray=2026.7.0 numpy=2.5.1 pandas=3.0.3 s3fs netcdf4 matplotlib cloudpickle
+micromamba run -n dask pip install icechunk==2.1.1 gribberish==1.6.0
+```
+
+Verified pins (client = all six workers): python 3.12.13, s3fs 2026.6.0,
+netCDF4 1.7.4, cloudpickle 3.1.2, pandas 3.0.3. Parity matters because a
+dask/distributed/zarr/cloudpickle mismatch shows up as an opaque
+deserialization error inside a task, not as an `ImportError`. Rebuild workers
+from this spec. Observed skew in 2026-10: worker python 3.12.14, msgpack
+1.2.2, tornado 6.5.8 (nothing traced to it).
 
 Client venv. It must be a real venv. On the gateway `python3 -m venv` has no
 `ensurepip`, so build it from the mamba interpreter:
@@ -141,5 +180,5 @@ Dashboard: `dashboard_forward.py --to 192.168.1.164:8791 --listen 8791`, then
 Step 5 is the one that proves the whole path. It covers anonymous source.coop,
 virtual chunks on AWS, GRIB decode on the workers, and the remote scheduler.
 Finite numbers mean the cluster can realize that date.
-[`history/run_20260301.md`](history/run_20260301.md) is a full A-to-Z record of
-one real run.
+[`EWC_REALIZE_NOTES.md`](EWC_REALIZE_NOTES.md) has the measured figures for a
+single real date.

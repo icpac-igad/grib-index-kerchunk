@@ -206,7 +206,7 @@ for s in repo.ancestry(branch="main"):
 > `time`** axes (three backfill commits on 2026-07-07 landed out of order), so
 > `.sel(time=slice(...))` raises `KeyError`. Use `ds.sortby("time")` first, or
 > exact-label `.sel(time=np.datetime64(d))`, which is unaffected.
-> See `ewc-realization/history/README_icechunk-dask-frisky_2026-08.md` "Known defects in the published store".
+> See `ewc-realization/EWC_REALIZE_NOTES.md` "Known defects in the published store".
 
 ---
 
@@ -217,4 +217,4 @@ for s in repo.ancestry(branch="main"):
 | `lithops-cr-gik-ecmwf/era_check.py` | era windows, cycle reach, the two era switches, GCS layout |
 | `lithops-cr-gik-ecmwf/README.md` | how the per-era runtime image selects the template |
 | `icechunk-par/build_ecmwf_icechunk.py` | `ERAS` table: grid + canonical level superset per era |
-| `ewc-realization/history/README_icechunk-dask-frisky_2026-08.md` | known defects in the published store; date coverage audit |
+| `ewc-realization/EWC_REALIZE_NOTES.md` | known defects in the published store |

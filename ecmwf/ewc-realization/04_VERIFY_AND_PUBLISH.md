@@ -17,9 +17,9 @@ Run the checks in order, cheapest first:
 | # | check | command | pass |
 |---|---|---|---|
 | 1 | manifest completeness | `check_chunks.py --prefix ea-swio/<sink> --env .env` | **every channel the same count**, and `total missing = unwritten_dates × 39 × 65` exactly. Unequal counts mean dates torn across channels, which is a silent partial commit |
-| 2 | chunk writes | `check_complete.py --prefix ea-swio/<sink> --env .env` | no missing chunks |
+| 2 | chunk writes | `check_complete.py --prefix ea-swio/<sink> --env .env` | no missing chunks. It reads blocks, so it is slow: on a 33-date store it produced nothing in 30 min. For a whole season use the manifest (row 1, or `Session.chunk_coordinates`, ~3 min) |
 | 3 | members are real | `check_members.py --prefix ea-swio/<sink> --env .env --var gh500` | spread grows with lead time. **Always pass `--var gh500`**: the default variable has a flat tropical spread and looks like a failure |
-| 4 | geolocation | `check_geolocation.py --prefix ea-swio/<sink> --env .env` | `CONSISTENT`. This check exists because of an earlier longitude bug (`history/figures/globe_longitude_bug.png`) |
+| 4 | geolocation | `check_geolocation.py --prefix ea-swio/<sink> --env .env` | `CONSISTENT`. This check exists because of an earlier longitude bug ([`figures/globe_longitude_bug.png`](figures/globe_longitude_bug.png)) |
 | 5 | spot read | `inspect_store.py --prefix ea-swio/<sink> --var tp --step 0`, then `--step 240` (hours) | finite at both ends of the step axis. A date can be whole at step 0 (index 0) and empty at 240 h (index 64) |
 
 **The build's success line is not evidence. Only the manifest is.** A read
@@ -64,6 +64,32 @@ st = icechunk.s3_storage(bucket="e4drr-project", prefix="forecasts/ecmwf-ifs-ea-
 ## 4. Delete from Ceph only on evidence
 
 Delete only after step 3 passes on the published copy, and record why.
-`purge_wrong_stores.py` exists for stores built on the wrong region. The
-record of what was deleted, and the evidence for each deletion, is
-[`history/CEPH_DELETION_EVIDENCE.md`](history/CEPH_DELETION_EVIDENCE.md).
+`purge_wrong_stores.py` exists for stores built on the wrong region.
+
+**Two independent checks, because one is not enough.** The time axis is
+preallocated, so an unwritten date reads back as NaN, and a mirror faithfully
+copies the hole. A matching listing therefore proves the copy, not the content.
+
+1. **Copy check.** Do a full listing of both sides, excluding `overwritten/`:
+   object count, bytes, snapshot count and HEAD snapshot id must be identical.
+2. **Content check.** Season completeness from the manifest
+   (`Session.chunk_coordinates`, via `../check_realized_coverage.py`, `bc00287`).
+   Read through the **`us-west-2.opendata.source.coop`** alias, not the write
+   endpoint.
+
+**The deletion done, 2026-08-23:** four MAM stores, 4,897.97 GB.
+
+| store | objects | GB | snapshots | HEAD |
+|---|---|---|---|---|
+| `v3-49r1-mam2024` | 243,982 | 1,651.75 | 291 | `7MB4YH8J09DSKS` |
+| `v3-49r1-mam2025` | 235,487 | 1,592.77 | 187 | `9VVSNV9KKSPS9V` |
+| `v3-49r1-mam2026` | 193,610 | 1,329.83 | 224 | `4QBREPA14W6D6V` |
+| `v3-50r1-mam2026-tail` | 47,821 | 323.62 | 41 | `9X2Z1WP5KH33S9` |
+
+- Both sides listed 720,900 objects, with a size difference of 0.000 GB.
+- The content check caught `mam2024` at **33/92** dates. A delta re-mirror
+  brought it to 92/92 before anything was deleted.
+- `w700` and `cape` are 87/92 in mam2024 (2024-03-01…05). That is expected:
+  49r1 has only 83 fields/member/step until 2024-03-06.
+- The `purge_wrong_stores.py` dry-run reported 722,370 objects / 4,898.00 GB.
+  The extra 1,470 objects are the `overwritten/` set.

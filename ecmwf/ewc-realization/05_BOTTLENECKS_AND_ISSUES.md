@@ -104,8 +104,6 @@ instead of explained after the fact.
 
 ## 4. Worker issues and their fixes
 
-Full write-up: [`history/WORKER_ISSUES_20261002.md`](history/WORKER_ISSUES_20261002.md).
-
 | issue | symptom | fix |
 |---|---|---|
 | Stale per-process store cache (`_open_era`, `open_store_cached`) | `KeyError: "not all values found in index 'time'"` on every block | **RULE 1**: restart frisky after mirror ②, and Dask after mirror ③. Built into the daily driver |
@@ -121,6 +119,10 @@ Full write-up: [`history/WORKER_ISSUES_20261002.md`](history/WORKER_ISSUES_20261
 | Environment gaps | `boto3` missing from the stage-3 venv and the Dask env; `gribberish` missing from a PEP-723 header; `uv`, `gcloud`, `source-coop` missing on the gateway | see [`01_SETUP_FROM_SCRATCH.md`](01_SETUP_FROM_SCRATCH.md) |
 | Version skew between client and workers | msgpack / python / tornado patch-level warnings | recorded; nothing traced to it |
 | Scheduler on the gateway OOM-killed | client sees only `channel closed` | run the frisky scheduler on a worker VM (`--scheduler-on 192.168.1.164`) |
+| A VM looks alive but is not | `.165` was ARP-`REACHABLE` with port 22 dead and its worker gone | `ip neigh` is not a liveness check; use scheduler membership (`--status`, the dashboard worker count) |
+| Two frisky clients at once | the second `build_corpus.py` killed the first (`scheduler recv ended: early eof`) | one client at a time |
+| `source-coop login --format env` | a silent no-op | `--format` belongs on `creds` |
+| Mirror ② transient errors | 113 HTTP 520s (112 objects actually missing) on 10-01; the `repo` pointer was correctly withheld | re-run; it finished in 12.6 s |
 
 ## 5. Open items (2026-10-16)
 

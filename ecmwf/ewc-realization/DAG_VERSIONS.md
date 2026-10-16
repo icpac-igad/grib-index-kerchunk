@@ -11,6 +11,75 @@ that any future change has something explicit to be a change *from*, and so the
 
 ---
 
+## 0. v0: the Dask attempt (2026-07-31 → 08-03), and why it was abandoned
+
+Before frisky, the realization was tried as a Dask collection graph on the
+same six VMs. It hung. The records of that period are not kept in this
+folder; the findings that still matter are below.
+
+**Root cause (`e77f2aa`): graph construction, not the cluster.**
+`xr.open_zarr(..., chunks={})` makes every array a dask array, so the graph is
+built over **every chunk in the store** before `.sel()` narrows it:
+
+| array | store chunks | tasks for a 2-chunk read | result |
+|---|---|---|---|
+| `t2m` | 221,085 | 665,966 | built in 1.4 s |
+| `u` (14 levels) | 3,097,290 | ~9.3 M | **never finishes** |
+
+The hang is **in the client**, building the graph while holding the GIL. The
+dashboard is empty, there is no traceback, and the distributed and threaded
+schedulers fail identically.
+
+- **Fix:** open without `chunks`, `isel(isobaricInhPa=…)` first, then
+  `.sel()`, then `.chunk({"number": 1, "step": 1})`. With it, `u` passes at
+  1,329 MB and `t2m` at 637 MB.
+- Select-first still builds 3.76 M tasks for `u` (in 2 s), so **graph size
+  tracks the store, not the request**.
+- **Rule:** measure the graph first (`store_chunks ≈ prod(ceil(shape/chunk))`).
+  Under 10 k tasks is fine; 100 k–1 M is fragile; over 1 M expect trouble;
+  over ~5 M expect a hang.
+
+**Secondary failures.** These were consequences of the eager pattern, not
+separate causes:
+
+- `.compute()` inside a task gave ~7 GB RSS per array.
+- Dask's `managed` memory read 0.00 GB against 33.6 GB resident, because the
+  memory sits in the Rust icechunk/gribberish layer. Dask therefore
+  over-subscribed `nthreads=4` workers (memory limit 13.94 GB).
+- The nanny killed those workers and left 236 orphaned tasks (`processing 7,
+  waiting 140, executing 0`). Only `sudo systemctl restart dask-scheduler`
+  cleared them; `client.restart()` raised `assert not self.tasks`.
+- The JupyterHub client cgroup is 8 GiB. Client-side runs were SIGKILLed (137)
+  at channel 11 (`u925`).
+
+**Other anti-patterns found:**
+
+- `workers=[w], allow_other_workers=False`: a dead worker's tasks never
+  reschedule.
+- Module-level caches in cloudpickled functions never hit.
+- `pure=True` on I/O tasks.
+- `AWS_*` popped without restore (and `finally` does not run on a kill).
+
+**Icechunk 2.1.1 constraints.** `to_zarr` is unsupported with the distributed
+and multiprocessing schedulers. Distributed writes need `fork → write →
+merge → commit`. Distributed reads are undocumented.
+
+**The decision.** The work is embarrassingly parallel per (date, channel). So
+v1 uses one session per process, a `ForkSession` pickled to the workers, and
+futures instead of a collection graph (§1).
+
+**Claims made and withdrawn during that period** (so they are not re-argued):
+
+1. "89.5 GB of manifest RAM, 96% of the archive unreachable". Wrong: the store
+   is already split one manifest per date (`splitting: time=1`); 46,154
+   objects, the largest 1.1 MB.
+2. "The 503 is self-inflicted". Wrong: one GET from a clean process also got
+   503, because the throttle is on the shared egress IP
+   ([`05_BOTTLENECKS_AND_ISSUES.md`](05_BOTTLENECKS_AND_ISSUES.md) §2).
+3. "A 0.74–14.5 MB/s link ceiling". Measured while throttled; not a ceiling.
+
+---
+
 ## 1. What v1 is
 
 Defined in `frisky_daily_dag.py`, submitted by `build_corpus.py`. It is a

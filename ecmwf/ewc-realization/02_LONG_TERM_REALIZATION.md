@@ -17,6 +17,8 @@ order, sizing, cost, and what to change next time.
 | dims | `(time, step, number, latitude, longitude)`; 65 steps (0–240 h), members 0–50 (control at 0) |
 | channels | **38–39**, era-portable (18 base variables common to `0p4`/`49r1`/`50r1`). `d2m` exists only in 49r1/50r1 from 2024-03-06 |
 | per date | ~126,000 GRIB messages read → 2,535 blocks, **~17 GB** stored |
+| era date counts in the virtual store | 0p4 401, 49r1 804, 50r1 52 (to 2026-07-03, when the corpus was planned) |
+| `0p4` grid | excludes 15.0°E (k = 487.5), so pre-2024-02-29 seasons are a separate **201 × 164** dataset. Enforced by `is_convective_era` in `build_corpus.py` |
 
 The store layout and its known gaps are documented in
 [`../icechunk-par/REALIZED_EA_SWIO_STORE.md`](../icechunk-par/REALIZED_EA_SWIO_STORE.md).
@@ -74,8 +76,9 @@ tmux new-session -d -s mam2025 \
 tmux new-session -d -s seasons ./run_all_seasons.sh
 ```
 
-The drivers that actually ran each season and each channel append are kept
-in [`history/season-drivers/`](history/season-drivers/). Order matters:
+The one-off per-season drivers that ran the corpus are not kept here;
+`run_all_seasons.sh` and `run_corpus_supervised.sh` are their general form.
+Order matters:
 
 1. **Build the newest, best-verified season first.** It tests the write path
    in hours, not days. MAM 2026 went first because 2026-03-01 had already
@@ -87,8 +90,8 @@ in [`history/season-drivers/`](history/season-drivers/). Order matters:
    missing blocks.
 4. **Verify, then mirror, then purge.** See
    [`04_VERIFY_AND_PUBLISH.md`](04_VERIFY_AND_PUBLISH.md). Don't delete a Ceph
-   store until the source.coop copy has passed the check; the evidence trail is
-   [`history/CEPH_DELETION_EVIDENCE.md`](history/CEPH_DELETION_EVIDENCE.md).
+   store until the source.coop copy has passed the check (how that was done
+   for the MAM stores: [`04_VERIFY_AND_PUBLISH.md`](04_VERIFY_AND_PUBLISH.md) §4).
 5. **Adding a channel later** (as `d2m` was) is done with `append_channels.py`
    into `-d2m` fragment stores. Next time, put every channel in the season
    from the start; 12 fragments (0.365 TB) are still unpublished.
